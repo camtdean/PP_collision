@@ -96,7 +96,7 @@ def fit_vertex_by_closest_approach(
     regularization=1e-9,
     minimum_eigenvalue_ratio=1e-4,
 ): 
-   """
+    """
     Weighted least-squares point of closest approach to a set of straight
     tracks, solved independently for each event.
 
