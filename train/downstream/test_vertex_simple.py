@@ -2,10 +2,8 @@
 """
 test_vertex_simple.py
 =====================
-Minimal standalone test for vertex_head.py.
- 
-1 event · 5 tracks · 30 hits each (150 total)
-Momenta drawn uniformly from 0.2 – 5 GeV.
+Toy model for vertex_head.py.
+
 All tracks originate at the known true primary vertex VTX_TRUE.
  
 TPC geometry (straight-line approximation — vertex_head.py uses no B-field):
@@ -15,32 +13,24 @@ TPC geometry (straight-line approximation — vertex_head.py uses no B-field):
   with std = HIT_SMEARING.  The arc-length s_k along the track to the k-th
   layer is the positive root of the quadratic
  
-      (dx² + dy²) s² + 2(Vx·dx + Vy·dy) s + (Vx² + Vy² − R_k²) = 0
+      (dx^2 + dy^2) s^2 + 2(Vx·dx + Vy·dy) s + (Vx^2 + Vy^2 − R_k^2) = 0
  
   where d = (dx, dy, dz) is the unit flight direction and V is the vertex.
   The smallest 3-D radius hit on each track is always the innermost layer
   (k = 0, r_xy ≈ R_TPC_INNER), which is exactly what VertexHead uses as
   its per-track reference point.
  
-HOW TO RUN
-----------
-Place this script in the same directory as vertex_head.py:
-    /Users/nieto/Storage/PP_collision/train/downstream/
+Place this script in the same directory as vertex_head.py
  
 Then run:
     python test_vertex_simple.py
- 
-If you get an ImportError, first restore vertex_head.py from git:
-    cd /Users/nieto/Storage/PP_collision
-    git checkout train/downstream/vertex_head.py
-    python train/downstream/test_vertex_simple.py
 """
  
 import os, sys, math
 import torch
 import numpy as np
  
-# ── import vertex_head from the same directory as this script ──────────────
+# ── import vertex_head from Cameron ──────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -57,18 +47,18 @@ except SyntaxError as e:
     )
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1.  Simulation parameters
+# 1.  Simulation parameters. Here, we are randomnizing with a poisson distribution the number of tracks based on what Marzia told us
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# torch.manual_seed(0)
  
 MEAN_N_TRACKS = 10.0
 N_TRACKS = int(torch.poisson(torch.tensor(MEAN_N_TRACKS)).item())
 
-N_HITS_PER_TRACK = 30
-N_HITS           = N_TRACKS * N_HITS_PER_TRACK   # 150
+# 30 hits per track
+N_HITS_PER_TRACK = 55
+N_HITS           = N_TRACKS * N_HITS_PER_TRACK   
 N_EVENTS         = 1
  
-# True primary vertex (cm) — what VertexHead should recover
+# True primary vertex... what VertexHead should recover. We are getting a random z vertex from a Gaussian distribution from -30 to 30
 VTX_Z_SIGMA = 3.0  # cm
 
 while True:
@@ -76,28 +66,25 @@ while True:
     if -30.0 <= vz <= 30.0:
         break
 
+# Vertex in x,y = (0,0)
 VTX_TRUE = torch.tensor([0.0, 0.0, vz])
  
 HIT_SMEARING    = 0.01   # cm  (100 µm detector resolution)
  
 # TPC geometry: hits at fixed r_xy layers stepping outward from R_TPC_INNER
-R_TPC_INNER     = 30.0   # cm  — innermost TPC layer radius
-TPC_HIT_SPACING =  1.0   # cm  — r_xy gap between successive hit layers
-# hit k lands at r_xy = R_TPC_INNER + k * TPC_HIT_SPACING
-# (k = 0, 1, …, N_HITS_PER_TRACK-1)
+R_TPC_INNER     = 30.0   # cm innermost TPC layer radius
+TPC_HIT_SPACING =  1.0   # cm r_xy gap between successive hit layers
 # With the defaults this spans 30 – 59 cm.
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2.  Track kinematics
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ── Thermal-like RHIC pT spectrum ───────────────────────────────────────────
-# dN/dpT ∝ pT * exp(-mT/T)
-# mT = sqrt(pT^2 + m^2)
 
-PION_MASS = 0.13957   # GeV/c^2
-PT_TEMPERATURE = 0.22 # GeV
-PT_MIN = 0.0          # GeV/c
-PT_MAX = 5.0          # GeV/c
+# This is from Marzia, a thermal-like RHIC pT spectrum. Getting a random pT. This part was entirely gotten from Claude without verification
+PION_MASS = 0.13957   
+PT_TEMPERATURE = 0.22 
+PT_MIN = 5.0          
+PT_MAX = 10.0          
 
 
 def sample_pt(n):
@@ -141,13 +128,15 @@ def sample_pt(n):
         samples,
         dtype=torch.float32
     )
-
 pT = sample_pt(N_TRACKS)
-theta   = torch.FloatTensor(N_TRACKS).uniform_(0.4, math.pi-0.4)  # polar angle (rad)
-phi     = torch.FloatTensor(N_TRACKS).uniform_(0, 2*math.pi)      # azimuthal angle (rad)
+
+# Random theta and phi with a even distribution
+theta   = torch.FloatTensor(N_TRACKS).uniform_(0.4, math.pi-0.4)  # polar angle
+phi     = torch.FloatTensor(N_TRACKS).uniform_(0, 2*math.pi)      # azimuthal angle 
 charge  = (torch.randint(0, 2, (N_TRACKS,)).float() * 2 - 1)      # ±1
 p_total = pT / torch.sin(theta)
 
+# Here the direction for each track is set based on the random theta and phi from before
 direction = torch.stack([               # unit flight direction (N_TRACKS, 3)
     torch.sin(theta) * torch.cos(phi),
     torch.sin(theta) * torch.sin(phi),
@@ -166,7 +155,7 @@ print(header)
 print("  " + "-" * (len(header) - 2))
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3.  Build the five tensors VertexHead.forward() expects
+# 3.  Build the five tensors VertexHead.forward() expects simulating the output file from data in the FM4NPP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  
 # ── class_probs  (1, 5, 2) ─────────────────────────────────────────────────
@@ -203,17 +192,20 @@ track_reg_result = torch.stack([
 #
 #    The vertex sits at r_xy ≈ 0.58 cm << R_TPC_INNER = 30 cm, so the
 #    discriminant is always positive for any R_k ≥ R_TPC_INNER.
-#
+
+# Loop over all the tracks
 rows = []
 for t in range(N_TRACKS):
     vx, vy, vz = VTX_TRUE.tolist()
     dx, dy, dz = direction[t].tolist()
  
-    # Quadratic coefficients (a and b are constant for this track)
+    # Quadratic coefficients (a and b are constant for this track). as^2 + bs + c = 0 for each track.
+    # a = dx^2 + dy^2, b = 2*(vx*dx + vy*dy), c  = vx^2 + vy^2 - R^2. For R inner.
+    
     a = dx**2 + dy**2                  # = sin²(theta_t); > 0 for theta in (0, π)
-    b = 2.0 * (vx * dx + vy * dy)
+    b = 2.0 * (vx * dx + vy * dy)      # vertex
  
-    # Arc-length to the innermost layer — for the header printout only
+    # Arc-length to the innermost layer for the header printout only
     c_inner = vx**2 + vy**2 - R_TPC_INNER**2
     disc_inner = b**2 - 4.0 * a * c_inner
     s_inner = (-b + math.sqrt(max(disc_inner, 0.0))) / (2.0 * a)
@@ -221,27 +213,32 @@ for t in range(N_TRACKS):
     print(f"  {t:>3}  {p_total[t]:>8.3f}  {pT[t]:>7.3f}  "
           f"{theta[t]:>7.4f}  {phi[t]:>7.4f}  {int(charge[t]):>3}  {s_inner:>10.2f}")
  
+    # TPC_HIT_SPACING here is 1 cm. Don't know how much it is in reality.
     for k in range(N_HITS_PER_TRACK):
         R_k  = R_TPC_INNER + k * TPC_HIT_SPACING
         c_k  = vx**2 + vy**2 - R_k**2
         disc = b**2 - 4.0 * a * c_k          # always > 0 (vertex inside TPC)
         s_k  = (-b + math.sqrt(disc)) / (2.0 * a)
  
-        # ideal hit position on the straight track + Gaussian smearing
+        # ideal hit position on the straight track + Gaussian smearing. It creates the hits positions. For example
+        # ideal (31.2, 4.5, 18.7) will be (31.21, 4.49, 18.71) instead.
         pos = VTX_TRUE + s_k * direction[t] + torch.randn(3) * HIT_SMEARING
         rows.append([p_total[t].item(), pos[0].item(), pos[1].item(), pos[2].item()])
  
+# hits are created here for the FM4NPP format
 points = torch.tensor(rows, dtype=torch.float32).unsqueeze(0)  # (1, 150, 4)
  
-# ── mask_probs  (1, 150, 5) ────────────────────────────────────────────────
-#    hits 0–29 → track 0 at prob 0.90, etc.
+# ── mask_probs: which track each hit probably belongs to ────────────────────────────────────────────────
+#    hits 0–29 → track 0 at prob 0.90, etc. Assigns the hits to tracks.
+# Each hit has a probability to belong to each track. Here, 0.9 for high probability and 0.2 for low probability for the 
+# toy model.
 mask_probs = torch.full((1, N_HITS, N_TRACKS), 0.02)
 for t in range(N_TRACKS):
     s, e = t * N_HITS_PER_TRACK, (t + 1) * N_HITS_PER_TRACK
     mask_probs[0, s:e, t] = 0.90
  
-# ── padding_mask  (1, 150) ─────────────────────────────────────────────────
-#    all True — no padding, every hit is real
+# ── padding_mask  ─────────────────────────────────────────────────
+#    all True... no padding, every hit is real
 padding_mask = torch.ones(1, N_HITS, dtype=torch.bool)
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -263,7 +260,7 @@ for t in range(N_TRACKS):
     print(f"    Track {t}: r_xy = {xy.norm().item():.4f} cm")
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5.  Save inputs so you can reload them later
+# 5.  Save inputs so they can be reloaded later
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 save_path = os.path.join(_HERE, "vertex_test_inputs.pt")
 torch.save({
