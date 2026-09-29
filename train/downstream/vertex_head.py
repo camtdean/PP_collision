@@ -315,11 +315,13 @@ def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
 
 
 def _wrap_to_pi(angle):
-    """Wrap an angle (radians) to (-pi, pi]. Used for the tangent-direction
+    """
+    Wrap an angle (radians) to (-pi, pi]. Used for the tangent-direction
     sign resolution below -- the C++ compares tangent_phi - phi directly
     without wrapping, which is fine when `global` is close to the track (its
     own hit), but a vertex candidate can be far from the track in general,
-    so this port wraps explicitly to keep the >pi/2 test meaningful."""
+    so this port wraps explicitly to keep the >pi/2 test meaningful.
+    """
     return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
@@ -544,17 +546,18 @@ class VertexHead(nn.Module):
                     "see the fitpars docstring above -- this isn't produced upstream yet."
                 )
             fit = fit_vertex_by_helix_closest_approach(
-                fitpars,
+                fitpars,  #Add fitpar translation
                 track_weight,
                 n_iterations=self.helix_iterations,
                 convergence_tol=self.helix_convergence_tol,
+                seed_vertex = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)["vertex_estimate"]
             )
         else:
             fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
 
         return {
             "vertex_estimate": fit["vertex_estimate"],
-            "chi_square": fit["chi_square"],
+            "chi_square": fit["chi_square"], 
             "fit_is_valid": fit["fit_is_valid"],
             "track_position": track_position,
             "track_direction": track_direction,
