@@ -75,6 +75,54 @@ HIT_SMEARING    = 0.01   # cm  (100 µm detector resolution)
 R_TPC_INNER     = 30.0   # cm innermost TPC layer radius
 TPC_HIT_SPACING =  1.0   # cm r_xy gap between successive hit layers
 # With the defaults this spans 30 – 59 cm.
+
+# Define Helix constants and functions
+USE_HELIX = True # This flag sets the linear and helix 
+B_FIELD_Z = 1.4            # Tesla
+HELIX_CONST_CM = 100.0 / 0.3
+
+def helix_radius_cm(p_T, B_z=B_FIELD_Z, q_abs=1.0):
+    """Transverse radius of curvature [cm]."""
+    return p_T * HELIX_CONST_CM / (q_abs * B_z)
+
+def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
+    """
+    Return the ideal helical position [x, y, z] at transverse radius R_target.
+
+    Assumes a uniform B field along z and a particle starting at the beam
+    axis (the current toy model has VTX_TRUE x = y = 0).
+    """
+    vx, vy, vz = vertex
+    q = float(charge)
+
+    rho = helix_radius_cm(float(p_T), B_z, abs(q))
+
+    # Starting at r_xy = 0, the transverse displacement is
+    #     R_target = 2*rho*sin(|alpha|/2)
+    ratio = R_target / (2.0 * rho)
+
+    if ratio > 1.0:
+        raise ValueError(
+            f"Requested radius {R_target:.3f} cm exceeds "
+            f"the maximum transverse displacement 2*rho = {2.0*rho:.3f} cm."
+        )
+
+    alpha_abs = 2.0 * math.asin(min(ratio, 1.0))
+
+    # Charge and B-field sign determine bending direction.
+    alpha = q * math.copysign(alpha_abs, B_z)
+
+    # Transverse helix in x-y.
+    x = vx + rho * (math.sin(phi + alpha) - math.sin(phi))
+    y = vy - rho * (math.cos(phi + alpha) - math.cos(phi))
+
+    # Arc length along the trajectory.
+    s = rho * abs(alpha)
+
+    # z advances linearly along the helix.
+    z = vz + s * math.cos(theta)
+
+    return torch.tensor([x, y, z], dtype=torch.float32)
  
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2.  Track kinematics
@@ -83,8 +131,8 @@ TPC_HIT_SPACING =  1.0   # cm r_xy gap between successive hit layers
 # This is from Marzia, a thermal-like RHIC pT spectrum. Getting a random pT. This part was entirely gotten from Claude without verification
 PION_MASS = 0.13957   
 PT_TEMPERATURE = 0.22 
-PT_MIN = 5.0          
-PT_MAX = 10.0          
+PT_MIN = 0.2         
+PT_MAX = 15.0          
 
 
 def sample_pt(n):
@@ -144,6 +192,9 @@ direction = torch.stack([               # unit flight direction (N_TRACKS, 3)
 ], dim=-1)
  
 print("=" * 66)
+print(f"  Track model: {'HELIX' if USE_HELIX else 'LINEAR'}")
+if USE_HELIX:
+    print(f"  B field: Bz = {B_FIELD_Z:.3f} T")
 print(f"  True primary vertex (cm): ({VTX_TRUE[0]:.3f}, {VTX_TRUE[1]:.3f}, {VTX_TRUE[2]:.3f})")
 print(f"  TPC hits: r_xy = {R_TPC_INNER:.0f} … "
       f"{R_TPC_INNER + (N_HITS_PER_TRACK-1)*TPC_HIT_SPACING:.0f} cm "
@@ -176,53 +227,76 @@ track_reg_result = torch.stack([
 #
 #    TPC geometry: hit k on track t is placed where the straight track line
 #    crosses the cylindrical surface r_xy = R_TPC_INNER + k * TPC_HIT_SPACING.
-#
-#    For track t with unit direction d = (dx, dy, dz) starting from vertex V:
-#       P(s) = V + s · d
-#       r_xy(s)² = (Vx + s·dx)² + (Vy + s·dy)² = R_k²
-#
-#    Expanding and collecting in s:
-#       a · s² + b · s + c_k = 0
-#       a   = dx² + dy²               (= sin²θ; constant per track)
-#       b   = 2(Vx·dx + Vy·dy)        (constant per track)
-#       c_k = Vx² + Vy² − R_k²        (changes with layer k)
-#
-#    Take the positive (outgoing) root:
-#       s_k = (−b + √(b² − 4·a·c_k)) / (2·a)
-#
-#    The vertex sits at r_xy ≈ 0.58 cm << R_TPC_INNER = 30 cm, so the
-#    discriminant is always positive for any R_k ≥ R_TPC_INNER.
 
 # Loop over all the tracks
 rows = []
+
 for t in range(N_TRACKS):
-    vx, vy, vz = VTX_TRUE.tolist()
-    dx, dy, dz = direction[t].tolist()
- 
-    # Quadratic coefficients (a and b are constant for this track). as^2 + bs + c = 0 for each track.
-    # a = dx^2 + dy^2, b = 2*(vx*dx + vy*dy), c  = vx^2 + vy^2 - R^2. For R inner.
     
-    a = dx**2 + dy**2                  # = sin²(theta_t); > 0 for theta in (0, π)
-    b = 2.0 * (vx * dx + vy * dy)      # vertex
+    vx, vy, vz = VTX_TRUE.tolist()
+    
+    if USE_HELIX:
+         # Helical track in a uniform magnetic field Bz
+        # rho = transverse radius of curvature:
+        # rho = pT / (0.3 * |q| * Bz)
+        rho = helix_radius_cm(
+            pT[t].item(),
+            B_FIELD_Z,
+            abs(charge[t].item())
+        )
+
+        R_first = R_TPC_INNER
+
+        # For the current toy model VTX_TRUE has x=y=0, so the first
+        # intersection angle follows directly from r_xy = 2*rho*sin(alpha/2).
+        ratio = min(R_first / (2.0 * rho), 1.0)
+        alpha_first = 2.0 * math.asin(ratio)
+        s_inner = rho * alpha_first
+    else:
+        # Linear track: no magnetic field, so the particle travels
+        dx, dy, dz = direction[t].tolist()
+        # Quadratic coefficients (a and b are constant for this track). as^2 + bs + c = 0 for each track.
+        # a = dx^2 + dy^2, b = 2*(vx*dx + vy*dy), c  = vx^2 + vy^2 - R^2. For R inner.
+    
+        a = dx**2 + dy**2                  # = sin²(theta_t); > 0 for theta in (0, π)
+        b = 2.0 * (vx * dx + vy * dy)      # vertex
  
-    # Arc-length to the innermost layer for the header printout only
-    c_inner = vx**2 + vy**2 - R_TPC_INNER**2
-    disc_inner = b**2 - 4.0 * a * c_inner
-    s_inner = (-b + math.sqrt(max(disc_inner, 0.0))) / (2.0 * a)
+        # Arc-length to the innermost layer for the header printout only
+        c_inner = vx**2 + vy**2 - R_TPC_INNER**2
+        disc_inner = b**2 - 4.0 * a * c_inner
+        s_inner = (-b + math.sqrt(max(disc_inner, 0.0))) / (2.0 * a)
  
     print(f"  {t:>3}  {p_total[t]:>8.3f}  {pT[t]:>7.3f}  "
-          f"{theta[t]:>7.4f}  {phi[t]:>7.4f}  {int(charge[t]):>3}  {s_inner:>10.2f}")
+        f"{theta[t]:>7.4f}  {phi[t]:>7.4f}  {int(charge[t]):>3}  {s_inner:>10.2f}")
  
-    # TPC_HIT_SPACING here is 1 cm. Don't know how much it is in reality.
+        # TPC_HIT_SPACING here is 1 cm. Don't know how much it is in reality.
     for k in range(N_HITS_PER_TRACK):
+        
         R_k  = R_TPC_INNER + k * TPC_HIT_SPACING
-        c_k  = vx**2 + vy**2 - R_k**2
-        disc = b**2 - 4.0 * a * c_k          # always > 0 (vertex inside TPC)
-        s_k  = (-b + math.sqrt(disc)) / (2.0 * a)
+            
+        if USE_HELIX:    
+            # Helical propagation in a uniform B field.
+            pos = helix_position_at_radius(
+                VTX_TRUE.tolist(),
+                pT[t].item(),
+                theta[t].item(),
+                phi[t].item(),
+                charge[t].item(),
+                B_FIELD_Z,
+                R_k,
+            )
+            
+        else:
+            # Straight-line propagation using the existing quadratic.
+            c_k  = vx**2 + vy**2 - R_k**2
+            disc = b**2 - 4.0 * a * c_k          # always > 0 (vertex inside TPC)
+            s_k  = (-b + math.sqrt(disc)) / (2.0 * a)
  
-        # ideal hit position on the straight track + Gaussian smearing. It creates the hits positions. For example
-        # ideal (31.2, 4.5, 18.7) will be (31.21, 4.49, 18.71) instead.
-        pos = VTX_TRUE + s_k * direction[t] + torch.randn(3) * HIT_SMEARING
+            # ideal hit position on the straight track + Gaussian smearing. It creates the hits positions. For example
+            # ideal (31.2, 4.5, 18.7) will be (31.21, 4.49, 18.71) instead.
+            pos = VTX_TRUE + s_k * direction[t]
+        
+        pos = pos + torch.randn(3) * HIT_SMEARING
         rows.append([p_total[t].item(), pos[0].item(), pos[1].item(), pos[2].item()])
  
 # hits are created here for the FM4NPP format
