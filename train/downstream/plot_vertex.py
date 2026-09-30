@@ -344,6 +344,7 @@ def plot_event_display(event, result, vtx_true, save_path):
     # Use the ORIGINAL truth direction saved by test_vertex_simple.py,
     # not VertexHead's reconstructed direction.
     track_dir = event["direction"].numpy()
+    #track_dir = result["vertex_direction"][0].numpy()
 
     # VertexHead's fitted reference positions are still useful for displaying
     # where its track references are located.
