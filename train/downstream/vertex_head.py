@@ -204,7 +204,7 @@ def fit_vertex_by_helix_closest_approach(
     track_position,
     b_z,
     track_weight,
-    n_iterations=100,
+    n_iterations=5,
     is_cosmics=False,
     seed_vertex=None,
     **linear_fit_kwargs,
@@ -264,9 +264,9 @@ def fit_vertex_by_helix_closest_approach(
 
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
-        track_position, track_direction = get_helix_tangent(track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
+        new_track_position, track_direction = get_helix_tangent(track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
 
-        result = fit_vertex_by_closest_approach(track_position, track_direction, track_weight, **linear_fit_kwargs)
+        result = fit_vertex_by_closest_approach(new_track_position, track_direction, track_weight, **linear_fit_kwargs)
 
         new_PV = result["vertex_estimate"]
         fit_is_valid = result["fit_is_valid"]
