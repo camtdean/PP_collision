@@ -310,30 +310,20 @@ def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
     norm = diff.norm(dim=-1, keepdim=True).clamp(min=epsilon)
     return origin + radius.unsqueeze(-1) * diff / norm
 
-
-def _wrap_to_pi(angle):
-    """
-    Wrap an angle (radians) to (-pi, pi]. Used for the tangent-direction
-    sign resolution below -- the C++ compares tangent_phi - phi directly
-    without wrapping, which is fine when `global` is close to the track (its
-    own hit), but a vertex candidate can be far from the track in general,
-    so this port wraps explicitly to keep the >pi/2 test meaningful.
-    """
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
-
-
-def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005):
+def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=False, d_angle=0.005):
     """
     Vectorized port of TrackFitUtils::get_helix_tangent.
 
     For each track and each corresponding query point, returns a local
     straight-line approximation to that track's helix at the point on the
-    helix nearest `point`: a (pca_point, unit_tangent) pair. This is the
-    "transport to point" function -- it re-anchors an already-fit helix at
-    a new reference point without refitting anything.
+    helix nearest `point`: a (pca_point, unit_tangent) pair.
 
     Args:
-        fitpars: (..., 5) tensor -- (radius, x0, y0, zslope, z0) per track
+        track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
+        track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
+            the regression was evaluated at, same leading shape
+        b_z: solenoid field, Tesla. Scalar (python float) or (...)-
+            broadcastable tensor.
         point: (..., 3) tensor, same leading shape as fitpars[..., 0] --
             the point to transport each track to (the trial vertex,
             broadcast across tracks)
@@ -345,11 +335,34 @@ def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005):
         pca: (..., 3) tensor -- point on the helix nearest `point`
         tangent: (..., 3) unit tensor -- local flight direction there
     """
-    radius = fitpars[..., 0]
-    x0 = fitpars[..., 1]
-    y0 = fitpars[..., 2]
-    zslope = fitpars[..., 3]
-    z0 = fitpars[..., 4]
+
+    rho = track_reg_result[..., 0]
+    theta = track_reg_result[..., 1]
+    sin_phi = track_reg_result[..., 2]
+    cos_phi = track_reg_result[..., 3]
+       
+    x_h = track_position[..., 0]
+    y_h = track_position[..., 1]
+    z_h = track_position[..., 2]
+       
+    q = torch.sign(rho)
+    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
+    p_T = (1.0 / rho.abs()) - 1.0
+      
+    tan_lambda = torch.cos(theta) / torch.sin(theta)
+    b_z_t = torch.full_like(rho, float(b_z))
+    R_s = (p_T / (0.2998 * q * b_z_t)) * SCALING_FACTOR
+    radius = R_s.abs()
+       
+    x0 = x_h + R_s * sin_phi
+    y0 = y_h - R_s * cos_phi
+       
+    r_h = torch.sqrt(x_h * x_h + y_h * y_h)
+      
+    cos_alpha = (x_h * cos_phi + y_h * sin_phi) / r_h
+          
+    zslope = tan_lambda / cos_alpha #TODO: update to use TrackFitUtils::line_fit / line_fit_xz
+    z0 = z_h - zslope * r_h
 
     point_xy = point[..., 0:2]
 
@@ -379,69 +392,7 @@ def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005):
     raw_tangent = second_point_pca - pca
     tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True)
 
-    # Direction is ambiguous (d_angle could as easily have been negative) --
-    # resolved the same way the C++ does, using the direction from the
-    # transport target itself, wrapped to (-pi, pi] (see _wrap_to_pi above).
-    phi = torch.atan2(point[..., 1], point[..., 0])
-    tangent_phi = torch.atan2(tangent[..., 1], tangent[..., 0])
-    delta = _wrap_to_pi(tangent_phi - phi)
-    flip = delta.abs() > (torch.pi / 2)
-    tangent = torch.where(flip.unsqueeze(-1), -tangent, tangent)
-
     return pca, tangent
-
-def track_reg_to_fitpars(track_reg_result, track_position, b_z):
-    """
-    Convert the track-finding head's regression output into TrackFitUtils'
-    fitpars convention, evaluated at the given reference point (normally the
-    innermost assigned hit, i.e. exactly track_position from
-    VertexHead.track_position_from_hits).
- 
-    Args:
-        track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
-        track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
-            the regression was evaluated at, same leading shape
-        b_z: solenoid field, Tesla. Scalar (python float) or (...)-
-            broadcastable tensor. Sign matters: it enters the
-            curvature-sign convention along with charge, per the derivation
-            this implements.
-        data_scaler: converts the 0.2998*B*R relation (R in meters) into
-            whatever length unit track_position is stored in (e.g. 100 for
-            cm).
-        epsilon: numerical floor for divisions (sin(theta), cos(alpha), B_z)
- 
-    Returns:
-        fitpars: (..., 5) tensor -- (radius, x0, y0, zslope, z0)
-    """
-    rho = track_reg_result[..., 0]
-    theta = track_reg_result[..., 1]
-    sin_phi = track_reg_result[..., 2]
-    cos_phi = track_reg_result[..., 3]
- 
-    x_h = track_position[..., 0]
-    y_h = track_position[..., 1]
-    z_h = track_position[..., 2]
- 
-    q = torch.sign(rho)
-    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
-    p_T = (1.0 / rho.abs()) - 1.0
-
-    tan_lambda = torch.cos(theta) / torch.sin(theta)
-    b_z_t = torch.full_like(rho, float(b_z))
-    R_s = (p_T / (0.2998 * q * b_z_t)) * SCALING_FACTOR
-    radius = R_s.abs()
- 
-    x0 = x_h + R_s * sin_phi
-    y0 = y_h - R_s * cos_phi
- 
-    r_h = torch.sqrt(x_h * x_h + y_h * y_h)
-
-    cos_alpha = (x_h * cos_phi + y_h * sin_phi) / r_h
-    
-    zslope = tan_lambda / cos_alpha #TODO: update to use TrackFitUtils::line_fit / line_fit_xz
-    z0 = z_h - zslope * r_h
- 
-    return torch.stack([radius, x0, y0, zslope, z0], dim=-1)
 
 class VertexHead(nn.Module):
     """
@@ -579,14 +530,12 @@ class VertexHead(nn.Module):
         fitpars = track_reg_to_fitpars(track_reg_result, track_position, self.b_z)
 
         if self.use_helix:
-            if fitpars is None:
-                raise ValueError(
-                    "VertexHead(use_helix=True) requires fitpars (n_events, n_tracks, 5); "
-                    "see the fitpars docstring above -- this isn't produced upstream yet."
-                )
             fit = fit_vertex_by_helix_closest_approach(
                 fitpars,  #Add fitpar translation
                 track_weight,
+                track_reg_result, 
+                track_position, 
+                self.b_z,
                 n_iterations=self.helix_iterations,
                 seed_vertex = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)["vertex_estimate"]
             )
