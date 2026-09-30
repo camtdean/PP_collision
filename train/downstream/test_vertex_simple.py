@@ -117,7 +117,7 @@ def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     y = vy - rho * (math.cos(phi + alpha) - math.cos(phi))
     
     # Arc length along the trajectory.
-    s = rho * abs(alpha) / math.sin(theta)
+    s = rho * abs(alpha) 
 
     # z advances linearly along the helix.
     z = vz + s * math.cos(theta)
