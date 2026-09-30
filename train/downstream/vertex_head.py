@@ -211,28 +211,13 @@ def fit_vertex_by_helix_closest_approach(
 ):
     """
     Helix-aware primary vertex fit, built on top of
-    fit_vertex_by_closest_approach without modifying it at all.
-
-    The straight-line fit above is exact only because a line's direction
-    doesn't depend on where you evaluate it. A helix's does -- its tangent
-    at the point nearest a candidate vertex changes as that candidate
-    vertex moves. So instead of a single closed-form solve, this re-anchors
-    every track's helix at the current vertex estimate (get_helix_tangent,
-    a closed-form, per-track operation -- see helix_transport.py), re-runs
-    the *same* linear closest-approach solve with those updated
-    (point, direction) pairs, and repeats until the vertex estimate stops
-    moving. This is a fixed-point form of the Billoir vertex-fit iteration:
-    each pass is an exact re-evaluation (not a linearization), so it
-    converges to the same answer a Jacobian-based Gauss-Newton form would,
-    just via full re-evaluation each step rather than a first-order update.
+    fit_vertex_by_closest_approach.
 
     Args:
-        fitpars: (n_events, n_tracks, 5) -- (radius, x0, y0, zslope, z0)
-            per track, in TrackFitUtils.cc's convention. This must already
-            be in the same spatial units as the vertex you want back (cm,
-            if these came straight from TrackFitUtils; check data_scaler
-            wherever fitpars is produced upstream if it's not TrackFitUtils
-            output directly).
+        track_reg_result: (n_events, n_tracks, 4) -- (q/(pT+1), theta, sin(phi), cos(phi))
+        track_position: (n_events, n_tracks, 3) -- reference point on each
+            track's line (the innermost assigned hit, see track_position_from_hits)
+        b_z: solenoid field, Tesla. Scalar (python float) or (...)-dimensional tensor
         track_weight: (n_events, n_tracks) -- same meaning as in
             fit_vertex_by_closest_approach
         n_iterations: max outer iterations
