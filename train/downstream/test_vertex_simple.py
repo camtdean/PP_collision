@@ -29,6 +29,7 @@ Then run:
 import os, sys, math
 import torch
 import numpy as np
+import argparse
  
 # ── import vertex_head from Cameron ──────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,10 +55,10 @@ MEAN_N_TRACKS = 10.0
 N_TRACKS = int(torch.poisson(torch.tensor(MEAN_N_TRACKS)).item())
 
 # 30 hits per track
-N_HITS_PER_TRACK = 55
+N_HITS_PER_TRACK = 47
 N_HITS           = N_TRACKS * N_HITS_PER_TRACK   
 N_EVENTS         = 1
- 
+
 # True primary vertex... what VertexHead should recover. We are getting a random z vertex from a Gaussian distribution from -30 to 30
 VTX_Z_SIGMA = 3.0  # cm
 
@@ -74,12 +75,30 @@ HIT_SMEARING    = 0.01   # cm  (100 µm detector resolution)
 # TPC geometry: hits at fixed r_xy layers stepping outward from R_TPC_INNER
 R_TPC_INNER     = 30.0   # cm innermost TPC layer radius
 TPC_HIT_SPACING =  1.0   # cm r_xy gap between successive hit layers
+R_TPC_OUTER = (
+    R_TPC_INNER
+    + (N_HITS_PER_TRACK - 1) * TPC_HIT_SPACING
+)
 # With the defaults this spans 30 – 59 cm.
 
 # Define Helix constants and functions
-USE_HELIX = True # This flag sets the linear and helix 
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--use-helix",
+    action="store_true",
+    help="Generate tracks as helices instead of straight lines"
+)
+
+args = parser.parse_args()
+
+USE_HELIX = args.use_helix
+
+print(f"USE_HELIX = {USE_HELIX}")
+ 
 B_FIELD_Z = 1.4            # Tesla
 HELIX_CONST_CM = 100.0 / 0.3
+
 
 def helix_radius_cm(p_T, B_z=B_FIELD_Z, q_abs=1.0):
     """Transverse radius of curvature [cm]."""
