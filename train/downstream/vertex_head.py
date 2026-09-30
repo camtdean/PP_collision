@@ -200,7 +200,9 @@ def fit_vertex_by_closest_approach(
 
 
 def fit_vertex_by_helix_closest_approach(
-    fitpars,
+    track_reg_result,
+    track_position,
+    b_z,
     track_weight,
     n_iterations=100,
     is_cosmics=False,
@@ -247,9 +249,9 @@ def fit_vertex_by_helix_closest_approach(
         Same dict as fit_vertex_by_closest_approach, from the final
         iteration
     """
-    n_events, n_tracks, _ = fitpars.shape
-    device = fitpars.device
-    dtype = fitpars.dtype
+    n_events, n_tracks, _ = track_reg_result.shape
+    device = track_reg_result.device
+    dtype = track_reg_result.dtype
 
     if seed_vertex is None:
         PV = torch.zeros(n_events, 3, device=device, dtype=dtype)
@@ -262,7 +264,7 @@ def fit_vertex_by_helix_closest_approach(
 
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
-        track_position, track_direction = get_helix_tangent(fitpars, PV_per_track, is_cosmics=is_cosmics)
+        track_position, track_direction = get_helix_tangent(track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
 
         result = fit_vertex_by_closest_approach(track_position, track_direction, track_weight, **linear_fit_kwargs)
 
@@ -411,7 +413,7 @@ class VertexHead(nn.Module):
         learn_weights: bool = False,
         weight_hidden_dim: int = 32,
         use_helix: bool = True,
-        helix_iterations: int = 5,
+        helix_iterations: int = 100,
         b_z: float = 3.8,
     ):
         super().__init__()
@@ -527,15 +529,13 @@ class VertexHead(nn.Module):
             # and how confident the track finder is that it's real
             track_weight = probability_track_is_real * total_hit_weight
 
-        fitpars = track_reg_to_fitpars(track_reg_result, track_position, self.b_z)
 
         if self.use_helix:
             fit = fit_vertex_by_helix_closest_approach(
-                fitpars,  #Add fitpar translation
-                track_weight,
-                track_reg_result, 
-                track_position, 
+                track_reg_result,
+                track_position,
                 self.b_z,
+                track_weight,
                 n_iterations=self.helix_iterations,
                 seed_vertex = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)["vertex_estimate"]
             )
