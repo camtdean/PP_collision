@@ -365,7 +365,7 @@ def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=F
     # Second point on the circle, a small angle further along, to define
     # the local tangent direction.
     angle_pca = torch.atan2(pca_circle[..., 1] - y0, pca_circle[..., 0] - x0)
-    new_angle = angle_pca + d_angle
+    new_angle = angle_pca - torch.sign(R_s) * d_angle
     newx = radius * torch.cos(new_angle) + x0
     newy = radius * torch.sin(new_angle) + y0
     new_xy = torch.stack([newx, newy], dim=-1)

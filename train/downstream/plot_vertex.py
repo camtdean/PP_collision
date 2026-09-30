@@ -90,7 +90,7 @@ B_FIELD_Z = 1.4  # Tesla
 HELIX_CONST_CM = 100.0 / 0.3
 
 R_TPC_INNER = 30.0
-R_TPC_OUTER = 78.0
+R_TPC_OUTER = 76.0
 
 def helix_radius_cm(pT, B_z=B_FIELD_Z, q_abs=1.0):
     """Transverse radius of curvature [cm]."""
@@ -104,29 +104,24 @@ def helix_points(
     phi,
     charge,
     B_z=B_FIELD_Z,
-    R_max=R_TPC_OUTER,
+    R_inner=R_TPC_INNER,
+    R_outer=R_TPC_OUTER,
     n_points=300,
 ):
     """
     Generate the helical trajectory using the SAME parameterization
-    as test_vertex_simple.py.
+    as vertex_head.py and test_vertex_simple.py.
 
-    Parameters
-    ----------
-    vertex : array-like
-        Starting vertex [x, y, z] in cm.
-    pT : float
-        Transverse momentum in GeV.
-    theta : float
-        Polar angle.
-    phi : float
-        Initial azimuthal angle.
-    charge : float
-        Particle charge (+1/-1).
-    B_z : float
-        Magnetic field in Tesla.
-    R_max : float
-        Maximum transverse radius to display.
+    phi is the momentum azimuth at the PRIMARY VERTEX.
+
+    The trajectory is generated from the signed curvature radius:
+
+        R_s = pT / (0.3 * q * Bz)
+
+    and the circle-center convention used by VertexHead:
+
+        x0 = x + R_s sin(phi)
+        y0 = y - R_s cos(phi)
     """
 
     vx, vy, vz = np.asarray(vertex, dtype=float)
@@ -137,33 +132,42 @@ def helix_points(
     phi = float(phi)
 
     rho = helix_radius_cm(pT, B_z, abs(q),)
-
-    # Same geometry as test_vertex_simple.py:
-    #
-    # R = 2 rho sin(|alpha|/2)
-    #
-    ratio = R_max / (2.0 * rho)
-
-    # Do not go beyond the maximum transverse displacement 2*rho.
-    ratio = min(ratio, 1.0)
+    radii = np.linspace(0, R_outer, n_points,)
+    ratio = np.clip(radii / (2.0 * rho), 0.0, 1.0,)
 
     alpha_abs = 2.0 * np.arcsin(ratio)
+    alpha = (-q * np.sign(B_z) * alpha_abs)
 
-    # SAME sign convention as test_vertex_simple.py
-    alpha_max = q * np.copysign(alpha_abs, B_z)
+    R_s = rho / q
+    
+    # Circle center corresponding to the momentum direction
+    # phi at the vertex.
+    x0 = vx + R_s * np.sin(phi)
+    y0 = vy - R_s * np.cos(phi)
 
-    alpha = np.linspace(0.0, alpha_max, n_points,)
+    # Position along the helix.
+    x = x0 - R_s * np.sin(phi + alpha)
+    y = y0 + R_s * np.cos(phi + alpha)
 
-    x = (vx + rho * (np.sin(phi + alpha) - np.sin(phi)))
-    y = (vy - rho * (np.cos(phi + alpha) - np.cos(phi)))
+    # Transverse arc length.
+    s_xy = rho * np.abs(alpha)
 
-    # Arc length along the helix
-    s = rho * np.abs(alpha)
+    # Convert transverse arc length to 3-D path length.
+    #
+    # ds_xy = ds * sin(theta)
+    # therefore
+    # ds = ds_xy / sin(theta)
+    sin_theta = np.sin(theta)
 
-    # z advances along the trajectory
-    z = vz + s * np.cos(theta)
+    if abs(sin_theta) < 1e-8:
+        s_3d = np.zeros_like(s_xy)
+    else:
+        s_3d = s_xy / abs(sin_theta)
 
-    return np.column_stack([x, y, z])
+    # z propagation.
+    z = vz + s_3d * np.cos(theta)
+
+    return np.column_stack([x, y, z,])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Line configuration
@@ -392,7 +396,7 @@ def load_saved_test_event(path):
         torch.sin(theta) * torch.sin(phi),
         torch.cos(theta),
     ], dim=-1)
-
+    
     event = {
         "class_probs": saved["class_probs"],
         "track_reg_result": saved["track_reg_result"],
@@ -400,6 +404,9 @@ def load_saved_test_event(path):
         "points": saved["points"],
         "padding_mask": saved["padding_mask"],
         "direction": direction,
+        # Truth kinematics at the PRIMARY VERTEX
+        "theta_vertex": saved["theta_rad"],
+        "phi_vertex": saved["phi_rad"],
     }
 
     return event, saved["true_vertex"], saved
@@ -444,15 +451,18 @@ def plot_event_display(event, result, vtx_true, save_path):
     # Actual track parameters stored by test_vertex_simple.py:
     q_over_pt_plus_one = track_reg[:, 0]
     theta = track_reg[:, 1]
-    sin_phi = track_reg[:, 2]
-    cos_phi = track_reg[:, 3]
-
-    # Recover the physical parameters
     charge = np.sign(q_over_pt_plus_one)
-
     pT = 1.0 / np.abs(q_over_pt_plus_one) - 1.0
 
-    phi = np.arctan2(sin_phi, cos_phi,)
+    phi_vertex = event["phi_vertex"].numpy()
+    theta_vertex = event["theta_vertex"].numpy()
+    
+    if USE_HELIX:
+        phi = phi_vertex
+        theta = theta_vertex
+    else:
+        phi = phi_vertex
+        theta = theta_vertex
     
     """
     4-panel event display for the EXACT event loaded from
@@ -488,7 +498,6 @@ def plot_event_display(event, result, vtx_true, save_path):
     # Use the ORIGINAL truth direction saved by test_vertex_simple.py,
     # not VertexHead's reconstructed direction.
     track_dir = event["direction"].numpy()
-    #track_dir = result["vertex_direction"][0].numpy()
 
     # VertexHead's fitted reference positions are still useful for displaying
     # where its track references are located.
@@ -539,10 +548,10 @@ def plot_event_display(event, result, vtx_true, save_path):
                 phi=phi[t],
                 charge=charge[t],
                 B_z=B_FIELD_Z,
-                R_max=R_TPC_OUTER,
+                R_inner=R_TPC_INNER,
+                R_outer=R_TPC_OUTER,
                 n_points=300,
             )
-
             ax_2d.plot(
                 helix_xyz[:, xi],
                 helix_xyz[:, yi],
@@ -551,7 +560,28 @@ def plot_event_display(event, result, vtx_true, save_path):
                 alpha=0.55,
                 zorder=3,
             )
-
+            """
+            helix_r = np.sqrt(helix_xyz[:, 0]**2 + helix_xyz[:, 1]**2)
+            hit_xyz = pts_xyz[mask]
+            hit_r = np.sqrt(pts_xyz[mask, 0]**2 + pts_xyz[mask, 1]**2)
+            
+            print(f"\nTrack {t}")
+            for j in [0, len(hit_xyz)//2, -1]:
+                idx = np.argmin(np.abs(helix_r - hit_r[j]))
+                helix_xy = helix_xyz[idx, :2]
+                hit_xy = hit_xyz[j, :2]
+                distance = np.linalg.norm(helix_xy - hit_xy)
+                helix_phi = np.arctan2(helix_xy[1], helix_xy[0],)
+                hit_phi = np.arctan2(hit_xy[1], hit_xy[0],)
+                dphi = np.arctan2(np.sin(hit_phi - helix_phi), np.cos(hit_phi - helix_phi),)
+                print(
+                    f"  hit {j:>3}: "
+                    f"r={hit_r[j]:7.3f} cm  "
+                    f"distance={distance:8.4f} cm  "
+                    f"dphi={np.degrees(dphi):8.3f} deg"
+                )
+                """
+            
         else:
 
             trajectory = linear_track_points(
@@ -603,7 +633,8 @@ def plot_event_display(event, result, vtx_true, save_path):
                 phi=phi[t],
                 charge=charge[t],
                 B_z=B_FIELD_Z,
-                R_max=R_TPC_OUTER,
+                R_inner=R_TPC_INNER,
+                R_outer=R_TPC_OUTER,
                 n_points=300,
             )
 
@@ -857,7 +888,7 @@ VTX_Z_MAX = 30.0
 
 
 def main():
-    vertex_head = VertexHead(learn_weights=False,  b_z=1.4)
+    vertex_head = VertexHead(learn_weights=False, use_helix=USE_HELIX, b_z=B_FIELD_Z,)
     vertex_head.eval()
 
     # ══════════════════════════════════════════════════════════════════════════
