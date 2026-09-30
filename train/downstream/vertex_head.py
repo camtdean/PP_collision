@@ -338,7 +338,7 @@ def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=F
       
     tan_lambda = torch.cos(theta) / torch.sin(theta)
     b_z_t = torch.full_like(rho, float(b_z))
-    R_s = (p_T / (0.2998 * q * b_z_t)) * SCALING_FACTOR
+    R_s = (p_T / (0.3 * q * b_z_t)) * SCALING_FACTOR
     radius = R_s.abs()
        
     x0 = x_h + R_s * sin_phi
@@ -399,7 +399,7 @@ class VertexHead(nn.Module):
         weight_hidden_dim: int = 32,
         use_helix: bool = True,
         helix_iterations: int = 100,
-        b_z: float = 3.8,
+        b_z: float = 1.4,
     ):
         super().__init__()
         self.learn_weights = learn_weights

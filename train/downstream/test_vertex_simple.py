@@ -30,6 +30,8 @@ import os, sys, math
 import torch
 import numpy as np
 import argparse
+
+from torch.special import psi
  
 # ── import vertex_head from Cameron ──────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -73,7 +75,7 @@ VTX_TRUE = torch.tensor([0.0, 0.0, vz])
 HIT_SMEARING    = 0.01   # cm  (100 µm detector resolution)
  
 # TPC geometry: hits at fixed r_xy layers stepping outward from R_TPC_INNER
-R_TPC_INNER     = 30.0   # cm innermost TPC layer radius
+R_TPC_INNER     = 0.0   # cm innermost TPC layer radius
 TPC_HIT_SPACING =  1.0   # cm r_xy gap between successive hit layers
 R_TPC_OUTER = (
     R_TPC_INNER
@@ -100,9 +102,9 @@ B_FIELD_Z = 1.4            # Tesla
 HELIX_CONST_CM = 100.0 / 0.3
 
 
-def helix_radius_cm(p_T, B_z=B_FIELD_Z, q_abs=1.0):
+def helix_radius_cm(p_T, B_z=B_FIELD_Z, q=1.0):
     """Transverse radius of curvature [cm]."""
-    return p_T * HELIX_CONST_CM / (q_abs * B_z)
+    return p_T * HELIX_CONST_CM / (q * B_z)
 
 def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     """
@@ -114,7 +116,7 @@ def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     vx, vy, vz = vertex
     q = float(charge)
 
-    rho = helix_radius_cm(float(p_T), B_z, abs(q))
+    rho = helix_radius_cm(float(p_T), B_z, q)
 
     # Starting at r_xy = 0, the transverse displacement is
     #     R_target = 2*rho*sin(|alpha|/2)
@@ -132,11 +134,11 @@ def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     alpha = q * math.copysign(alpha_abs, B_z)
 
     # Transverse helix in x-y.
-    x = vx + rho * (math.sin(phi + alpha) - math.sin(phi))
-    y = vy - rho * (math.cos(phi + alpha) - math.cos(phi))
+    x = (vx - rho*math.sin(phi)) + rho*math.sin(phi + alpha)
+    y = (vy + rho*math.cos(phi)) - rho*math.cos(phi + alpha)
     
     # Arc length along the trajectory.
-    s = rho * abs(alpha) # s = rho * |alpha| / sin(theta)
+    s = abs(rho) * abs(alpha) 
 
     # z advances linearly along the helix.
     z = vz + s * math.cos(theta)
@@ -261,7 +263,7 @@ for t in range(N_TRACKS):
         rho = helix_radius_cm(
             pT[t].item(),
             B_FIELD_Z,
-            abs(charge[t].item())
+            charge[t].item()
         )
 
         R_first = R_TPC_INNER
