@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
 """
 plot_vertex.py
-==============
-Two publication-quality figures for PP-collision primary-vertex reconstruction.
 
 Figure 1 — Event display
     • Uses the EXACT event saved by test_vertex_simple.py in vertex_test_inputs.pt.
-    • Hits are coloured by hard track assignment (argmax of mask_probs).
-    • Track direction lines use the ORIGINAL truth directions saved by
-      test_vertex_simple.py (theta_rad and phi_rad).
-    • True primary vertex is taken from the saved true_vertex.
     • Reconstructed vertex is obtained by running VertexHead on the SAVED inputs.
 
 Figure 2 — Truth vs reco scatter
-    • 200 NEW synthetic events.
-    • One panel per coordinate: x, y, z.
-    • Each event gets a newly generated true vertex and newly generated tracks.
-    • Identity line y = x in each panel.
-    • Residual mean μ and standard deviation σ (in µm) shown in each title.
+    • Residual mean mu and standard deviation sigma (in microns) shown in each title.
 
-IMPORTANT
----------
 Figure 1 does NOT regenerate the event. It loads the tensors produced by
 test_vertex_simple.py:
 
@@ -28,8 +16,6 @@ test_vertex_simple.py:
 
 Therefore, the Figure 1 hits, track kinematics, and true vertex are exactly
 the ones saved by test_vertex_simple.py.
-
-Figure 2 remains an independent 200-event synthetic study.
 """
 
 import os
@@ -45,7 +31,7 @@ matplotlib.use("Agg")  # headless rendering — no display window needed
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  registers 3-D projection
-
+import argparse
 
 # ── import VertexHead from the same directory as this script ───────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -70,7 +56,7 @@ except SyntaxError as e:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PALETTE
+# PALETTE. Thanks Claude
 # ══════════════════════════════════════════════════════════════════════════════
 
 SURFACE = "#fcfcfb"
@@ -83,6 +69,148 @@ AXIS_LINE = "#c3c2b7"
 TRUE_VTX_COLOR = INK_PRIMARY
 RECO_VTX_COLOR = "#d03b3b"
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helix configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--use-helix",
+    action="store_true",
+    help="Generate tracks as helices instead of straight lines"
+)
+
+args = parser.parse_args()
+
+USE_HELIX = args.use_helix
+
+print(f"USE_HELIX = {USE_HELIX}")
+
+B_FIELD_Z = 1.4  # Tesla
+HELIX_CONST_CM = 100.0 / 0.3
+
+R_TPC_INNER = 30.0
+R_TPC_OUTER = 78.0
+
+def helix_radius_cm(pT, B_z=B_FIELD_Z, q_abs=1.0):
+    """Transverse radius of curvature [cm]."""
+    return pT * HELIX_CONST_CM / (q_abs * B_z)
+
+
+def helix_points(
+    vertex,
+    pT,
+    theta,
+    phi,
+    charge,
+    B_z=B_FIELD_Z,
+    R_max=R_TPC_OUTER,
+    n_points=300,
+):
+    """
+    Generate the helical trajectory using the SAME parameterization
+    as test_vertex_simple.py.
+
+    Parameters
+    ----------
+    vertex : array-like
+        Starting vertex [x, y, z] in cm.
+    pT : float
+        Transverse momentum in GeV.
+    theta : float
+        Polar angle.
+    phi : float
+        Initial azimuthal angle.
+    charge : float
+        Particle charge (+1/-1).
+    B_z : float
+        Magnetic field in Tesla.
+    R_max : float
+        Maximum transverse radius to display.
+    """
+
+    vx, vy, vz = np.asarray(vertex, dtype=float)
+
+    q = float(charge)
+    pT = float(pT)
+    theta = float(theta)
+    phi = float(phi)
+
+    rho = helix_radius_cm(pT, B_z, abs(q),)
+
+    # Same geometry as test_vertex_simple.py:
+    #
+    # R = 2 rho sin(|alpha|/2)
+    #
+    ratio = R_max / (2.0 * rho)
+
+    # Do not go beyond the maximum transverse displacement 2*rho.
+    ratio = min(ratio, 1.0)
+
+    alpha_abs = 2.0 * np.arcsin(ratio)
+
+    # SAME sign convention as test_vertex_simple.py
+    alpha_max = q * np.copysign(alpha_abs, B_z)
+
+    alpha = np.linspace(0.0, alpha_max, n_points,)
+
+    x = (vx + rho * (np.sin(phi + alpha) - np.sin(phi)))
+    y = (vy - rho * (np.cos(phi + alpha) - np.cos(phi)))
+
+    # Arc length along the helix
+    s = rho * np.abs(alpha)
+
+    # z advances along the trajectory
+    z = vz + s * np.cos(theta)
+
+    return np.column_stack([x, y, z])
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Line configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+def linear_track_points(
+    vertex,
+    theta,
+    phi,
+    R_max=R_TPC_OUTER,
+    n_points=100,
+):
+    """
+    Generate a straight-line trajectory starting at the true vertex.
+
+    The trajectory is extended until approximately R_max in the
+    transverse plane.
+    """
+    vx, vy, vz = np.asarray(vertex, dtype=float)
+
+    theta = float(theta)
+    phi = float(phi)
+
+    # Unit direction vector
+    dx = np.sin(theta) * np.cos(phi)
+    dy = np.sin(theta) * np.sin(phi)
+    dz = np.cos(theta)
+
+    # For a vertex at (0,0), transverse distance is
+    #
+    #   R = s * sin(theta)
+    #
+    # so solve for the path length s that reaches R_max.
+    sin_theta = np.sin(theta)
+
+    if abs(sin_theta) < 1e-8:
+        s_max = R_max
+    else:
+        s_max = R_max / abs(sin_theta)
+
+    s = np.linspace(0.0, s_max, n_points)
+
+    x = vx + s * dx
+    y = vy + s * dy
+    z = vz + s * dz
+
+    return np.column_stack([x, y, z])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SYNTHETIC EVENT GENERATOR
@@ -310,6 +438,22 @@ def _style_ax(ax, xlabel="", ylabel="", title=""):
 # FIGURE 1 — EVENT DISPLAY
 # ══════════════════════════════════════════════════════════════════════════════
 def plot_event_display(event, result, vtx_true, save_path):
+    
+    track_reg = event["track_reg_result"][0].numpy()
+
+    # Actual track parameters stored by test_vertex_simple.py:
+    q_over_pt_plus_one = track_reg[:, 0]
+    theta = track_reg[:, 1]
+    sin_phi = track_reg[:, 2]
+    cos_phi = track_reg[:, 3]
+
+    # Recover the physical parameters
+    charge = np.sign(q_over_pt_plus_one)
+
+    pT = 1.0 / np.abs(q_over_pt_plus_one) - 1.0
+
+    phi = np.arctan2(sin_phi, cos_phi,)
+    
     """
     4-panel event display for the EXACT event loaded from
     test_vertex_simple.py.
@@ -367,7 +511,7 @@ def plot_event_display(event, result, vtx_true, save_path):
     ax_yz = fig.add_subplot(2, 2, 4)
 
     # ── helper: draw one truth track in any projection ──────────────────────
-    def draw_track(ax_2d, t, xi, yi, line_len=6.0):
+    def draw_track(ax_2d, t, xi, yi, line_len=30.0):
         mask = hit_track == t
 
         ax_2d.scatter(
@@ -385,22 +529,51 @@ def plot_event_display(event, result, vtx_true, save_path):
         #
         # The first hit is at index t * N_HITS_PER_TRACK because
         # test_vertex_simple.py stores hits track-by-track.
-        p0 = pts_xyz[t * (len(pts_xyz) // n_tracks)]
-        d0 = track_dir[t]
+        if USE_HELIX:
 
-        ax_2d.plot(
-            [p0[xi], p0[xi] + d0[xi] * line_len],
-            [p0[yi], p0[yi] + d0[yi] * line_len],
-            color=track_colors[t],
-            lw=1.2,
-            alpha=0.55,
-            zorder=3,
-        )
+            helix_xyz = helix_points(
+                vertex=vtx_true_np,
+                pT=pT[t],
+                theta=theta[t],
+                phi=phi[t],
+                charge=charge[t],
+                B_z=B_FIELD_Z,
+                R_max=R_TPC_OUTER,
+                n_points=300,
+            )
+
+            ax_2d.plot(
+                helix_xyz[:, xi],
+                helix_xyz[:, yi],
+                color=track_colors[t],
+                lw=1.2,
+                alpha=0.55,
+                zorder=3,
+            )
+
+        else:
+
+            trajectory = linear_track_points(
+                vertex=vtx_true_np,
+                theta=theta[t],
+                phi=phi[t],
+                R_max=R_TPC_OUTER,
+                n_points=100,
+            )
+
+            ax_2d.plot(
+                trajectory[:, xi],
+                trajectory[:, yi],
+                color=track_colors[t],
+                lw=1.2,
+                alpha=0.55,
+                zorder=3,
+            )
 
     # ── 3-D panel ────────────────────────────────────────────────────────────
     ax3d.set_facecolor(SURFACE)
 
-    LINE_LEN = 6.0
+    LINE_LEN = 30.0
 
     for t in range(n_tracks):
         mask = hit_track == t
@@ -419,17 +592,47 @@ def plot_event_display(event, result, vtx_true, save_path):
         # Start at the exact saved innermost hit and use the exact truth
         # direction saved by test_vertex_simple.py.
         n_hits_per_track = pts_xyz.shape[0] // n_tracks
-        p0 = pts_xyz[t * n_hits_per_track]
-        d0 = track_dir[t]
+        
+        if USE_HELIX:
 
-        ax3d.plot(
-            [p0[0], p0[0] + d0[0] * LINE_LEN],
-            [p0[1], p0[1] + d0[1] * LINE_LEN],
-            [p0[2], p0[2] + d0[2] * LINE_LEN],
-            color=track_colors[t],
-            lw=1.2,
-            alpha=0.55,
-        )
+            helix_xyz = helix_points(
+                vertex=vtx_true_np,
+                pT=pT[t],
+                theta=theta[t],
+                phi=phi[t],
+                charge=charge[t],
+                B_z=B_FIELD_Z,
+                R_max=R_TPC_OUTER,
+                n_points=300,
+            )
+
+            ax3d.plot(
+                helix_xyz[:, 0],
+                helix_xyz[:, 1],
+                helix_xyz[:, 2],
+                color=track_colors[t],
+                lw=1.2,
+                alpha=0.55,
+            )
+
+        else:
+
+            linear_xyz = linear_track_points(
+                vertex=vtx_true_np,
+                theta=theta[t],
+                phi=phi[t],
+                R_max=R_TPC_OUTER,
+                n_points=100,
+            )
+
+            ax3d.plot(
+                linear_xyz[:, 0],
+                linear_xyz[:, 1],
+                linear_xyz[:, 2],
+                color=track_colors[t],
+                lw=1.2,
+                alpha=0.55,
+            )
 
     ax3d.scatter(
         *vtx_true_np,
