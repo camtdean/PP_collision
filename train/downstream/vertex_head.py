@@ -64,6 +64,7 @@ it as a first version, not a substitute for that helical refinement.
 import torch
 import torch.nn as nn
 
+SCALING_FACTOR = 100.0  # placeholder for dataset.py's data_scaler, which is not yet implemented
 
 def track_flight_direction(track_reg_result, epsilon=1e-8):
     """
@@ -201,8 +202,7 @@ def fit_vertex_by_closest_approach(
 def fit_vertex_by_helix_closest_approach(
     fitpars,
     track_weight,
-    n_iterations=5,
-    convergence_tol=1e-4,
+    n_iterations=100,
     is_cosmics=False,
     seed_vertex=None,
     **linear_fit_kwargs,
@@ -234,9 +234,6 @@ def fit_vertex_by_helix_closest_approach(
         track_weight: (n_events, n_tracks) -- same meaning as in
             fit_vertex_by_closest_approach
         n_iterations: max outer iterations
-        convergence_tol: stop early once every event's vertex moves less
-            than this between iterations (events with an invalid fit are
-            excluded from this check, not left stalling the loop)
         is_cosmics: passed through to get_helix_tangent, see helix_transport.py
         seed_vertex: (n_events, 3) starting point for iteration 0. Defaults
             to the origin. Seeding from fit_vertex_by_closest_approach's own
@@ -287,7 +284,7 @@ def fit_vertex_by_helix_closest_approach(
         # remainder of a batched (vectorized-over-events) iteration.
         PV = torch.where(fit_is_valid.unsqueeze(-1), new_PV, PV)
 
-        still_moving = still_moving & fit_is_valid & (step > convergence_tol)
+        still_moving = still_moving & fit_is_valid & (step > 1e-4)
         if not still_moving.any():
             break
         
@@ -325,7 +322,7 @@ def _wrap_to_pi(angle):
     return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
-def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005, epsilon=1e-8):
+def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005):
     """
     Vectorized port of TrackFitUtils::get_helix_tangent.
 
@@ -356,7 +353,7 @@ def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005, epsilon=1
 
     point_xy = point[..., 0:2]
 
-    pca_circle = get_circle_point_pca(radius, x0, y0, point_xy, epsilon=epsilon)  # (..., 2)
+    pca_circle = get_circle_point_pca(radius, x0, y0, point_xy)  # (..., 2)
 
     pca_circle_radius = pca_circle.norm(dim=-1)
     if is_cosmics:
@@ -380,7 +377,7 @@ def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005, epsilon=1
     second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
 
     raw_tangent = second_point_pca - pca
-    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=epsilon)
+    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True)
 
     # Direction is ambiguous (d_angle could as easily have been negative) --
     # resolved the same way the C++ does, using the direction from the
@@ -392,6 +389,59 @@ def get_helix_tangent(fitpars, point, is_cosmics=False, d_angle=0.005, epsilon=1
     tangent = torch.where(flip.unsqueeze(-1), -tangent, tangent)
 
     return pca, tangent
+
+def track_reg_to_fitpars(track_reg_result, track_position, b_z):
+    """
+    Convert the track-finding head's regression output into TrackFitUtils'
+    fitpars convention, evaluated at the given reference point (normally the
+    innermost assigned hit, i.e. exactly track_position from
+    VertexHead.track_position_from_hits).
+ 
+    Args:
+        track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
+        track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
+            the regression was evaluated at, same leading shape
+        b_z: solenoid field, Tesla. Scalar (python float) or (...)-
+            broadcastable tensor. Sign matters: it enters the
+            curvature-sign convention along with charge, per the derivation
+            this implements.
+        data_scaler: converts the 0.2998*B*R relation (R in meters) into
+            whatever length unit track_position is stored in (e.g. 100 for
+            cm).
+        epsilon: numerical floor for divisions (sin(theta), cos(alpha), B_z)
+ 
+    Returns:
+        fitpars: (..., 5) tensor -- (radius, x0, y0, zslope, z0)
+    """
+    rho = track_reg_result[..., 0]
+    theta = track_reg_result[..., 1]
+    sin_phi = track_reg_result[..., 2]
+    cos_phi = track_reg_result[..., 3]
+ 
+    x_h = track_position[..., 0]
+    y_h = track_position[..., 1]
+    z_h = track_position[..., 2]
+ 
+    q = torch.sign(rho)
+    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
+    p_T = (1.0 / rho.abs()) - 1.0
+
+    tan_lambda = torch.cos(theta) / torch.sin(theta)
+    b_z_t = torch.full_like(rho, float(b_z))
+    R_s = (p_T / (0.2998 * q * b_z_t)) * SCALING_FACTOR
+    radius = R_s.abs()
+ 
+    x0 = x_h + R_s * sin_phi
+    y0 = y_h - R_s * cos_phi
+ 
+    r_h = torch.sqrt(x_h * x_h + y_h * y_h)
+
+    cos_alpha = (x_h * cos_phi + y_h * sin_phi) / r_h
+    
+    zslope = tan_lambda / cos_alpha #TODO: update to use TrackFitUtils::line_fit / line_fit_xz
+    z0 = z_h - zslope * r_h
+ 
+    return torch.stack([radius, x0, y0, zslope, z0], dim=-1)
 
 class VertexHead(nn.Module):
     """
@@ -409,15 +459,15 @@ class VertexHead(nn.Module):
         self,
         learn_weights: bool = False,
         weight_hidden_dim: int = 32,
-        use_helix: bool = False,
+        use_helix: bool = True,
         helix_iterations: int = 5,
-        helix_convergence_tol: float = 1e-4,
+        b_z: float = 3.8,
     ):
         super().__init__()
         self.learn_weights = learn_weights
         self.use_helix = use_helix
         self.helix_iterations = helix_iterations
-        self.helix_convergence_tol = helix_convergence_tol
+        self.b_z = b_z       
         if learn_weights:
             # Input features: class_probs (2) + track_reg_result (4) = 6.
             # Deliberately no PID and no track_position here -- this network
@@ -479,7 +529,7 @@ class VertexHead(nn.Module):
         track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
         return track_position, total_hit_weight
 
-    def forward(self, class_probs, track_reg_result, mask_probs, points, padding_mask, fitpars=None):
+    def forward(self, class_probs, track_reg_result, mask_probs, points, padding_mask):
         """
         Args:
             class_probs: (n_events, n_tracks, 2) from MambaAttentionHead
@@ -491,19 +541,6 @@ class VertexHead(nn.Module):
             mask_probs: (n_events, n_hits, n_tracks) from MambaAttentionHead
             points: (n_events, n_hits, 4) raw hits (same tensor fed to the backbone)
             padding_mask: (n_events, n_hits) True where a hit is real
-            fitpars: (n_events, n_tracks, 5) or None. Required when
-                use_helix=True: (radius, x0, y0, zslope, z0) per track in
-                TrackFitUtils.cc's convention (see helix_transport.py).
-                THIS IS NOT YET PRODUCED ANYWHERE UPSTREAM -- the
-                MambaAttentionHead regression output is (q/(pT+1), theta,
-                sin(phi), cos(phi)), a different parameterization, and
-                converting it into (radius, x0, y0, zslope, z0) needs the
-                magnetic field strength and the same data_scaler that the
-                original docstring above already flags as a placeholder
-                (currently 1, in dataset.py). Until that conversion and a
-                real data_scaler exist, fitpars must come from wherever
-                TrackFitUtils::fitClusters (or equivalent) already runs, or
-                use_helix must stay False. Ignored when use_helix is False.
 
         Returns:
             {
@@ -539,6 +576,8 @@ class VertexHead(nn.Module):
             # and how confident the track finder is that it's real
             track_weight = probability_track_is_real * total_hit_weight
 
+        fitpars = track_reg_to_fitpars(track_reg_result, track_position, self.b_z)
+
         if self.use_helix:
             if fitpars is None:
                 raise ValueError(
@@ -549,7 +588,6 @@ class VertexHead(nn.Module):
                 fitpars,  #Add fitpar translation
                 track_weight,
                 n_iterations=self.helix_iterations,
-                convergence_tol=self.helix_convergence_tol,
                 seed_vertex = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)["vertex_estimate"]
             )
         else:

@@ -115,7 +115,7 @@ def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     # Transverse helix in x-y.
     x = vx + rho * (math.sin(phi + alpha) - math.sin(phi))
     y = vy - rho * (math.cos(phi + alpha) - math.cos(phi))
-
+    
     # Arc length along the trajectory.
     s = rho * abs(alpha)
 
