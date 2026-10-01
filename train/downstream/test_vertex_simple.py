@@ -90,7 +90,27 @@ parser.add_argument(
     help="Generate tracks as helices instead of straight lines"
 )
 
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Random seed for reproducible event generation"
+)
+
+parser.add_argument(
+    "--output",
+    type=str,
+    default="vertex_test_events/vertex_test_inputs.pt",
+    help="Output .pt filename"
+)
+
 args = parser.parse_args()
+
+if args.seed is not None:
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    print(f"Random seed = {args.seed}")
 
 USE_HELIX = args.use_helix
 
@@ -145,30 +165,6 @@ def helix_position_at_radius(vertex, p_T, theta, phi, charge, B_z, R_target):
     z = vz + s_3d * math.cos(theta)
     
     return torch.tensor([x, y, z], dtype=torch.float32)
-
-"""  
-    # Starting at r_xy = 0, the transverse displacement is
-    #     R_target = 2*rho*sin(|alpha|/2)
-    ratio = R_target / (2.0 * rho)
-
-    if ratio > 1.0:
-        raise ValueError(
-            f"Requested radius {R_target:.3f} cm exceeds "
-            f"the maximum transverse displacement 2*rho = {2.0*rho:.3f} cm."
-        )
-
-    alpha_abs = 2.0 * math.asin(min(ratio, 1.0))
-
-    # Charge and B-field sign determine bending direction.
-    alpha = -q * math.copysign(alpha_abs, B_z)
-
-    # Transverse helix in x-y.
-    x = vx + rho * (math.sin(phi + alpha) - math.sin(phi))
-    y = vy - rho * (math.cos(phi + alpha) - math.cos(phi))
-    z = vz + rho * abs(alpha) * math.cos(theta) / math.sin(theta)
-
-    return torch.tensor([x, y, z], dtype=torch.float32)
-"""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2.  Track kinematics
@@ -336,7 +332,7 @@ for t in range(N_TRACKS):
  
 # hits are created here for the FM4NPP format
 points = torch.tensor(rows, dtype=torch.float32).unsqueeze(0)  # (1, 150, 4)
-
+"""
 print("\nHELIX DEBUG")
 
 for t in range(N_TRACKS):
@@ -358,7 +354,7 @@ for t in range(N_TRACKS):
     y0_true = y_h + R_s_true * math.cos(first_hit_phi[t].item())
 
     print("true circle center =", x0_true, y0_true)
-
+    """
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Build the five tensors VertexHead.forward() expects simulating the output file from data in the FM4NPP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -372,11 +368,12 @@ if USE_HELIX:
 else: 
     phi_for_vertex = phi
  
-
+"""
 print("vertex phi      =", phi[t].item())
 print("first hit phi   =", first_hit_phi[t].item())
 print("alpha first     =", alpha_first)
 print("first hit xyz   =", points[0, t*N_HITS_PER_TRACK, 1:4])
+"""
 
 # ── track_reg_result  (1, 5, 4) ────────────────────────────────────────────
 #    columns: [ q/(pT+1),  theta,  sin(phi),  cos(phi) ]
@@ -421,7 +418,7 @@ for t in range(N_TRACKS):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 5.  Save inputs so they can be reloaded later
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-save_path = os.path.join(_HERE, "vertex_test_inputs.pt")
+save_path = os.path.join(_HERE, args.output)
 torch.save({
     "class_probs":        class_probs,
     "track_reg_result":   track_reg_result,
@@ -443,7 +440,12 @@ print(f"\n  Inputs saved → {save_path}")
 # 6.  Run VertexHead
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 print("\nRunning VertexHead …")
-vertex_head = VertexHead(learn_weights=False)
+
+vertex_head = VertexHead(
+    learn_weights=False,
+    use_helix=USE_HELIX,
+    b_z=B_FIELD_Z,
+)
  
 with torch.no_grad():
     result = vertex_head(
