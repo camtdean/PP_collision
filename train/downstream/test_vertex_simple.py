@@ -100,7 +100,7 @@ parser.add_argument(
 parser.add_argument(
     "--output",
     type=str,
-    default="vertex_test_events/vertex_test_inputs.pt",
+    default="vertex_test_inputs.pt",
     help="Output .pt filename"
 )
 
