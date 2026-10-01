@@ -204,7 +204,7 @@ def fit_vertex_by_helix_closest_approach(
     track_position,
     b_z,
     track_weight,
-    n_iterations=5,
+    n_iterations=100,
     is_cosmics=False,
     seed_vertex=None,
     **linear_fit_kwargs,
@@ -239,6 +239,7 @@ def fit_vertex_by_helix_closest_approach(
     dtype = track_reg_result.dtype
 
     if seed_vertex is None:
+        print("WARNING: no seed_vertex provided, starting helix iteration from the origin.")
         PV = torch.zeros(n_events, 3, device=device, dtype=dtype)
     else:
         PV = seed_vertex.clone()
@@ -399,7 +400,7 @@ class VertexHead(nn.Module):
         weight_hidden_dim: int = 32,
         use_helix: bool = True,
         helix_iterations: int = 100,
-        b_z: float = 1.4,
+        b_z: float = 0.0,
     ):
         super().__init__()
         self.learn_weights = learn_weights
@@ -418,6 +419,9 @@ class VertexHead(nn.Module):
                 nn.Linear(weight_hidden_dim, 1),
                 nn.Softplus(),  # weights must be >= 0
             )
+
+    def dontUseHelix(self, use_helix: bool = False):
+        self.use_helix = use_helix
 
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
@@ -514,18 +518,20 @@ class VertexHead(nn.Module):
             # and how confident the track finder is that it's real
             track_weight = probability_track_is_real * total_hit_weight
 
+        fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
 
-        if self.use_helix:
+        if (self.use_helix and self.b_z != 0.0):
             fit = fit_vertex_by_helix_closest_approach(
                 track_reg_result,
                 track_position,
                 self.b_z,
                 track_weight,
                 n_iterations=self.helix_iterations,
-                seed_vertex = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)["vertex_estimate"]
+                seed_vertex = fit["vertex_estimate"]
             )
-        else:
-            fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
+        elif self.b_z == 0.0:
+            print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
+     
 
         return {
             "vertex_estimate": fit["vertex_estimate"],
