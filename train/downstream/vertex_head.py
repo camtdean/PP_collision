@@ -200,6 +200,8 @@ def fit_vertex_by_closest_approach(
 
 
 def fit_vertex_by_helix_closest_approach(
+    points,
+    mask,
     track_reg_result,
     track_position,
     b_z,
@@ -248,9 +250,19 @@ def fit_vertex_by_helix_closest_approach(
     n_iterations_used = torch.zeros(n_events, dtype=torch.long, device=device)
     result = None
 
+    n_tracks = mask.shape[-1]
+    hit_x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks)
+    hit_y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks)
+    hit_z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks)
+        
+    if not is_cosmics:    
+        zslope, z0 = line_fit(torch.sqrt(hit_x**2 + hit_y**2), hit_z, mask) 
+    else:
+        zslope, z0 = line_fit(hit_x, hit_z, mask)
+
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
-        new_track_position, track_direction = get_helix_tangent(track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
+        new_track_position, track_direction = get_helix_tangent(zslope, z0, track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
 
         result = fit_vertex_by_closest_approach(new_track_position, track_direction, track_weight, **linear_fit_kwargs)
 
@@ -298,7 +310,7 @@ def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
     norm = diff.norm(dim=-1, keepdim=True).clamp(min=epsilon)
     return origin + radius.unsqueeze(-1) * diff / norm
 
-def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=False, d_angle=0.005):
+def get_helix_tangent(zslope, z0, track_reg_result, track_position, b_z, point, is_cosmics=False, d_angle=0.005):
     """
     Vectorized port of TrackFitUtils::get_helix_tangent.
 
@@ -337,21 +349,13 @@ def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=F
     q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
     p_T = (1.0 / rho.abs()) - 1.0
       
-    tan_lambda = torch.cos(theta) / torch.sin(theta)
     b_z_t = torch.full_like(rho, float(b_z))
     R_s = (p_T / (0.3 * q * b_z_t)) * SCALING_FACTOR
     radius = R_s.abs()
        
     x0 = x_h + R_s * sin_phi
     y0 = y_h - R_s * cos_phi
-       
-    r_h = torch.sqrt(x_h * x_h + y_h * y_h)
-      
-    cos_alpha = (x_h * cos_phi + y_h * sin_phi) / r_h
-          
-    zslope = tan_lambda / cos_alpha #TODO: update to use TrackFitUtils::line_fit / line_fit_xz
-    z0 = z_h - zslope * r_h
-
+    
     point_xy = point[..., 0:2]
 
     pca_circle = get_circle_point_pca(radius, x0, y0, point_xy)  # (..., 2)
@@ -378,9 +382,63 @@ def get_helix_tangent(track_reg_result, track_position, b_z, point, is_cosmics=F
     second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
 
     raw_tangent = second_point_pca - pca
-    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True)
+    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
 
     return pca, tangent
+
+def _masked_mean(value, mask, denom, eps):
+    """sum(value * mask) / denom, broadcasting mask over value's last dims as needed."""
+    return (value * mask).sum(dim=1) / denom.clamp(min=eps)
+
+
+def line_fit(u, v, mask, min_hits=2, eps=1e-12):
+    """
+    Vectorized port of TrackFitUtils::line_fit (the Deming/orthogonal-
+    distance line fit -- minimizes true perpendicular distance, not
+    vertical residual, assuming equal variance in u and v).
+ 
+    Args:
+        u, v: (n_events, n_hits, n_tracks), the two coordinates to fit
+            v = slope*u + intercept against (caller picks which physical
+            coordinates these are -- see line_fit_r_z / line_fit_xz below,
+            matching the C++'s named overloads)
+        mask: (n_events, n_hits, n_tracks) bool/float, same convention as
+            circle_fit_by_taubin
+        min_hits: C++ requires only size() >= 1 implicitly (no guard at
+            all, in fact -- it'll divide by n=0 or by a degenerate
+            ssd_xy=0 for a single point). 2 is the practical minimum for a
+            line to mean anything; raise it if you want a safety margin
+            against near-degenerate fits.
+        eps: numerical floor on ssd_xy, not present in the original
+            (single-track) C++, for the same batched-NaN-isolation reason
+            as circle_fit_by_taubin.
+ 
+    Returns:
+        slope, intercept: (n_events, n_tracks)
+        valid: (n_events, n_tracks) bool
+    """
+    mask = mask.to(u.dtype)
+    n_valid = mask.sum(dim=1)
+    valid = n_valid >= min_hits
+ 
+    mean_u = _masked_mean(u, mask, n_valid, eps)
+    mean_v = _masked_mean(v, mask, n_valid, eps)
+ 
+    du = u - mean_u.unsqueeze(1)
+    dv = v - mean_v.unsqueeze(1)
+ 
+    ssd_u = _masked_mean(du * du, mask, n_valid, eps) * n_valid  # sums, not means -- matches C++ (raw sums, not /n)
+    ssd_v = _masked_mean(dv * dv, mask, n_valid, eps) * n_valid
+    ssd_uv = _masked_mean(du * dv, mask, n_valid, eps) * n_valid
+ 
+    ssd_uv_safe = torch.where(ssd_uv.abs() < eps, torch.full_like(ssd_uv, eps), ssd_uv)
+    slope = (ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 / ssd_uv_safe
+    intercept = mean_v - slope * mean_u
+ 
+    nan = torch.full_like(slope, float("nan"))
+    slope = torch.where(valid, slope, nan)
+    intercept = torch.where(valid, intercept, nan)
+    return slope, intercept
 
 class VertexHead(nn.Module):
     """
@@ -400,7 +458,7 @@ class VertexHead(nn.Module):
         weight_hidden_dim: int = 32,
         use_helix: bool = True,
         helix_iterations: int = 100,
-        b_z: float = 0.0,
+        b_z: float = 1.0,
     ):
         super().__init__()
         self.learn_weights = learn_weights
@@ -469,7 +527,7 @@ class VertexHead(nn.Module):
         innermost_hit_position = hit_position[event_index, innermost_hit_index]
 
         track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
-        return track_position, total_hit_weight
+        return track_position, total_hit_weight, is_assigned
 
     def forward(self, class_probs, track_reg_result, mask_probs, points, padding_mask):
         """
@@ -504,7 +562,7 @@ class VertexHead(nn.Module):
                   summed over the whole event
             }
         """
-        track_position, total_hit_weight = self.track_position_from_hits(points, mask_probs, padding_mask)
+        track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
 
         probability_track_is_real = class_probs[..., 1]
@@ -522,6 +580,8 @@ class VertexHead(nn.Module):
 
         if (self.use_helix and self.b_z != 0.0):
             fit = fit_vertex_by_helix_closest_approach(
+                points,
+                is_assigned,
                 track_reg_result,
                 track_position,
                 self.b_z,
