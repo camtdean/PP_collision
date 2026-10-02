@@ -64,6 +64,7 @@ it as a first version, not a substitute for that helical refinement.
 import torch
 import torch.nn as nn
 
+SCALING_FACTOR = 100.0  # placeholder for dataset.py's data_scaler, which is not yet implemented
 
 def track_flight_direction(track_reg_result, epsilon=1e-8):
     """
@@ -96,7 +97,7 @@ def fit_vertex_by_closest_approach(
     regularization=1e-9,
     minimum_eigenvalue_ratio=1e-4,
 ): 
-   """
+    """
     Weighted least-squares point of closest approach to a set of straight
     tracks, solved independently for each event.
 
@@ -198,6 +199,247 @@ def fit_vertex_by_closest_approach(
     }
 
 
+def fit_vertex_by_helix_closest_approach(
+    points,
+    mask,
+    track_reg_result,
+    track_position,
+    b_z,
+    track_weight,
+    n_iterations=100,
+    is_cosmics=False,
+    seed_vertex=None,
+    **linear_fit_kwargs,
+):
+    """
+    Helix-aware primary vertex fit, built on top of
+    fit_vertex_by_closest_approach.
+
+    Args:
+        track_reg_result: (n_events, n_tracks, 4) -- (q/(pT+1), theta, sin(phi), cos(phi))
+        track_position: (n_events, n_tracks, 3) -- reference point on each
+            track's line (the innermost assigned hit, see track_position_from_hits)
+        b_z: solenoid field, Tesla. Scalar (python float) or (...)-dimensional tensor
+        track_weight: (n_events, n_tracks) -- same meaning as in
+            fit_vertex_by_closest_approach
+        n_iterations: max outer iterations
+        is_cosmics: passed through to get_helix_tangent, see helix_transport.py
+        seed_vertex: (n_events, 3) starting point for iteration 0. Defaults
+            to the origin. Seeding from fit_vertex_by_closest_approach's own
+            straight-line answer (using each track's PCA-to-origin point and
+            direction as an approximation) converges in fewer iterations and
+            is recommended once you have that fit available upstream.
+        **linear_fit_kwargs: forwarded to fit_vertex_by_closest_approach
+            (minimum_total_weight, regularization, minimum_eigenvalue_ratio)
+
+    Returns:
+        Same dict as fit_vertex_by_closest_approach, from the final
+        iteration
+    """
+    n_events, n_tracks, _ = track_reg_result.shape
+    device = track_reg_result.device
+    dtype = track_reg_result.dtype
+
+    if seed_vertex is None:
+        print("WARNING: no seed_vertex provided, starting helix iteration from the origin.")
+        PV = torch.zeros(n_events, 3, device=device, dtype=dtype)
+    else:
+        PV = seed_vertex.clone()
+
+    still_moving = torch.ones(n_events, dtype=torch.bool, device=device)
+    n_iterations_used = torch.zeros(n_events, dtype=torch.long, device=device)
+    result = None
+
+    n_tracks = mask.shape[-1]
+    hit_x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks)
+    hit_y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks)
+    hit_z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks)
+        
+    if not is_cosmics:    
+        zslope, z0 = line_fit(torch.sqrt(hit_x**2 + hit_y**2), hit_z, mask) 
+    else:
+        zslope, z0 = line_fit(hit_x, hit_z, mask)
+
+    for iteration in range(n_iterations):
+        PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
+        new_track_position, track_direction = get_helix_tangent(zslope, z0, track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
+
+        result = fit_vertex_by_closest_approach(new_track_position, track_direction, track_weight, **linear_fit_kwargs)
+
+        new_PV = result["vertex_estimate"]
+        fit_is_valid = result["fit_is_valid"]
+
+        # NaN-safe step size: invalid-fit events never count as "still
+        # moving" (there's nothing to converge), so they don't block the
+        # early-exit check below.
+        step = (new_PV - PV).norm(dim=-1)
+        step = torch.where(fit_is_valid, step, torch.zeros_like(step))
+
+        n_iterations_used = torch.where(
+            still_moving & fit_is_valid, torch.full_like(n_iterations_used, iteration + 1), n_iterations_used
+        )
+
+        # Only advance the vertex where the fit is valid; hold position
+        # elsewhere so one bad event's NaNs can't corrupt PV for the
+        # remainder of a batched (vectorized-over-events) iteration.
+        PV = torch.where(fit_is_valid.unsqueeze(-1), new_PV, PV)
+
+        still_moving = still_moving & fit_is_valid & (step > 1e-4)
+        if not still_moving.any():
+            break
+        
+    return result
+
+def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
+    """
+    Vectorized port of TrackFitUtils::get_circle_point_pca.
+
+    PCA of `point_xy` to the circle (x0, y0, radius): draw a line from the
+    circle center through the point: the PCA is at distance `radius` from
+    the center along that line. Exact, closed form -- no iteration.
+
+    Args:
+        radius, x0, y0: (...) tensors, broadcastable to a common shape
+        point_xy: (..., 2) tensor, broadcastable against radius/x0/y0
+
+    Returns:
+        (..., 2) tensor: the PCA point in the transverse plane
+    """
+    origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
+    diff = point_xy - origin
+    norm = diff.norm(dim=-1, keepdim=True).clamp(min=epsilon)
+    return origin + radius.unsqueeze(-1) * diff / norm
+
+def get_helix_tangent(zslope, z0, track_reg_result, track_position, b_z, point, is_cosmics=False, d_angle=0.005):
+    """
+    Vectorized port of TrackFitUtils::get_helix_tangent.
+
+    For each track and each corresponding query point, returns a local
+    straight-line approximation to that track's helix at the point on the
+    helix nearest `point`: a (pca_point, unit_tangent) pair.
+
+    Args:
+        track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
+        track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
+            the regression was evaluated at, same leading shape
+        b_z: solenoid field, Tesla. Scalar (python float) or (...)-
+            broadcastable tensor.
+        point: (..., 3) tensor, same leading shape as fitpars[..., 0] --
+            the point to transport each track to (the trial vertex,
+            broadcast across tracks)
+        is_cosmics: bool, see module docstring
+        d_angle: angular step (radians) used to locate a second point on
+            the circle for the tangent direction -- matches the C++ default
+
+    Returns:
+        pca: (..., 3) tensor -- point on the helix nearest `point`
+        tangent: (..., 3) unit tensor -- local flight direction there
+    """
+
+    rho = track_reg_result[..., 0]
+    theta = track_reg_result[..., 1]
+    sin_phi = track_reg_result[..., 2]
+    cos_phi = track_reg_result[..., 3]
+       
+    x_h = track_position[..., 0]
+    y_h = track_position[..., 1]
+    z_h = track_position[..., 2]
+       
+    q = torch.sign(rho)
+    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
+    p_T = (1.0 / rho.abs()) - 1.0
+      
+    b_z_t = torch.full_like(rho, float(b_z))
+    R_s = (p_T / (0.3 * q * b_z_t)) * SCALING_FACTOR
+    radius = R_s.abs()
+       
+    x0 = x_h + R_s * sin_phi
+    y0 = y_h - R_s * cos_phi
+    
+    point_xy = point[..., 0:2]
+
+    pca_circle = get_circle_point_pca(radius, x0, y0, point_xy)  # (..., 2)
+
+    pca_circle_radius = pca_circle.norm(dim=-1)
+    if is_cosmics:
+        pca_z = pca_circle[..., 0] * zslope + z0
+    else:
+        pca_z = pca_circle_radius * zslope + z0
+    pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)  # (..., 3)
+
+    # Second point on the circle, a small angle further along, to define
+    # the local tangent direction.
+    angle_pca = torch.atan2(pca_circle[..., 1] - y0, pca_circle[..., 0] - x0)
+    new_angle = angle_pca - torch.sign(R_s) * d_angle
+    newx = radius * torch.cos(new_angle) + x0
+    newy = radius * torch.sin(new_angle) + y0
+    new_xy = torch.stack([newx, newy], dim=-1)
+
+    if is_cosmics:
+        new_z = newx * zslope + z0
+    else:
+        new_z = new_xy.norm(dim=-1) * zslope + z0
+    second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
+
+    raw_tangent = second_point_pca - pca
+    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+
+    return pca, tangent
+
+def _masked_mean(value, mask, denom, eps):
+    """sum(value * mask) / denom, broadcasting mask over value's last dims as needed."""
+    return (value * mask).sum(dim=1) / denom.clamp(min=eps)
+
+
+def line_fit(u, v, mask, min_hits=2, eps=1e-12):
+    """
+    Vectorized port of TrackFitUtils::line_fit (the Deming/orthogonal-
+    distance line fit -- minimizes true perpendicular distance, not
+    vertical residual, assuming equal variance in u and v).
+ 
+    Args:
+        u, v: (n_events, n_hits, n_tracks), the two coordinates to fit
+            v = slope*u + intercept against (caller picks which physical
+            coordinates these are -- see line_fit_r_z / line_fit_xz below,
+            matching the C++'s named overloads)
+        mask: (n_events, n_hits, n_tracks) bool/float, same convention as
+            circle_fit_by_taubin
+        min_hits: C++ requires only size() >= 1 implicitly (no guard at
+            all, in fact -- it'll divide by n=0 or by a degenerate
+            ssd_xy=0 for a single point). 2 is the practical minimum for a
+            line to mean anything; raise it if you want a safety margin
+            against near-degenerate fits.
+        eps: numerical floor on ssd_xy, not present in the original
+            (single-track) C++, for the same batched-NaN-isolation reason
+            as circle_fit_by_taubin.
+ 
+    Returns:
+        slope, intercept: (n_events, n_tracks)
+        valid: (n_events, n_tracks) bool
+    """
+    mask = mask.to(u.dtype)
+    n_valid = mask.sum(dim=1)
+    valid = n_valid >= min_hits
+ 
+    mean_u = _masked_mean(u, mask, n_valid, eps)
+    mean_v = _masked_mean(v, mask, n_valid, eps)
+ 
+    du = u - mean_u.unsqueeze(1)
+    dv = v - mean_v.unsqueeze(1)
+ 
+    ssd_u = _masked_mean(du * du, mask, n_valid, eps) * n_valid  # sums, not means -- matches C++ (raw sums, not /n)
+    ssd_v = _masked_mean(dv * dv, mask, n_valid, eps) * n_valid
+    ssd_uv = _masked_mean(du * dv, mask, n_valid, eps) * n_valid
+ 
+    ssd_uv_safe = torch.where(ssd_uv.abs() < eps, torch.full_like(ssd_uv, eps), ssd_uv)
+    slope = (ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 / ssd_uv_safe
+    intercept = mean_v - slope * mean_u
+ 
+    nan = torch.full_like(slope, float("nan"))
+    slope = torch.where(valid, slope, nan)
+    intercept = torch.where(valid, intercept, nan)
+    return slope, intercept
+
 class VertexHead(nn.Module):
     """
     Zero learnable parameters by default (learn_weights=False): the
@@ -210,9 +452,19 @@ class VertexHead(nn.Module):
     if you do this.
     """
 
-    def __init__(self, learn_weights: bool = False, weight_hidden_dim: int = 32):
+    def __init__(
+        self,
+        learn_weights: bool = False,
+        weight_hidden_dim: int = 32,
+        use_helix: bool = True,
+        helix_iterations: int = 100,
+        b_z: float = 1.0,
+    ):
         super().__init__()
         self.learn_weights = learn_weights
+        self.use_helix = use_helix
+        self.helix_iterations = helix_iterations
+        self.b_z = b_z       
         if learn_weights:
             # Input features: class_probs (2) + track_reg_result (4) = 6.
             # Deliberately no PID and no track_position here -- this network
@@ -225,6 +477,9 @@ class VertexHead(nn.Module):
                 nn.Linear(weight_hidden_dim, 1),
                 nn.Softplus(),  # weights must be >= 0
             )
+
+    def dontUseHelix(self, use_helix: bool = False):
+        self.use_helix = use_helix
 
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
@@ -272,13 +527,17 @@ class VertexHead(nn.Module):
         innermost_hit_position = hit_position[event_index, innermost_hit_index]
 
         track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
-        return track_position, total_hit_weight
+        return track_position, total_hit_weight, is_assigned
 
     def forward(self, class_probs, track_reg_result, mask_probs, points, padding_mask):
         """
         Args:
             class_probs: (n_events, n_tracks, 2) from MambaAttentionHead
-            track_reg_result: (n_events, n_tracks, 4) from MambaAttentionHead
+            track_reg_result: (n_events, n_tracks, 4) from MambaAttentionHead --
+                still (q/(pT+1), theta, sin(phi), cos(phi)); only used here to
+                score track quality (learn_weights=True) and, when use_helix
+                is False, to build the straight-line direction as before.
+                It is NOT the helix parameterization -- see fitpars.
             mask_probs: (n_events, n_hits, n_tracks) from MambaAttentionHead
             points: (n_events, n_hits, 4) raw hits (same tensor fed to the backbone)
             padding_mask: (n_events, n_hits) True where a hit is real
@@ -303,7 +562,7 @@ class VertexHead(nn.Module):
                   summed over the whole event
             }
         """
-        track_position, total_hit_weight = self.track_position_from_hits(points, mask_probs, padding_mask)
+        track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
 
         probability_track_is_real = class_probs[..., 1]
@@ -319,9 +578,24 @@ class VertexHead(nn.Module):
 
         fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
 
+        if (self.use_helix and self.b_z != 0.0):
+            fit = fit_vertex_by_helix_closest_approach(
+                points,
+                is_assigned,
+                track_reg_result,
+                track_position,
+                self.b_z,
+                track_weight,
+                n_iterations=self.helix_iterations,
+                seed_vertex = fit["vertex_estimate"]
+            )
+        elif self.b_z == 0.0:
+            print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
+     
+
         return {
             "vertex_estimate": fit["vertex_estimate"],
-            "chi_square": fit["chi_square"],
+            "chi_square": fit["chi_square"], 
             "fit_is_valid": fit["fit_is_valid"],
             "track_position": track_position,
             "track_direction": track_direction,
