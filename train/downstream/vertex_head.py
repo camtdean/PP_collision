@@ -274,10 +274,13 @@ def fit_vertex_by_helix_closest_approach(
     y0 = y_h - R_s * cos_phi
     
     angle = torch.atan2(hit_y - y0, hit_x - x0)
-    angle_ref = angle[..., 0:1, :]  # reference: first/innermost hit per track
-    
+    angle_ref = angle[..., 0, :]  # (n_events, n_tracks)
+
     if not is_cosmics:    
-        d_angle = torch.atan2(torch.sin(angle - angle_ref), torch.cos(angle - angle_ref))  # wrapped
+        d_angle = torch.atan2(
+            torch.sin(angle - angle_ref.unsqueeze(1)),
+            torch.cos(angle - angle_ref.unsqueeze(1)),
+        )  # wrapped
         s = radius.unsqueeze(1) * d_angle
         zslope, z0 = line_fit(s, hit_z, mask)
     else:
