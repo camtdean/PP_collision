@@ -64,9 +64,6 @@ it as a first version, not a substitute for that helical refinement.
 import torch
 import torch.nn as nn
 
-SCALING_FACTOR = 100.0  # placeholder for dataset.py's data_scaler, which is not yet implemented
-IS_COSMICS = False
-
 def track_flight_direction(track_reg_result, epsilon=1e-8):
     """
     Reconstruct each track's unit flight direction from the track-finding
@@ -210,6 +207,8 @@ def fit_vertex_by_helix_closest_approach(
     n_iterations=100,
     seed_vertex=None,
     d_angle=0.005,
+    scaling_factor = 100.0,  # placeholder for dataset.py's data_scaler, which is not yet implemented
+    is_cosmics = False,
     **linear_fit_kwargs,
 ):
     """
@@ -227,15 +226,42 @@ def fit_vertex_by_helix_closest_approach(
         track_weight: (n_events, n_tracks) -- same meaning as in
             fit_vertex_by_closest_approach
         n_iterations: max outer iterations
-        is_cosmics: passed through to get_helix_tangent, see helix_transport.py
         seed_vertex: (n_events, 3) starting point for iteration 0. Defaults
             to the origin.
+        d_angle: small angle (radians) to step along each track's helix
+        scaling_factor: placeholder for dataset.py's data_scaler, which is
+            not yet implemented. Used to convert the track_reg_result's
+            q/(pT+1) into a radius in the same units as points[..., 1:4].
+        is_cosmics: if True, fit a straight line in z vs. x
         **linear_fit_kwargs: forwarded to fit_vertex_by_closest_approach
             (minimum_total_weight, regularization, minimum_eigenvalue_ratio)
 
     Returns:
-        Same dict as fit_vertex_by_closest_approach, from the final
-        iteration
+        {
+          "vertex_estimate": (n_events, 3)  the fitted PV
+              (NaN in any event where fit_is_valid is False)
+          "chi_square": (n_events,)  chi_square(PV) at the solution -- the
+              weighted sum of squared distances of closest approach,
+              generalized to N tracks, evaluated at the fitted vertex.
+              NO NUMBER OF DEGREES OF FREEDOM APPLIED!!!
+          "fit_is_valid": (n_events,) bool, False wherever the event did
+              not contain enough independent track information to define
+              a vertex at all
+          "track_closest_approach_point": (n_events, n_tracks, 3)  the
+              point ON each track's own line closest to the fitted PV
+              (NaN wherever fit_is_valid is False). Plot this alongside
+              vertex_estimate and track_position: if the fit is sensible,
+              each track's closest_approach_point should sit close to
+              vertex_estimate, and roughly along the line from
+              track_position through track_direction.
+          "track_dca": (n_events, n_tracks)  each track's OWN distance of
+              closest approach to the fitted PV (NaN wherever
+              fit_is_valid is False) -- the per-track quantity that
+              chi_square sums (weighted, squared) over. A track with a
+              much larger track_dca than the others in its event is an
+              outlier the fit did not actually agree with, even if the
+              overall chi_square looks acceptable.
+        }
     """
     n_events, n_tracks, _ = track_reg_result.shape
     device = track_reg_result.device
@@ -268,7 +294,7 @@ def fit_vertex_by_helix_closest_approach(
     pT = (1.0 / rho.abs()) - 1.0
              
     b_z_t = torch.full_like(rho, float(b_z))
-    R_s = (pT / (0.3 * q * b_z_t)) * SCALING_FACTOR
+    R_s = (pT / (0.3 * q * b_z_t)) * scaling_factor
     radius = R_s.abs()
               
     x0 = x_h + R_s * sin_phi
@@ -277,7 +303,7 @@ def fit_vertex_by_helix_closest_approach(
     angle = torch.atan2(hit_y - y0, hit_x - x0)
     angle_ref = angle[..., 0, :]  # (n_events, n_tracks)
 
-    if IS_COSMICS:    
+    if is_cosmics:    
         zslope, z0 = _line_fit(hit_x, hit_z, mask)
     else:
         small_angle = torch.atan2(torch.sin(angle - angle_ref.unsqueeze(1)),
@@ -297,7 +323,7 @@ def fit_vertex_by_helix_closest_approach(
         
         angle_pca = torch.atan2(pca_circle[...,1] - y0, pca_circle[...,0] - x0)
           
-        if IS_COSMICS:
+        if is_cosmics:
             pca_z = pca_circle[..., 0] * zslope + z0
         else:
             s_pca = radius * torch.atan2(torch.sin(angle_pca - angle_ref), torch.cos(angle_pca - angle_ref))
@@ -312,7 +338,7 @@ def fit_vertex_by_helix_closest_approach(
         new_xy = torch.stack([newx, newy], dim=-1)
         new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
                     
-        if IS_COSMICS:
+        if is_cosmics:
             new_z = newx * zslope + z0
         else:
             new_z = new_s_pca * zslope + z0
