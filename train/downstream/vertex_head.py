@@ -217,6 +217,9 @@ def fit_vertex_by_helix_closest_approach(
     fit_vertex_by_closest_approach.
 
     Args:
+        points: (n_events, n_hits, 4) raw hits; spatial position is points[..., 1:4]
+        mask: (n_events, n_hits, n_tracks) bool/float, True where a hit
+            is assigned to a track
         track_reg_result: (n_events, n_tracks, 4) -- (q/(pT+1), theta, sin(phi), cos(phi))
         track_position: (n_events, n_tracks, 3) -- reference point on each
             track's line (the innermost assigned hit, see track_position_from_hits)
@@ -456,6 +459,8 @@ class VertexHead(nn.Module):
                 (mask_probs-weighted) hit count per track, still used as
                 part of the fit's default track weight (see forward()
                 below); no longer used to build track_position itself
+            is_assigned: (n_events, n_hits, n_tracks) bool, True where a hit
+                is assigned to a track
         """
         hit_position = points[..., 1:4]  # (n_events, n_hits, 3)
         hit_weight = mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)
