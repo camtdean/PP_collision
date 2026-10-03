@@ -48,17 +48,11 @@ weighted, and summed over every track in the event -- a chi-square
 as a function of a candidate PV -- solved for the PV that minimizes it,
 generalized from a single track to an arbitrary number N.
 
-Deliberately NOT implemented here: fully accounting for track curvature
-(the helical bend from the solenoidal field). Anchoring track_position at
-the innermost hit (above) keeps the straight-line approximation close to
-where track_direction is evaluated, which reduces this curvature bias but
-does not remove it. Removing it properly means re-evaluating each track's
-position and direction at the point on its actual helix nearest the
-current vertex estimate, and iterating -- which needs the magnetic field
-strength and units for this dataset's vtx_x/y/z and momentum (see dataset.py's 
-`data_scaler`, currently a placeholder value of 1). The straight-line fit 
-below is exact only in the zero-field limit / for short lever arms; treat 
-it as a first version, not a substitute for that helical refinement.
+Deliberately NOT implemented here: The helical fit 
+below assumes a uniform magnetic field with the scaling factor 
+for the Magnetic field strength and units for this dataset's vtx_x/y/z and momentum 
+(see dataset.py's `data_scaler`, currently a placeholder value of 1) still
+being undefined, current defualt assumes a meter to cm conversion with Bz being in Tesla.
 """
 
 import torch
@@ -202,7 +196,7 @@ def fit_vertex_by_helix_closest_approach(
     mask,
     track_reg_result,
     track_position,
-    b_z,
+    Bz,
     track_weight,
     n_iterations=100,
     seed_vertex=None,
@@ -222,7 +216,7 @@ def fit_vertex_by_helix_closest_approach(
         track_reg_result: (n_events, n_tracks, 4) -- (q/(pT+1), theta, sin(phi), cos(phi))
         track_position: (n_events, n_tracks, 3) -- reference point on each
             track's line (the innermost assigned hit, see track_position_from_hits)
-        b_z: solenoid field, Tesla. Scalar (python float) or (...)-dimensional tensor
+        Bz: solenoid field, Tesla. Scalar (python float) or (...)-dimensional tensor
         track_weight: (n_events, n_tracks) -- same meaning as in
             fit_vertex_by_closest_approach
         n_iterations: max outer iterations
@@ -293,7 +287,7 @@ def fit_vertex_by_helix_closest_approach(
     q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
     pT = (1.0 / rho.abs()) - 1.0
              
-    b_z_t = torch.full_like(rho, float(b_z))
+    b_z_t = torch.full_like(rho, float(Bz))
     R_s = (pT / (0.3 * q * b_z_t)) * scaling_factor
     radius = R_s.abs()
               
@@ -437,7 +431,7 @@ class VertexHead(nn.Module):
         weight_hidden_dim: int = 32,
         use_helix: bool = True,
         helix_iterations: int = 100,
-        b_z: float = 1.0,
+        Bz: float = 1.0,
         is_cosmics: bool = False,
         scaling_factor: float = 100.0
     ):
@@ -445,7 +439,7 @@ class VertexHead(nn.Module):
         self.learn_weights = learn_weights
         self.use_helix = use_helix
         self.helix_iterations = helix_iterations
-        self.b_z = b_z
+        self.Bz = Bz
         self.is_cosmics = is_cosmics
         self.scaling_factor = scaling_factor
         if learn_weights:
@@ -569,20 +563,20 @@ class VertexHead(nn.Module):
 
         fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
 
-        if (self.use_helix and self.b_z != 0.0):
+        if (self.use_helix and self.Bz != 0.0):
             fit = fit_vertex_by_helix_closest_approach(
                 points,
                 is_assigned,
                 track_reg_result,
                 track_position,
-                self.b_z,
+                self.Bz,
                 track_weight,
                 n_iterations=self.helix_iterations,
                 seed_vertex = fit["vertex_estimate"],
                 is_cosmics = self.is_cosmics,
                 scaling_factor = self.scaling_factor
             )
-        elif self.b_z == 0.0:
+        elif self.Bz == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
        
         return {

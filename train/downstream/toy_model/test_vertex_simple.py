@@ -445,7 +445,7 @@ print("\nRunning VertexHead …")
 vertex_head = VertexHead(
     learn_weights=False,
     use_helix=USE_HELIX,
-    b_z=B_FIELD_Z,
+    Bz=B_FIELD_Z,
 )
  
 with torch.no_grad():

@@ -319,7 +319,7 @@ VTX_Z_MAX = 30.0
 
 
 def main():
-    vertex_head = VertexHead(learn_weights=False, use_helix=USE_HELIX, b_z=B_FIELD_Z,)
+    vertex_head = VertexHead(learn_weights=False, use_helix=USE_HELIX, Bz=B_FIELD_Z,)
     vertex_head.eval()
 
     # ══════════════════════════════════════════════════════════════════════════
