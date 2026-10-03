@@ -209,6 +209,7 @@ def fit_vertex_by_helix_closest_approach(
     track_weight,
     n_iterations=100,
     seed_vertex=None,
+    d_angle=0.005,
     **linear_fit_kwargs,
 ):
     """
@@ -274,19 +275,51 @@ def fit_vertex_by_helix_closest_approach(
     angle_ref = angle[..., 0, :]  # (n_events, n_tracks)
 
     if IS_COSMICS:    
-        zslope, z0 = line_fit(hit_x, hit_z, mask)
+        zslope, z0 = _line_fit(hit_x, hit_z, mask)
     else:
-        d_angle = torch.atan2(torch.sin(angle - angle_ref.unsqueeze(1)),
+        small_angle = torch.atan2(torch.sin(angle - angle_ref.unsqueeze(1)),
                                        torch.cos(angle - angle_ref.unsqueeze(1))) 
-        s = radius.unsqueeze(1) * d_angle
-        zslope, z0 = line_fit(s, hit_z, mask)
+        s = radius.unsqueeze(1) * small_angle
+        zslope, z0 = _line_fit(s, hit_z, mask)
 
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
-        new_track_position, track_direction = get_helix_tangent(zslope, z0, angle_ref, R_s,
-                                                                 track_reg_result, track_position, PV_per_track)
+            
+        point_xy = PV_per_track[..., 0:2]
+        
+        origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
+        diff = point_xy - origin
+        norm = diff.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        pca_circle = origin + radius.unsqueeze(-1) * diff / norm
+        
+        angle_pca = torch.atan2(pca_circle[...,1] - y0, pca_circle[...,0] - x0)
+          
+        if IS_COSMICS:
+            pca_z = pca_circle[..., 0] * zslope + z0
+        else:
+            s_pca = radius * torch.atan2(torch.sin(angle_pca - angle_ref), torch.cos(angle_pca - angle_ref))
+            pca_z = s_pca * zslope + z0
+        pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)  # (..., 3)
+        
+        # Second point on the circle, a small angle further along, to define
+        # the local tangent direction.
+        new_angle = angle_pca - torch.sign(R_s) * d_angle
+        newx = radius * torch.cos(new_angle) + x0
+        newy = radius * torch.sin(new_angle) + y0
+        new_xy = torch.stack([newx, newy], dim=-1)
+        new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
+                    
+        if IS_COSMICS:
+            new_z = newx * zslope + z0
+        else:
+            new_z = new_s_pca * zslope + z0
+        
+        second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
+        
+        raw_tangent = second_point_pca - pca
+        tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
 
-        result = fit_vertex_by_closest_approach(new_track_position, track_direction, track_weight, **linear_fit_kwargs)
+        result = fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
 
         new_PV = result["vertex_estimate"]
         fit_is_valid = result["fit_is_valid"]
@@ -312,119 +345,12 @@ def fit_vertex_by_helix_closest_approach(
         
     return result
 
-def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
-    """
-    PCA of `point_xy` to the circle (x0, y0, radius): draw a line from the
-    circle center through the point: the PCA is at distance `radius` from
-    the center along that line. Exact, closed form -- no iteration.
-
-    Args:
-        radius, x0, y0: (...) tensors, broadcastable to a common shape
-        point_xy: (..., 2) tensor, broadcastable against radius/x0/y0
-
-    Returns:
-        (..., 2) tensor: the PCA point in the transverse plane
-    """
-    origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
-    diff = point_xy - origin
-    norm = diff.norm(dim=-1, keepdim=True).clamp(min=epsilon)
-    return origin + radius.unsqueeze(-1) * diff / norm
-
-def get_helix_tangent(
-        zslope, 
-        z0, 
-        angle_ref,
-        R_s,
-        track_reg_result, 
-        track_position,
-        point,
-        d_angle=0.005):
-    """
-    Vectorized port of TrackFitUtils::get_helix_tangent.
-
-    For each track and each corresponding query point, returns a local
-    straight-line approximation to that track's helix at the point on the
-    helix nearest `point`: a (pca_point, unit_tangent) pair.
-
-    Args:
-        zslope: (..., 1) tensor -- dz/ds along the helix, from line_fit
-        z0: (..., 1) tensor -- z-intercept of the helix,
-            from line_fit
-        angle_ref: (..., 1) tensor -- the azimuthal angle of the
-            helix at the reference point (track_position), from
-            get_circle_point_pca
-        R_s: (..., 1) tensor -- the helix radius of curvature
-        track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
-        track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
-            the regression was evaluated at, same leading shape
-        b_z: solenoid field, Tesla. Scalar (python float) or (...)-
-            broadcastable tensor.
-        point: (..., 3) tensor, same leading shape as fitpars[..., 0] --
-            the point to transport each track to (the trial vertex,
-            broadcast across tracks)
-        is_cosmics: bool, see module docstring
-        d_angle: angular step (radians) used to locate a second point on
-            the circle for the tangent direction -- matches the C++ default
-
-    Returns:
-        pca: (..., 3) tensor -- point on the helix nearest `point`
-        tangent: (..., 3) unit tensor -- local flight direction there
-    """
-
-    rho = track_reg_result[..., 0]
-    sin_phi = track_reg_result[..., 2]
-    cos_phi = track_reg_result[..., 3]
-       
-    x_h = track_position[..., 0]
-    y_h = track_position[..., 1]
-       
-    q = torch.sign(rho)
-    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
-      
-    radius = R_s.abs()
-       
-    x0 = x_h + R_s * sin_phi
-    y0 = y_h - R_s * cos_phi
-    
-    point_xy = point[..., 0:2]
-
-    pca_circle = get_circle_point_pca(radius, x0, y0, point_xy)  # (..., 2)
-
-    angle_pca = torch.atan2(pca_circle[...,1] - y0, pca_circle[...,0] - x0)
-  
-    if IS_COSMICS:
-        pca_z = pca_circle[..., 0] * zslope + z0
-    else:
-        s_pca = radius * torch.atan2(torch.sin(angle_pca - angle_ref), torch.cos(angle_pca - angle_ref))
-        pca_z = s_pca * zslope + z0
-    pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)  # (..., 3)
-
-    # Second point on the circle, a small angle further along, to define
-    # the local tangent direction.
-    new_angle = angle_pca - torch.sign(R_s) * d_angle
-    newx = radius * torch.cos(new_angle) + x0
-    newy = radius * torch.sin(new_angle) + y0
-    new_xy = torch.stack([newx, newy], dim=-1)
-    new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
-            
-    if IS_COSMICS:
-        new_z = newx * zslope + z0
-    else:
-        new_z = new_s_pca * zslope + z0
-
-    second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
-
-    raw_tangent = second_point_pca - pca
-    tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
-
-    return pca, tangent
-
 def _masked_mean(value, mask, denom, eps):
     """sum(value * mask) / denom, broadcasting mask over value's last dims as needed."""
     return (value * mask).sum(dim=1) / denom.clamp(min=eps)
 
 
-def line_fit(u, v, mask, min_hits=2, eps=1e-12):
+def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     """
     the Deming/orthogonal distance line fit -- minimizes true perpendicular distance, not
     vertical residual, assuming equal variance in u and v).
