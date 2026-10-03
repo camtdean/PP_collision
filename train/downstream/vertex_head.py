@@ -65,6 +65,7 @@ import torch
 import torch.nn as nn
 
 SCALING_FACTOR = 100.0  # placeholder for dataset.py's data_scaler, which is not yet implemented
+IS_COSMICS = False
 
 def track_flight_direction(track_reg_result, epsilon=1e-8):
     """
@@ -207,7 +208,6 @@ def fit_vertex_by_helix_closest_approach(
     b_z,
     track_weight,
     n_iterations=100,
-    is_cosmics=False,
     seed_vertex=None,
     **linear_fit_kwargs,
 ):
@@ -225,10 +225,7 @@ def fit_vertex_by_helix_closest_approach(
         n_iterations: max outer iterations
         is_cosmics: passed through to get_helix_tangent, see helix_transport.py
         seed_vertex: (n_events, 3) starting point for iteration 0. Defaults
-            to the origin. Seeding from fit_vertex_by_closest_approach's own
-            straight-line answer (using each track's PCA-to-origin point and
-            direction as an approximation) converges in fewer iterations and
-            is recommended once you have that fit available upstream.
+            to the origin.
         **linear_fit_kwargs: forwarded to fit_vertex_by_closest_approach
             (minimum_total_weight, regularization, minimum_eigenvalue_ratio)
 
@@ -264,10 +261,10 @@ def fit_vertex_by_helix_closest_approach(
               
     q = torch.sign(rho)
     q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
-    p_T = (1.0 / rho.abs()) - 1.0
+    pT = (1.0 / rho.abs()) - 1.0
              
     b_z_t = torch.full_like(rho, float(b_z))
-    R_s = (p_T / (0.3 * q * b_z_t)) * SCALING_FACTOR
+    R_s = (pT / (0.3 * q * b_z_t)) * SCALING_FACTOR
     radius = R_s.abs()
               
     x0 = x_h + R_s * sin_phi
@@ -276,19 +273,18 @@ def fit_vertex_by_helix_closest_approach(
     angle = torch.atan2(hit_y - y0, hit_x - x0)
     angle_ref = angle[..., 0, :]  # (n_events, n_tracks)
 
-    if not is_cosmics:    
-        d_angle = torch.atan2(
-            torch.sin(angle - angle_ref.unsqueeze(1)),
-            torch.cos(angle - angle_ref.unsqueeze(1)),
-        )  # wrapped
+    if IS_COSMICS:    
+        zslope, z0 = line_fit(hit_x, hit_z, mask)
+    else:
+        d_angle = torch.atan2(torch.sin(angle - angle_ref.unsqueeze(1)),
+                                       torch.cos(angle - angle_ref.unsqueeze(1))) 
         s = radius.unsqueeze(1) * d_angle
         zslope, z0 = line_fit(s, hit_z, mask)
-    else:
-        zslope, z0 = line_fit(hit_x, hit_z, mask)
 
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
-        new_track_position, track_direction = get_helix_tangent(zslope, z0, angle, angle_ref, track_reg_result, track_position, b_z, PV_per_track, is_cosmics=is_cosmics)
+        new_track_position, track_direction = get_helix_tangent(zslope, z0, angle_ref, R_s,
+                                                                 track_reg_result, track_position, PV_per_track)
 
         result = fit_vertex_by_closest_approach(new_track_position, track_direction, track_weight, **linear_fit_kwargs)
 
@@ -318,8 +314,6 @@ def fit_vertex_by_helix_closest_approach(
 
 def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
     """
-    Vectorized port of TrackFitUtils::get_circle_point_pca.
-
     PCA of `point_xy` to the circle (x0, y0, radius): draw a line from the
     circle center through the point: the PCA is at distance `radius` from
     the center along that line. Exact, closed form -- no iteration.
@@ -339,13 +333,11 @@ def get_circle_point_pca(radius, x0, y0, point_xy, epsilon=1e-8):
 def get_helix_tangent(
         zslope, 
         z0, 
-        angle, 
-        angle_ref, 
+        angle_ref,
+        R_s,
         track_reg_result, 
-        track_position, 
-        b_z, 
-        point, 
-        is_cosmics=False, 
+        track_position,
+        point,
         d_angle=0.005):
     """
     Vectorized port of TrackFitUtils::get_helix_tangent.
@@ -355,6 +347,13 @@ def get_helix_tangent(
     helix nearest `point`: a (pca_point, unit_tangent) pair.
 
     Args:
+        zslope: (..., 1) tensor -- dz/ds along the helix, from line_fit
+        z0: (..., 1) tensor -- z-intercept of the helix,
+            from line_fit
+        angle_ref: (..., 1) tensor -- the azimuthal angle of the
+            helix at the reference point (track_position), from
+            get_circle_point_pca
+        R_s: (..., 1) tensor -- the helix radius of curvature
         track_reg_result: (..., 4) tensor -- (q/(pT+1), theta, sin(phi), cos(phi))
         track_position: (..., 3) tensor -- reference point (x_h, y_h, z_h)
             the regression was evaluated at, same leading shape
@@ -381,10 +380,7 @@ def get_helix_tangent(
        
     q = torch.sign(rho)
     q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
-    p_T = (1.0 / rho.abs()) - 1.0
       
-    b_z_t = torch.full_like(rho, float(b_z))
-    R_s = (p_T / (0.3 * q * b_z_t)) * SCALING_FACTOR
     radius = R_s.abs()
        
     x0 = x_h + R_s * sin_phi
@@ -396,7 +392,7 @@ def get_helix_tangent(
 
     angle_pca = torch.atan2(pca_circle[...,1] - y0, pca_circle[...,0] - x0)
   
-    if is_cosmics:
+    if IS_COSMICS:
         pca_z = pca_circle[..., 0] * zslope + z0
     else:
         s_pca = radius * torch.atan2(torch.sin(angle_pca - angle_ref), torch.cos(angle_pca - angle_ref))
@@ -411,7 +407,7 @@ def get_helix_tangent(
     new_xy = torch.stack([newx, newy], dim=-1)
     new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
             
-    if is_cosmics:
+    if IS_COSMICS:
         new_z = newx * zslope + z0
     else:
         new_z = new_s_pca * zslope + z0
@@ -430,25 +426,16 @@ def _masked_mean(value, mask, denom, eps):
 
 def line_fit(u, v, mask, min_hits=2, eps=1e-12):
     """
-    Vectorized port of TrackFitUtils::line_fit (the Deming/orthogonal-
-    distance line fit -- minimizes true perpendicular distance, not
+    the Deming/orthogonal distance line fit -- minimizes true perpendicular distance, not
     vertical residual, assuming equal variance in u and v).
  
     Args:
         u, v: (n_events, n_hits, n_tracks), the two coordinates to fit
-            v = slope*u + intercept against (caller picks which physical
-            coordinates these are -- see line_fit_r_z / line_fit_xz below,
-            matching the C++'s named overloads)
+            v = slope*u + intercept
         mask: (n_events, n_hits, n_tracks) bool/float, same convention as
             circle_fit_by_taubin
-        min_hits: C++ requires only size() >= 1 implicitly (no guard at
-            all, in fact -- it'll divide by n=0 or by a degenerate
-            ssd_xy=0 for a single point). 2 is the practical minimum for a
-            line to mean anything; raise it if you want a safety margin
-            against near-degenerate fits.
-        eps: numerical floor on ssd_xy, not present in the original
-            (single-track) C++, for the same batched-NaN-isolation reason
-            as circle_fit_by_taubin.
+        min_hits: 2 is the practical minimum for aline to mean anything
+        eps: numerical floor on ssd_xy
  
     Returns:
         slope, intercept: (n_events, n_tracks)
@@ -464,7 +451,7 @@ def line_fit(u, v, mask, min_hits=2, eps=1e-12):
     du = u - mean_u.unsqueeze(1)
     dv = v - mean_v.unsqueeze(1)
  
-    ssd_u = _masked_mean(du * du, mask, n_valid, eps) * n_valid  # sums, not means -- matches C++ (raw sums, not /n)
+    ssd_u = _masked_mean(du * du, mask, n_valid, eps) * n_valid
     ssd_v = _masked_mean(dv * dv, mask, n_valid, eps) * n_valid
     ssd_uv = _masked_mean(du * dv, mask, n_valid, eps) * n_valid
  
@@ -517,6 +504,10 @@ class VertexHead(nn.Module):
 
     def dontUseHelix(self, use_helix: bool = False):
         self.use_helix = use_helix
+
+    def isCosmics(self, is_cosmics: bool = True):
+        global IS_COSMICS
+        IS_COSMICS = is_cosmics
 
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
@@ -628,8 +619,7 @@ class VertexHead(nn.Module):
             )
         elif self.b_z == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
-     
-
+       
         return {
             "vertex_estimate": fit["vertex_estimate"],
             "chi_square": fit["chi_square"], 
