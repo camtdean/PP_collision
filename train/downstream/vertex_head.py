@@ -438,12 +438,16 @@ class VertexHead(nn.Module):
         use_helix: bool = True,
         helix_iterations: int = 100,
         b_z: float = 1.0,
+        is_cosmics: bool = False,
+        scaling_factor: float = 100.0
     ):
         super().__init__()
         self.learn_weights = learn_weights
         self.use_helix = use_helix
         self.helix_iterations = helix_iterations
-        self.b_z = b_z       
+        self.b_z = b_z
+        self.is_cosmics = is_cosmics
+        self.scaling_factor = scaling_factor
         if learn_weights:
             # Input features: class_probs (2) + track_reg_result (4) = 6.
             # Deliberately no PID and no track_position here -- this network
@@ -461,8 +465,10 @@ class VertexHead(nn.Module):
         self.use_helix = use_helix
 
     def isCosmics(self, is_cosmics: bool = True):
-        global IS_COSMICS
-        IS_COSMICS = is_cosmics
+        self.is_cosmics = is_cosmics
+
+    def setScalingFactor(self, scaling_factor: float = 100.0):
+        self.scaling_factor = scaling_factor
 
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
@@ -572,7 +578,9 @@ class VertexHead(nn.Module):
                 self.b_z,
                 track_weight,
                 n_iterations=self.helix_iterations,
-                seed_vertex = fit["vertex_estimate"]
+                seed_vertex = fit["vertex_estimate"],
+                is_cosmics = self.is_cosmics,
+                scaling_factor = self.scaling_factor
             )
         elif self.b_z == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
