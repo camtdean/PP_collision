@@ -305,12 +305,13 @@ def fit_vertex_by_helix_closest_approach(
         s = radius.unsqueeze(1) * small_angle
         zslope, z0 = _line_fit(s, hit_z, mask)
 
+    origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
+
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
             
         point_xy = PV_per_track[..., 0:2]
         
-        origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
         diff = point_xy - origin
         norm = diff.norm(dim=-1, keepdim=True).clamp(min=1e-12)
         pca_circle = origin + radius.unsqueeze(-1) * diff / norm
