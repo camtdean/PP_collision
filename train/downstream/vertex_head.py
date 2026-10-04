@@ -331,11 +331,11 @@ def fit_vertex_by_helix_closest_approach(
         newx = radius * torch.cos(new_angle) + x0
         newy = radius * torch.sin(new_angle) + y0
         new_xy = torch.stack([newx, newy], dim=-1)
-        new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
                     
         if is_cosmics:
             new_z = newx * zslope + z0
         else:
+            new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
             new_z = new_s_pca * zslope + z0
         
         second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
