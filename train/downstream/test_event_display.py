@@ -48,10 +48,9 @@ for _candidate in [_HERE, os.path.join(_HERE, "train", "downstream")]:
         sys.path.insert(0, _candidate)
         break
 
-from train.downstream.vertexhead import VertexHead  # noqa: E402
-from train.downstream.vertexhead_inputs import (  # noqa: E402
-    DEFAULT_DATA_DIR, DEFAULT_EVENT_IDX, DEFAULT_BZ,
-    load_event, build_truth_tracks, apply_silicon_tpc_mask, vertex_head_inputs,
+from train.downstream.vertexhead import (  # noqa: E402
+    VertexHead, DEFAULT_DATA_DIR, DEFAULT_EVENT_IDX, DEFAULT_BZ,
+    load_event, build_tracks, apply_silicon_tpc_mask, vertex_head_inputs,
 )
 
 
@@ -140,8 +139,8 @@ def make_event_display(
     features, seg_target, reg_target,
     args
 ):
-    print("Building truth tracks...", flush=True)
-    td = build_truth_tracks(features, seg_target, reg_target)
+    print("Building tracks...", flush=True)
+    td = build_tracks(features, seg_target, reg_target)
     
     # silicon hits (R < 15 cm) on tracks with no TPC hit (25 < R < 100 cm): excluded from the fit, still drawn
     silicon_info = apply_silicon_tpc_mask(td, features, seg_target, apply=not args.no_silicon_tpc_mask)

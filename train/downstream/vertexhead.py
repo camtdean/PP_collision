@@ -1,158 +1,164 @@
 """
-Each reconstructed track is a straight line in 3D -- a reference
-point on the track plus its direction of flight. The primary vertex is
-taken to be the single point that minimizes the weighted sum of squared
-perpendicular distances to every track's line, all at once. No
-covariance matrix is used; each track is weighted by how many hits
-are on it and how confident the track finder is that it's real which is
-output by the track finder. This is a pure linear algebra solution, there
-is no machine learning calculation (yet). Everything it needs comes straight
-out of the already-trained track-finding head (MambaAttentionHead in model.py).
+vertexhead.py
+=============
+Primary-vertex fit from track-finder output, plus truth-level input building for testing it.
 
-Per-track quantities used, and where they come from:
+VertexHead finds the point minimising the weighted sum of squared distances of closest approach
+to every track, anchoring each track at its innermost assigned hit and weighting it by
+(soft hit count) x P(real). With use_helix and Bz != 0 that straight-line vertex seeds an
+iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to points' units).
 
-    track_position  (n_events, n_tracks, 3)
-        A point the track's line of flight passes through: specifically,
-        the position of the single assigned hit closest to the origin --
-        the innermost measurement on that track (see track_position_from_hits
-        below). This is a real spatial position from this track's own hits.
+Inputs (from MambaAttentionHead.forward, or build_tracks for truth-level tests):
+    class_probs      (n_events, n_tracks, 2)        P(slot empty), P(slot real)
+    track_reg_result (n_events, n_tracks, 4)        (q/(pT+1), theta, sin phi, cos phi)
+    mask_probs       (n_events, n_hits, n_tracks)   hit-to-track assignment
+    points           (n_events, n_hits, 4)          (E, x, y, z)
+    padding_mask     (n_events, n_hits)             True = real hit
+    noise_labels     (n_events, n_tracks), optional 1 = noise (pT < threshold)
+    valid_tracks     (n_events, n_tracks), optional 1 = production vertex within 1 cm
 
-    track_direction (n_events, n_tracks, 3)
-        A unit vector along the track's flight direction, reconstructed from
-        the track-finding head's regressed (theta, sin(phi), cos(phi))
-
-    track_weight (n_events, n_tracks)
-        How much this track counts in the fit: the number of hits
-        on the track times the track finder's own confidence that
-        this slot is a real track and not an empty one.
-
-Inputs, all produced by MambaAttentionHead.forward() (model.py) with no
-modifications needed there:
-
-    class_probs      (n_events, n_tracks, 2)   P(track slot is real / empty)
-    track_reg_result (n_events, n_tracks, 4)   (q/(pT+1), theta, sin(phi), cos(phi))
-    mask_probs       (n_events, n_hits, n_tracks)  soft hit-to-track assignment
-    points           (n_events, n_hits, 4)     raw (E, x, y, z) hits fed to the backbone
-    padding_mask     (n_events, n_hits)        True when a hit is real (i.e. not padding)
-
-theta is the polar angle from the beam axis; phi is the azimuthal angle
-
-For a single track with reference point X and slope S, and a
-candidate vertex PV,
-
-    DCA = | X - PV - [S.(X - PV) / S.S] S |
-
-where S = (p_x/p, p_y/p, p_z/p), i.e. the unit momentum vector.
-fit_vertex_by_closest_approach below is exactly this DCA, squared,
-weighted, and summed over every track in the event -- a chi-square
-as a function of a candidate PV -- solved for the PV that minimizes it,
-generalized from a single track to an arbitrary number N.
-
-Deliberately NOT implemented here: The helical fit
-below assumes a uniform magnetic field with the scaling factor
-for the Magnetic field strength and units for this dataset's vtx_x/y/z and momentum
-(see dataset.py's `data_scaler`, currently a placeholder value of 1) still
-being undefined, current default assumes a meter to cm conversion with Bz being in Tesla.
-
-Track-quality filtering (added 2026-10):
------------------------------------------
-VertexHead.forward() now accepts two optional per-track boolean masks,
-derived from downstream_util.get_trackinfo_noiselabel():
-
-    noise_labels   (n_events, n_tracks)  long  -- 1 = noise track (pT < threshold),  0 = good
-    valid_tracks   (n_events, n_tracks)  int   -- 1 = valid (vertex within 1 cm),     0 = invalid
-
-Both are per-TRACK tensors (not per-hit).  During truth-based
-validation they are derived from reg_target; during real inference they
-must come from the reconstructed/predicted tracking output -- NOT from
-reg_target -- so that VertexHead never sees truth labels at inference time.
-
-When either mask is None (the default) the existing behaviour is
-preserved: every track slot receives the weight it always did.
-
-A free function  build_track_quality_mask()  implements the combined
-mask so callers can build it outside forward() if needed.
-
-See also:
-    downstream_util.get_trackinfo_noiselabel()
-    The FM4NPP SETUP.md for the reg_target column layout.
+noise_labels / valid_tracks come from reg_target only in truth-level tests; at inference they
+must come from the tracking output.
 """
+import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 from downstream_util import get_trackinfo_noiselabel
 
-# ---------------------------------------------------------------------------
-# Track-quality helpers (new in 2026-10)
-# ---------------------------------------------------------------------------
+DEFAULT_DATA_DIR = os.path.expanduser("~/Storage/PP_collision/train/downstream/test/combined_0")
+DEFAULT_EVENT_IDX = 1   # event 0 has only 10 hits; event 1 has ~1951 hits
+DEFAULT_BZ = 1.4        # Tesla
+NOISE_PT_THRESHOLD = 0.25
+
+# features (E, x, y, z), seg_target (track ID), reg_target (px, py, pz, vx, vy, vz, q, e)
+def load_event(data_dir: str, event_idx: int):
+    features   = RaggedMmap(os.path.join(data_dir, "features.mmap"),   n_cols=4)[event_idx]
+    seg_target = RaggedMmap(os.path.join(data_dir, "seg_target.mmap"), n_cols=1)[event_idx]
+    reg_target = RaggedMmap(os.path.join(data_dir, "reg_target.mmap"), n_cols=8)[event_idx]
+    return features.astype(np.float32), seg_target.astype(np.int32), reg_target.astype(np.float64)
+
+# per-track tensors (batch dim 1); every unique seg_target is a track, negative IDs included
+def build_tracks(features, seg_target, reg_target, noise_pt_threshold=NOISE_PT_THRESHOLD):
+    unique_ids = np.unique(seg_target)
+    n_hits, n_tracks = len(seg_target), len(unique_ids)
+    id_to_col = {tid: col for col, tid in enumerate(unique_ids)}
+
+    # all hits of a truth track share its reg_target row; take the first
+    track_px  = np.zeros(n_tracks, dtype=np.float64)
+    track_py  = np.zeros(n_tracks, dtype=np.float64)
+    track_pz  = np.zeros(n_tracks, dtype=np.float64)
+    track_vtx = np.zeros((n_tracks, 3), dtype=np.float64)
+    track_q   = np.zeros(n_tracks, dtype=np.float64)
+    track_seen = np.zeros(n_tracks, dtype=bool)
+    mask_probs_np = np.zeros((n_hits, n_tracks), dtype=np.float32)
+
+    for hit_idx, tid in enumerate(seg_target):
+        col = id_to_col[int(tid)]
+        mask_probs_np[hit_idx, col] = 1.0
+        if not track_seen[col]:
+            track_px[col]  = reg_target[hit_idx, 0]
+            track_py[col]  = reg_target[hit_idx, 1]
+            track_pz[col]  = reg_target[hit_idx, 2]
+            track_vtx[col] = reg_target[hit_idx, 3:6]
+            track_q[col]   = reg_target[hit_idx, 6]
+            track_seen[col] = True
+
+    pT    = np.sqrt(track_px**2 + track_py**2)
+    phi   = np.arctan2(track_py, track_px)
+    theta = np.arctan2(pT, track_pz)
+    rho   = track_q / (pT + 1.0)
+
+    # track_reg_result layout: (rho, theta, sin_phi, cos_phi), rho = q / (pT + 1)
+    track_reg = np.stack([rho, theta, np.sin(phi), np.cos(phi)], axis=-1).astype(np.float32)
+
+    # same noise/validity cuts as get_trackinfo_noiselabel
+    vtx_r = np.sqrt(track_vtx[:, 0]**2 + track_vtx[:, 1]**2)
+    noise = (pT < noise_pt_threshold).astype(np.int64)   # 1=noise, 0=good
+    valid = (vtx_r < 1.0).astype(np.int32)               # 1=valid, 0=invalid
+
+    class_probs = torch.zeros(1, n_tracks, 2, dtype=torch.float32)
+    class_probs[..., 1] = 1.0                            # all truth tracks are real
+
+    return {
+        "track_ids":           unique_ids,
+        "track_reg_result":    torch.from_numpy(track_reg).unsqueeze(0),
+        "noise_labels":        torch.from_numpy(noise).unsqueeze(0),
+        "valid_tracks":        torch.from_numpy(valid).unsqueeze(0),
+        "mask_probs":          torch.from_numpy(mask_probs_np).unsqueeze(0),
+        "points":              torch.from_numpy(features).float().unsqueeze(0),
+        "padding_mask":        torch.ones(1, n_hits, dtype=torch.bool),
+        "class_probs":         class_probs,
+        "vtx_per_track":       torch.from_numpy(track_vtx.astype(np.float32)),
+        "pT_per_track":        torch.from_numpy(pT.astype(np.float32)),
+    }
+
+# zeroes mask_probs rows of silicon hits whose track has no TPC hit, in place (apply=False: info only)
+def apply_silicon_tpc_mask(td, features, seg_target, apply=True):
+    from downstream_util import get_silicon_tpc_match_mask
+    info = get_silicon_tpc_match_mask(features, seg_target)
+    if apply:
+        keep = torch.as_tensor(np.asarray(info["keep_mask"]), dtype=torch.bool)
+        td["mask_probs"][0, ~keep, :] = 0.0
+    return info
+
+# exactly VertexHead.forward's keyword arguments; quality labels omitted when use_quality_mask=False
+def vertex_head_inputs(td, use_quality_mask=True):
+    return {
+        "class_probs":      td["class_probs"],
+        "track_reg_result": td["track_reg_result"],
+        "mask_probs":       td["mask_probs"],
+        "points":           td["points"],
+        "padding_mask":     td["padding_mask"],
+        "noise_labels":     td["noise_labels"] if use_quality_mask else None,
+        "valid_tracks":     td["valid_tracks"] if use_quality_mask else None,
+    }
+
+def load_vertex_head_inputs(data_dir=DEFAULT_DATA_DIR, event_idx=DEFAULT_EVENT_IDX,
+                            use_silicon_tpc_mask=False, use_quality_mask=True,
+                            noise_pt_threshold=NOISE_PT_THRESHOLD):
+    features, seg_target, reg_target = load_event(data_dir, event_idx)
+    td = build_tracks(features, seg_target, reg_target, noise_pt_threshold)
+    if use_silicon_tpc_mask:
+        td["silicon_info"] = apply_silicon_tpc_mask(td, features, seg_target)
+    return vertex_head_inputs(td, use_quality_mask), td
 
 def build_track_quality_mask(noise_labels=None, valid_tracks=None):
     """
-    Combine FM4NPP-style per-track quality tensors into a single boolean
-    mask of "usable" tracks.
-
-    Semantics follow downstream_util.get_trackinfo_noiselabel():
-
-        noise_labels[b, t] == 1  -->  pT < noise_pt_threshold  --> EXCLUDE
-        valid_tracks[b, t] == 0  -->  production vertex outside 1 cm  --> EXCLUDE
+    Combine per-track quality labels into one mask of usable tracks.
 
     Args:
-        noise_labels : (n_events, n_tracks) long/int tensor, or None.
-            1 = noise, 0 = good.  Source: get_trackinfo_noiselabel()["noise_labels"].
-        valid_tracks : (n_events, n_tracks) int tensor, or None.
-            1 = valid (vertex r < 1 cm), 0 = invalid.
-            Source: get_trackinfo_noiselabel()["valid_tracks"].
+        noise_labels: (n_events, n_tracks) int or None. 1 = noise (pT < threshold), 0 = good.
+        valid_tracks: (n_events, n_tracks) int or None. 1 = production vertex within 1 cm, 0 = not.
 
     Returns:
-        quality_mask : (n_events, n_tracks) bool tensor.
-            True  = track is usable and should participate in the vertex fit.
-            False = track is bad/noise/invalid; its weight will be zeroed.
-
-            If BOTH inputs are None, returns None (sentinel: "no filtering
-            requested, keep original VertexHead behaviour").
-
-    Notes:
-        - The shapes of noise_labels and valid_tracks must broadcast
-          against each other when both are provided.
-        - During truth-level testing these tensors are per truth-track
-          (n_tracks = number of unique seg_target IDs for the event).
-        - During real inference they are per reconstructed-track slot
-          (n_tracks = MambaAttentionHead's output track dimension).
-        - This function has no knowledge of which source is being used;
-          that distinction belongs entirely in the calling code.
+        (n_events, n_tracks) bool, True = track is used in the fit; None if both inputs are None.
     """
     if noise_labels is None and valid_tracks is None:
         return None
 
-    # Determine a reference tensor for shape / device / dtype inference.
     ref = noise_labels if noise_labels is not None else valid_tracks
     mask = torch.ones(ref.shape, dtype=torch.bool, device=ref.device)
 
     if noise_labels is not None:
-        # 1 = noise  -->  False in quality_mask
         mask = mask & (noise_labels == 0)
 
     if valid_tracks is not None:
-        # 0 = invalid  -->  False in quality_mask
         mask = mask & (valid_tracks == 1)
 
     return mask
 
-
-# ---------------------------------------------------------------------------
-# Unchanged helper: flight direction from helix parameterisation
-# ---------------------------------------------------------------------------
-
 def track_flight_direction(track_reg_result, epsilon=1e-8):
     """
-    Reconstruct each track's unit flight direction from the track-finding
-    head's regressed parameters.
+    Unit flight direction of each track.
 
     Args:
-        track_reg_result: (..., 4) tensor, last dimension = (q/(pT+1), theta, sin(phi), cos(phi))
+        track_reg_result: (..., 4) (q/(pT+1), theta, sin phi, cos phi).
+        epsilon: floor on the norm before normalising.
 
     Returns:
-        (..., 3) unit direction vectors, one per track.
+        (..., 3) unit direction vectors.
     """
     theta = track_reg_result[..., 1]
     sin_phi = track_reg_result[..., 2]
@@ -165,7 +171,6 @@ def track_flight_direction(track_reg_result, epsilon=1e-8):
     direction_length = direction.norm(dim=-1, keepdim=True).clamp(min=epsilon)
     return direction / direction_length
 
-
 def fit_vertex_by_closest_approach(
     track_position,
     track_direction,
@@ -175,50 +180,23 @@ def fit_vertex_by_closest_approach(
     minimum_eigenvalue_ratio=1e-4,
 ):
     """
-    Weighted least-squares point of closest approach to a set of straight
-    tracks, solved independently for each event.
-
-    PyTorch: squeeze removes dimensions of size 1, while unsqueeze adds a dimension of size 1
+    Weighted least-squares point of closest approach to straight tracks, per event.
 
     Args:
-        track_position: (n_events, n_tracks, 3) reference point on each track's line (eq. 8.3's X)
-        track_direction: (n_events, n_tracks, 3) unit direction of each track's line (eq. 8.3's S, unit-normalized)
-        track_weight: (n_events, n_tracks) nonnegative per-track weight (0 = ignore)
-        minimum_total_weight: an event needs at least this much total
-            weight, spread across at least two non-parallel tracks, before
-            its fit is considered meaningful rather than degenerate
-        regularization: small value added to normal_matrix's diagonal so
-            the linear solve stays numerically well-posed even in
-            degenerate (too-few-track) events
-        minimum_eigenvalue_ratio: degeneracy threshold, expressed as a
-            RATIO of normal_matrix's smallest to largest eigenvalue
+        track_position: (n_events, n_tracks, 3) a point on each track's line.
+        track_direction: (n_events, n_tracks, 3) unit direction of each line.
+        track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
+        minimum_total_weight: an event needs more total weight than this to be valid.
+        regularization: added to the normal matrix's diagonal so the solve stays well-posed.
+        minimum_eigenvalue_ratio: smallest/largest eigenvalue ratio below which the event is degenerate.
 
     Returns:
-        {
-          "vertex_estimate": (n_events, 3)  the fitted PV
-              (NaN in any event where fit_is_valid is False)
-          "chi_square": (n_events,)  chi_square(PV) at the solution -- the
-              weighted sum of squared distances of closest approach,
-              generalized to N tracks, evaluated at the fitted vertex.
-              NO NUMBER OF DEGREES OF FREEDOM APPLIED!!!
-          "fit_is_valid": (n_events,) bool, False wherever the event did
-              not contain enough independent track information to define
-              a vertex at all
-          "track_closest_approach_point": (n_events, n_tracks, 3)  the
-              point ON each track's own line closest to the fitted PV
-              (NaN wherever fit_is_valid is False). Plot this alongside
-              vertex_estimate and track_position: if the fit is sensible,
-              each track's closest_approach_point should sit close to
-              vertex_estimate, and roughly along the line from
-              track_position through track_direction.
-          "track_dca": (n_events, n_tracks)  each track's OWN distance of
-              closest approach to the fitted PV (NaN wherever
-              fit_is_valid is False) -- the per-track quantity that
-              chi_square sums (weighted, squared) over. A track with a
-              much larger track_dca than the others in its event is an
-              outlier the fit did not actually agree with, even if the
-              overall chi_square looks acceptable.
-        }
+        dict:
+            vertex_estimate: (n_events, 3) fitted vertex; NaN where fit_is_valid is False.
+            chi_square: (n_events,) weighted sum of squared DCAs at the vertex; no ndf applied.
+            fit_is_valid: (n_events,) bool; False without >= 2 non-parallel weighted tracks.
+            track_closest_approach_point: (n_events, n_tracks, 3) point on each line nearest the vertex; NaN where invalid.
+            track_dca: (n_events, n_tracks) each track's distance of closest approach; NaN where invalid.
     """
     device = track_position.device
     dtype = track_position.dtype
@@ -247,12 +225,8 @@ def fit_vertex_by_closest_approach(
 
     track_closest_approach_point = PV.unsqueeze(1) + dca_vector
 
-    # Degeneracy check -- see the minimum_eigenvalue_ratio argument doc
-    # above for why this must be a ratio of eigenvalues, not an absolute
-    # cutoff. 0 tracks: all eigenvalues ~0. 1 track: exactly one ~0
-    # eigenvalue (the singular direction along that track). >=2
-    # non-parallel weighted tracks: all three eigenvalues clearly positive.
-    normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)  # ascending, (n_events, 3)
+    # degeneracy check: smallest/largest eigenvalue ratio (0 tracks: all ~0; 1 track: one ~0)
+    normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)
     largest_eigenvalue = normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
     eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / largest_eigenvalue
     well_determined = eigenvalue_ratio > minimum_eigenvalue_ratio
@@ -274,7 +248,6 @@ def fit_vertex_by_closest_approach(
         "track_dca": track_dca,
     }
 
-
 def fit_vertex_by_helix_closest_approach(
     points,
     mask,
@@ -285,61 +258,32 @@ def fit_vertex_by_helix_closest_approach(
     n_iterations=100,
     seed_vertex=None,
     d_angle=0.005,
-    scaling_factor = 100.0,  # placeholder for dataset.py's data_scaler, which is not yet implemented
+    scaling_factor = 100.0,  # placeholder for dataset.py's data_scaler
     is_cosmics = False,
     **linear_fit_kwargs,
 ):
     """
-    Helix-aware primary vertex fit, built on top of
-    fit_vertex_by_closest_approach.
+    Helix-aware vertex fit: iterates fit_vertex_by_closest_approach on each track's local
+    tangent at its point of closest approach to the current vertex.
 
     Args:
-        points: (n_events, n_hits, 4) raw hits; spatial position is points[..., 1:4]
-        mask: (n_events, n_hits, n_tracks) bool/float, True where a hit
-            is assigned to a track
-        track_reg_result: (n_events, n_tracks, 4) -- (q/(pT+1), theta, sin(phi), cos(phi))
-        track_position: (n_events, n_tracks, 3) -- reference point on each
-            track's line (the innermost assigned hit, see track_position_from_hits)
-        Bz: solenoid field, Tesla. Scalar (python float) or (...)-dimensional tensor
-        track_weight: (n_events, n_tracks) -- same meaning as in
-            fit_vertex_by_closest_approach
-        n_iterations: max outer iterations
-        seed_vertex: (n_events, 3) starting point for iteration 0. Defaults
-            to the origin.
-        d_angle: small angle (radians) to step along each track's helix
-        scaling_factor: placeholder for dataset.py's data_scaler, which is
-            not yet implemented. Used to convert the track_reg_result's
-            q/(pT+1) into a radius in the same units as points[..., 1:4].
-        is_cosmics: if True, fit a straight line in z vs. x
-        **linear_fit_kwargs: forwarded to fit_vertex_by_closest_approach
-            (minimum_total_weight, regularization, minimum_eigenvalue_ratio)
+        points: (n_events, n_hits, 4) hits (E, x, y, z).
+        mask: (n_events, n_hits, n_tracks) bool, True where a hit is assigned to a track.
+        track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi).
+        track_position: (n_events, n_tracks, 3) innermost assigned hit of each track.
+        Bz: solenoid field along z, Tesla.
+        track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
+        n_iterations: maximum iterations; stops early once every event moves < 1e-4.
+        seed_vertex: (n_events, 3) starting vertex; origin if None.
+        d_angle: angular step (radians) along the circle used to form the tangent.
+        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
+        is_cosmics: fit z against x instead of z against transverse radius r.
+        **linear_fit_kwargs: passed to fit_vertex_by_closest_approach.
 
     Returns:
-        {
-          "vertex_estimate": (n_events, 3)  the fitted PV
-              (NaN in any event where fit_is_valid is False)
-          "chi_square": (n_events,)  chi_square(PV) at the solution -- the
-              weighted sum of squared distances of closest approach,
-              generalized to N tracks, evaluated at the fitted vertex.
-              NO NUMBER OF DEGREES OF FREEDOM APPLIED!!!
-          "fit_is_valid": (n_events,) bool, False wherever the event did
-              not contain enough independent track information to define
-              a vertex at all
-          "track_closest_approach_point": (n_events, n_tracks, 3)  the
-              point ON each track's own line closest to the fitted PV
-              (NaN wherever fit_is_valid is False). Plot this alongside
-              vertex_estimate and track_position: if the fit is sensible,
-              each track's closest_approach_point should sit close to
-              vertex_estimate, and roughly along the line from
-              track_position through track_direction.
-          "track_dca": (n_events, n_tracks)  each track's OWN distance of
-              closest approach to the fitted PV (NaN wherever
-              fit_is_valid is False) -- the per-track quantity that
-              chi_square sums (weighted, squared) over. A track with a
-              much larger track_dca than the others in its event is an
-              outlier the fit did not actually agree with, even if the
-              overall chi_square looks acceptable.
-        }
+        dict, same keys as fit_vertex_by_closest_approach, from the last iteration.
+        Tracks with too few hits for a z fit are excluded from it and get NaN
+        track_dca and track_closest_approach_point.
     """
     n_events, n_tracks, _ = track_reg_result.shape
     device = track_reg_result.device
@@ -368,7 +312,7 @@ def fit_vertex_by_helix_closest_approach(
     y_h = track_position[..., 1]
 
     q = torch.sign(rho)
-    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is a degenerate/invalid slot either way
+    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is an invalid slot either way
     pT = (1.0 / rho.abs()) - 1.0
 
     b_z_t = torch.full_like(rho, float(Bz))
@@ -378,21 +322,15 @@ def fit_vertex_by_helix_closest_approach(
     x0 = x_h + R_s * sin_phi
     y0 = y_h - R_s * cos_phi
 
-    angle = torch.atan2(hit_y - y0, hit_x - x0)
-    angle_ref = angle[..., 0, :]  # (n_events, n_tracks)
-
     if is_cosmics:
         zslope, z0 = _line_fit(hit_x, hit_z, mask)
     else:
-        small_angle = torch.atan2(torch.sin(angle - angle_ref.unsqueeze(1)),
-                                       torch.cos(angle - angle_ref.unsqueeze(1)))
-        s = radius.unsqueeze(1) * small_angle
-        zslope, z0 = _line_fit(s, hit_z, mask)
+        zslope, z0 = _line_fit(torch.sqrt(hit_x**2 + hit_y**2), hit_z, mask)
 
-    origin = torch.stack([x0, y0], dim=-1)  # (..., 2)
+    origin = torch.stack([x0, y0], dim=-1)
 
     for iteration in range(n_iterations):
-        PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)  # (n_events, n_tracks, 3)
+        PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)
 
         point_xy = PV_per_track[..., 0:2]
 
@@ -405,12 +343,10 @@ def fit_vertex_by_helix_closest_approach(
         if is_cosmics:
             pca_z = pca_circle[..., 0] * zslope + z0
         else:
-            s_pca = radius * torch.atan2(torch.sin(angle_pca - angle_ref), torch.cos(angle_pca - angle_ref))
-            pca_z = s_pca * zslope + z0
-        pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)  # (..., 3)
+            pca_z = pca_circle.norm(dim=-1) * zslope + z0
+        pca = torch.cat([pca_circle, pca_z.unsqueeze(-1)], dim=-1)
 
-        # Second point on the circle, a small angle further along, to define
-        # the local tangent direction.
+        # second point a small step along the circle gives the local tangent
         new_angle = angle_pca - torch.sign(R_s) * d_angle
         newx = radius * torch.cos(new_angle) + x0
         newy = radius * torch.sin(new_angle) + y0
@@ -419,37 +355,31 @@ def fit_vertex_by_helix_closest_approach(
         if is_cosmics:
             new_z = newx * zslope + z0
         else:
-            new_s_pca = radius * torch.atan2(torch.sin(new_angle - angle_ref), torch.cos(new_angle - angle_ref))
-            new_z = new_s_pca * zslope + z0
+            new_z = new_xy.norm(dim=-1) * zslope + z0
 
         second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
 
         raw_tangent = second_point_pca - pca
         tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
 
-        # NaN guard: near-zero-pT tracks (e.g. noise) produce a helix
-        # radius ≈ 0 which makes the z-line fit degenerate and yields
-        # NaN pca / tangent.  Those tracks have weight = 0 (either from
-        # quality masking or from the normal track-weight formula), but
-        # 0 * NaN = NaN still contaminates the normal matrix inside
-        # fit_vertex_by_closest_approach.  Replace NaN with a safe
-        # dummy point / direction so the linear algebra stays clean.
-        # This does NOT affect any event or track where the geometry is
-        # well-defined; it is a no-op when no NaN is present.
+        # NaN guard: near-zero-pT tracks (e.g. noise) produce a helix radius ≈ 0
         nan_track = torch.isnan(pca).any(dim=-1) | torch.isnan(tangent).any(dim=-1)
         if nan_track.any():
-            _dummy_dir = pca.new_tensor([0.0, 0.0, 1.0]).expand_as(tangent)
-            pca     = torch.where(nan_track.unsqueeze(-1), torch.zeros_like(pca),    pca)
-            tangent = torch.where(nan_track.unsqueeze(-1), _dummy_dir,               tangent)
+            pca     = torch.where(nan_track.unsqueeze(-1), torch.zeros_like(pca), pca)
+            tangent = torch.where(nan_track.unsqueeze(-1), pca.new_tensor([0.0, 0.0, 1.0]).expand_as(tangent), tangent)
 
-        result = fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
+        # NaN tracks are excluded from this fit, not left pulling as a stand-in beam-axis line
+        iter_weight = torch.where(nan_track, torch.zeros_like(track_weight), track_weight)
+        result = fit_vertex_by_closest_approach(pca, tangent, iter_weight, **linear_fit_kwargs)
+        result["track_dca"] = torch.where(nan_track, torch.full_like(result["track_dca"], float("nan")), result["track_dca"])
+        result["track_closest_approach_point"] = torch.where(
+            nan_track.unsqueeze(-1), torch.full_like(result["track_closest_approach_point"], float("nan")),
+            result["track_closest_approach_point"])
 
         new_PV = result["vertex_estimate"]
         fit_is_valid = result["fit_is_valid"]
 
-        # NaN-safe step size: invalid-fit events never count as "still
-        # moving" (there's nothing to converge), so they don't block the
-        # early-exit check below.
+        # invalid-fit events never count as still moving
         step = (new_PV - PV).norm(dim=-1)
         step = torch.where(fit_is_valid, step, torch.zeros_like(step))
 
@@ -457,9 +387,7 @@ def fit_vertex_by_helix_closest_approach(
             still_moving & fit_is_valid, torch.full_like(n_iterations_used, iteration + 1), n_iterations_used
         )
 
-        # Only advance the vertex where the fit is valid; hold position
-        # elsewhere so one bad event's NaNs can't corrupt PV for the
-        # remainder of a batched (vectorized-over-events) iteration.
+        # advance PV only where the fit is valid, so one bad event can't spread NaN
         PV = torch.where(fit_is_valid.unsqueeze(-1), new_PV, PV)
 
         still_moving = still_moving & fit_is_valid & (step > 1e-4)
@@ -469,26 +397,21 @@ def fit_vertex_by_helix_closest_approach(
     return result
 
 def _masked_mean(value, mask, denom, eps):
-    """sum(value * mask) / denom, broadcasting mask over value's last dims as needed."""
+    """sum(value * mask) over hits, divided by denom (floored at eps)."""
     return (value * mask).sum(dim=1) / denom.clamp(min=eps)
-
 
 def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     """
-    the Deming/orthogonal distance line fit -- minimizes true perpendicular distance, not
-    vertical residual, assuming equal variance in u and v).
+    Deming (orthogonal-distance) line fit v = slope * u + intercept, per track.
 
     Args:
-        u, v: (n_events, n_hits, n_tracks), the two coordinates to fit
-            v = slope*u + intercept
-        mask: (n_events, n_hits, n_tracks) bool/float, same convention as
-            circle_fit_by_taubin
-        min_hits: 2 is the practical minimum for a line to mean anything
-        eps: numerical floor on ssd_xy
+        u, v: (n_events, n_hits, n_tracks) coordinates to fit.
+        mask: (n_events, n_hits, n_tracks) bool/float, which hits belong to each track.
+        min_hits: tracks with fewer hits get NaN.
+        eps: numerical floor for divisions.
 
     Returns:
-        slope, intercept: (n_events, n_tracks)
-        valid: (n_events, n_tracks) bool
+        slope, intercept: (n_events, n_tracks) each; NaN where fewer than min_hits hits.
     """
     mask = mask.to(u.dtype)
     n_valid = mask.sum(dim=1)
@@ -513,25 +436,20 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     intercept = torch.where(valid, intercept, nan)
     return slope, intercept
 
-
 class VertexHead(nn.Module):
-    """
-    Zero learnable parameters by default (learn_weights=False): the
-    per-track weight is simply (soft hit count) x (P(real track)), and
-    everything downstream of that is the fixed linear solve above --
-    nothing here is trained. Set learn_weights=True to instead score each
-    track with a small learned network before the same solve; the linear
-    solve itself is unchanged and remains fully differentiable with
-    respect to that network's parameters, so it can be trained end-to-end
-    if you do this.
 
-    Track-quality masking (2026-10):
-        forward() now accepts optional noise_labels and valid_tracks per-
-        track tensors.  When supplied they zero the weight of bad tracks
-        before BOTH the linear and helix vertex fits.  When omitted the
-        behaviour is identical to the original implementation.
     """
+    Primary-vertex fit from track-finder output. No learnable parameters unless learn_weights=True.
 
+    Args:
+        learn_weights: if True, a small network rescales each track's weight.
+        weight_hidden_dim: hidden width of that network.
+        use_helix: refine the straight-line vertex with the helix fit (when Bz != 0).
+        helix_iterations: maximum helix-fit iterations.
+        Bz: solenoid field along z, Tesla.
+        is_cosmics: fit z against x instead of z against transverse radius r.
+        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
+    """
     def __init__(
         self,
         learn_weights: bool = False,
@@ -550,11 +468,7 @@ class VertexHead(nn.Module):
         self.is_cosmics = is_cosmics
         self.scaling_factor = scaling_factor
         if learn_weights:
-            # Input features: class_probs (2) + track_reg_result (4) = 6.
-            # Deliberately no PID and no track_position here -- this network
-            # scores track QUALITY (how much to trust this track's fitted
-            # direction and hit count), which should not depend on where
-            # in space the track happens to be.
+            # 6 inputs: class_probs (2) + track_reg_result (4); position deliberately excluded
             self.track_weight_network = nn.Sequential(
                 nn.Linear(6, weight_hidden_dim),
                 nn.GELU(),
@@ -574,36 +488,27 @@ class VertexHead(nn.Module):
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
         """
-        For each track slot, the position of its innermost assigned hit --
-        the single real hit closest to the origin -- used as its
-        reference point in the fit.
+        Per-track reference point, hit weight and hard hit assignment.
 
         Args:
-            points: (n_events, n_hits, 4) raw hits; spatial position is points[..., 1:4]
-            mask_probs: (n_events, n_hits, n_tracks) soft hit-to-track assignment, from MambaAttentionHead
-            padding_mask: (n_events, n_hits) True where a hit is real (not padding)
+            points: (n_events, n_hits, 4) hits (E, x, y, z).
+            mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
+            padding_mask: (n_events, n_hits) True = real hit.
 
         Returns:
-            track_position: (n_events, n_tracks, 3) -- the innermost
-                assigned hit's own position; (0, 0, 0) for any track slot
-                with no assigned real hits at all (harmless: such a slot
-                also has total_hit_weight ~0 and is excluded from the fit)
-            total_hit_weight: (n_events, n_tracks) -- unchanged: the soft
-                (mask_probs-weighted) hit count per track, still used as
-                part of the fit's default track weight (see forward()
-                below); no longer used to build track_position itself
-            is_assigned: (n_events, n_hits, n_tracks) bool, True where a hit
-                is assigned to a track
+            track_position: (n_events, n_tracks, 3) innermost assigned hit; (0, 0, 0) for a track with none.
+            total_hit_weight: (n_events, n_tracks) sum of mask_probs over real hits.
+            is_assigned: (n_events, n_hits, n_tracks) bool, each real hit assigned to its argmax track;
+            hits with zero probability for every track are unassigned.
         """
-        hit_position = points[..., 1:4]  # (n_events, n_hits, 3)
+        hit_position = points[..., 1:4]
         hit_weight = mask_probs * padding_mask.unsqueeze(-1).to(mask_probs.dtype)
         total_hit_weight = hit_weight.sum(dim=1)
 
         n_events, n_hits, n_tracks = mask_probs.shape
         hit_radius = hit_position.norm(dim=-1)
 
-        # Hard hit-to-track assignment (see docstring above): each hit
-        # belongs to whichever track slot its mask_probs is largest for.
+        # each hit belongs to the track slot with the largest mask_probs
         hard_assigned_track = mask_probs.argmax(dim=-1)
 
         is_assigned = torch.nn.functional.one_hot(hard_assigned_track, num_classes=n_tracks).bool()
@@ -611,10 +516,9 @@ class VertexHead(nn.Module):
         has_assignment = mask_probs.max(dim=-1).values > 0
         is_assigned = (is_assigned & padding_mask.unsqueeze(-1) & has_assignment.unsqueeze(-1))
 
-        # Within each track's assigned hits, find the smallest hit_radius:
         radius_if_assigned = torch.where(is_assigned
                                        , hit_radius.unsqueeze(-1).expand(-1, -1, n_tracks)
-                                       , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_radius.dtype),) # Note extra ,
+                                       , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_radius.dtype),)
         innermost_hit_index = radius_if_assigned.argmin(dim=1)
         has_any_assigned_hit = is_assigned.any(dim=1)
 
@@ -636,66 +540,29 @@ class VertexHead(nn.Module):
     ):
         """
         Args:
-            class_probs: (n_events, n_tracks, 2) from MambaAttentionHead
-            track_reg_result: (n_events, n_tracks, 4) from MambaAttentionHead --
-                still (q/(pT+1), theta, sin(phi), cos(phi)); only used here to
-                score track quality (learn_weights=True) and, when use_helix
-                is False, to build the straight-line direction as before.
-                It is NOT the helix parameterization -- see fitpars.
-            mask_probs: (n_events, n_hits, n_tracks) from MambaAttentionHead
-            points: (n_events, n_hits, 4) raw hits (same tensor fed to the backbone)
-            padding_mask: (n_events, n_hits) True where a hit is real
-
-            --- NEW optional track-quality arguments (2026-10) ---
-
-            noise_labels : (n_events, n_tracks) long/int tensor, or None.
-                1 = noise track (pT < threshold per get_trackinfo_noiselabel),
-                0 = good track.
-                During truth-level testing: derived from reg_target via
-                  downstream_util.get_trackinfo_noiselabel(), then
-                  aggregated from per-hit to per-truth-track by the caller.
-                During real inference: must come from the reconstructed
-                  tracking model output, NOT from reg_target.
-                If None: no noise filtering (original behaviour preserved).
-
-            valid_tracks : (n_events, n_tracks) int tensor, or None.
-                1 = valid (production vertex within 1 cm transverse radius),
-                0 = invalid (e.g. secondary vertex or poorly reconstructed).
-                Same sourcing rules as noise_labels.
-                If None: no validity filtering (original behaviour preserved).
+            class_probs: (n_events, n_tracks, 2) P(slot empty), P(slot real).
+            track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi); gives the
+                straight-line directions and the helix parameters, and is a learn_weights input.
+            mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
+            points: (n_events, n_hits, 4) hits (E, x, y, z).
+            padding_mask: (n_events, n_hits) True = real hit.
+            noise_labels: (n_events, n_tracks) int or None. 1 = noise, 0 = good.
+            valid_tracks: (n_events, n_tracks) int or None. 1 = production vertex within 1 cm.
+                Both quality labels come from reg_target only in truth-level tests; at inference
+                they must come from the tracking output.
 
         Returns:
-            {
-              "vertex_estimate": (n_events, 3)  fitted primary vertex
-                  (NaN in any event where fit_is_valid is False)
-              "chi_square": (n_events,)  weighted sum of squared
-                  perpendicular residuals at the fitted vertex
-              "fit_is_valid": (n_events,) bool
-              "track_position": (n_events, n_tracks, 3)   -- for debugging/plotting
-              "track_direction": (n_events, n_tracks, 3)
-              "track_weight": (n_events, n_tracks)  -- weights actually used in the fit
-                  (already zeroed for masked/bad tracks)
-              "track_quality_mask": (n_events, n_tracks) bool or None
-                  -- True = track participated in fit; None if no masking requested
-              "track_closest_approach_point": (n_events, n_tracks, 3) --
-                  the point on each track's own line closest to
-                  vertex_estimate; plot this against vertex_estimate and
-                  track_position to visually check the fit
-              "track_dca": (n_events, n_tracks) -- each track's own
-                  distance of closest approach to vertex_estimate; a
-                  per-track outlier check, unlike chi_square which is
-                  summed over the whole event
-            }
-
-        Notes on masking:
-            The quality mask is applied by zeroing track_weight for bad
-            tracks.  fit_vertex_by_closest_approach already treats zero-
-            weight tracks as absent (they contribute 0 to the normal
-            matrix and 0 to the weighted-position sum), so no further
-            changes to the fit code are needed.  The existing eigenvalue-
-            ratio degeneracy check handles the resulting "fewer effective
-            tracks" automatically -- events left with fewer than 2 well-
-            separated non-zero-weight tracks will have fit_is_valid=False.
+            dict:
+                vertex_estimate: (n_events, 3) fitted vertex; NaN where fit_is_valid is False.
+                chi_square: (n_events,) weighted sum of squared DCAs at the vertex; no ndf applied.
+                fit_is_valid: (n_events,) bool; False with fewer than 2 usable, non-parallel tracks.
+                track_position: (n_events, n_tracks, 3) innermost assigned hit of each track.
+                track_direction: (n_events, n_tracks, 3) straight-line flight direction.
+                track_weight: (n_events, n_tracks) weight after quality masking; tracks the helix fit
+                    later excludes for too few hits still show their weight here.
+                track_quality_mask: (n_events, n_tracks) bool, or None if no labels were given.
+                track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
+                track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
@@ -703,24 +570,15 @@ class VertexHead(nn.Module):
         probability_track_is_real = class_probs[..., 1]
 
         if self.learn_weights:
-            # learn_weights uses track_reg_result (the network's own
-            # output), not the optional track_info override, so that the
-            # learned scoring remains end-to-end differentiable through
-            # the reconstruction model even when truth parameters are
-            # used for the geometric fit.
             track_quality_features = torch.cat([class_probs, track_reg_result], dim=-1)
             learned_weight_scale = self.track_weight_network(track_quality_features).squeeze(-1)
             track_weight = probability_track_is_real * total_hit_weight * learned_weight_scale
         else:
-            # Zero-parameter default: trust a track in proportion to how many hits support it
-            # and how confident the track finder is that it's real
             track_weight = probability_track_is_real * total_hit_weight
 
         quality_mask = build_track_quality_mask(noise_labels, valid_tracks)
 
         if quality_mask is not None:
-            # Shape guard: quality_mask must be (n_events, n_tracks) where
-            # n_tracks matches track_weight exactly.
             if quality_mask.shape != track_weight.shape:
                 raise ValueError(
                     f"Track-quality mask shape {quality_mask.shape} does not match "
@@ -730,15 +588,13 @@ class VertexHead(nn.Module):
                 )
             track_weight = track_weight * quality_mask.to(dtype=track_weight.dtype)
 
-
         fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
-
 
         if (self.use_helix and self.Bz != 0.0):
             fit = fit_vertex_by_helix_closest_approach(
                 points,
                 is_assigned,
-                track_reg_result,                    # same parameterisation as flight direction
+                track_reg_result,
                 track_position,
                 self.Bz,
                 track_weight,               # already zeroed for bad tracks
@@ -761,3 +617,20 @@ class VertexHead(nn.Module):
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
         }
+
+# reads FM4NPP .mmap dirs: data.ninja + dtype.ninja + starts/ and ends/ index arrays
+class RaggedMmap:
+    def __init__(self, mmap_dir: str, n_cols: int):
+        self.n_cols = n_cols
+        self.dtype = np.dtype(open(os.path.join(mmap_dir, "dtype.ninja")).read().strip())
+        self.flat = np.memmap(os.path.join(mmap_dir, "data.ninja"), dtype=self.dtype, mode="r")
+        self.starts = np.fromfile(os.path.join(mmap_dir, "starts", "data.ninja"), dtype=np.int64)
+        self.ends = np.fromfile(os.path.join(mmap_dir, "ends", "data.ninja"), dtype=np.int64)
+        assert len(self.starts) == len(self.ends), "starts/ends length mismatch"
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        data = np.array(self.flat[self.starts[idx]:self.ends[idx]])   # copy out of memmap
+        return data if self.n_cols == 1 else data.reshape(-1, self.n_cols)
