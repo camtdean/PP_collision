@@ -49,127 +49,11 @@ for _candidate in [_HERE, os.path.join(_HERE, "train", "downstream")]:
         break
 
 from vertex_head import VertexHead  # noqa: E402
-from downstream_util import (get_trackinfo_noiselabel, get_silicon_tpc_match_mask,)
-
-
-DEFAULT_DATA_DIR = os.path.expanduser(
-    "~/Storage/PP_collision/train/downstream/test/combined_0"
+from vertex_head_inputs import (  # noqa: E402
+    DEFAULT_DATA_DIR, DEFAULT_EVENT_IDX, DEFAULT_BZ,
+    load_event, build_truth_tracks, apply_silicon_tpc_mask, vertex_head_inputs,
 )
-DEFAULT_EVENT_IDX = 1   # event 0 has only 10 hits; event 1 has ~1951 hits
-DEFAULT_BZ = 1.4        # Tesla
-NOISE_PT_THRESHOLD = 0.25
 
-
-# reads FM4NPP .mmap dirs: data.ninja + dtype.ninja + starts/ and ends/ index arrays
-class RaggedMmap:
-    def __init__(self, mmap_dir: str, n_cols: int):
-        self.n_cols = n_cols
-        dtype_str = open(os.path.join(mmap_dir, "dtype.ninja")).read().strip()
-        self.dtype = np.dtype(dtype_str)
-        self.flat = np.memmap(
-            os.path.join(mmap_dir, "data.ninja"), dtype=self.dtype, mode="r"
-        )
-        self.starts = np.fromfile(
-            os.path.join(mmap_dir, "starts", "data.ninja"), dtype=np.int64
-        )
-        self.ends = np.fromfile(
-            os.path.join(mmap_dir, "ends", "data.ninja"), dtype=np.int64
-        )
-        assert len(self.starts) == len(self.ends), "starts/ends length mismatch"
-
-    def __len__(self):
-        return len(self.starts)
-
-    def __getitem__(self, idx: int) -> np.ndarray:
-        s, e = self.starts[idx], self.ends[idx]
-        data = np.array(self.flat[s:e])          # copy out of memmap
-        if self.n_cols == 1:
-            return data
-        return data.reshape(-1, self.n_cols)
-
-# features (E, x, y, z), seg_target (track ID), reg_target (px, py, pz, vx, vy, vz, q, e)
-def load_event(data_dir: str, event_idx: int):
-    features   = RaggedMmap(os.path.join(data_dir, "features.mmap"),   n_cols=4)[event_idx]
-    seg_target = RaggedMmap(os.path.join(data_dir, "seg_target.mmap"), n_cols=1)[event_idx]
-    reg_target = RaggedMmap(os.path.join(data_dir, "reg_target.mmap"), n_cols=8)[event_idx]
-
-    features   = features.astype(np.float32)
-    seg_target = seg_target.astype(np.int32)
-    reg_target = reg_target.astype(np.float64)
-
-    return features, seg_target, reg_target
-
-# per-truth-track VertexHead inputs (batch dim 1), plus truth vertex and pT per track
-def build_truth_tracks(features, seg_target, reg_target, noise_pt_threshold=NOISE_PT_THRESHOLD):
-    unique_ids = np.unique(seg_target)            # sorted; negative IDs are real tracks
-    n_hits     = len(seg_target)
-    n_tracks   = len(unique_ids)
-
-    id_to_col = {tid: col for col, tid in enumerate(unique_ids)}
-
-    # all hits of a truth track share its reg_target row; take the first
-    track_px  = np.zeros(n_tracks, dtype=np.float64)
-    track_py  = np.zeros(n_tracks, dtype=np.float64)
-    track_pz  = np.zeros(n_tracks, dtype=np.float64)
-    track_vtx = np.zeros((n_tracks, 3), dtype=np.float64)   # vtx_x, vtx_y, vtx_z
-    track_q   = np.zeros(n_tracks, dtype=np.float64)
-    track_seen = np.zeros(n_tracks, dtype=bool)
-
-    mask_probs_np = np.zeros((n_hits, n_tracks), dtype=np.float32)
-
-    for hit_idx, tid in enumerate(seg_target):
-        col = id_to_col[int(tid)]
-        mask_probs_np[hit_idx, col] = 1.0
-
-        if not track_seen[col]:
-            track_px[col]    = reg_target[hit_idx, 0]
-            track_py[col]    = reg_target[hit_idx, 1]
-            track_pz[col]    = reg_target[hit_idx, 2]
-            track_vtx[col]   = reg_target[hit_idx, 3:6]
-            track_q[col]     = reg_target[hit_idx, 6]
-            track_seen[col]  = True
-
-    pT  = np.sqrt(track_px**2 + track_py**2)
-    phi = np.arctan2(track_py, track_px)
-    theta = np.arctan2(pT, track_pz)
-
-    rho = track_q / (pT + 1.0)
-
-    # track_reg_result layout: (rho, theta, sin_phi, cos_phi), rho = q / (pT + 1)
-    track_reg = np.stack([
-        rho,
-        theta,
-        np.sin(phi),
-        np.cos(phi),
-    ], axis=-1).astype(np.float32)
-
-    # same noise/validity cuts as get_trackinfo_noiselabel
-    vtx_r    = np.sqrt(track_vtx[:, 0]**2 + track_vtx[:, 1]**2)
-    noise    = (pT < noise_pt_threshold).astype(np.int64)   # 1=noise, 0=good
-    valid    = (vtx_r < 1.0).astype(np.int32)               # 1=valid, 0=invalid
-
-    trr  = torch.from_numpy(track_reg).unsqueeze(0)
-    nlab = torch.from_numpy(noise).unsqueeze(0)
-    vtrk = torch.from_numpy(valid).unsqueeze(0)
-    mprb = torch.from_numpy(mask_probs_np).unsqueeze(0)
-    pts  = torch.from_numpy(features).float().unsqueeze(0)
-    pad  = torch.ones(1, n_hits, dtype=torch.bool)
-    cprb = torch.zeros(1, n_tracks, 2, dtype=torch.float32)
-    cprb[..., 1] = 1.0                                          # all real
-
-    return {
-        "track_ids":           unique_ids,
-        "track_reg_result":    trr,
-        "noise_labels":        nlab,
-        "valid_tracks":        vtrk,
-        "track_info":          trr,
-        "mask_probs":          mprb,
-        "points":              pts,
-        "padding_mask":        pad,
-        "class_probs":         cprb,
-        "truth_vtx_per_track": torch.from_numpy(track_vtx.astype(np.float32)),
-        "pT_per_track":        torch.from_numpy(pT.astype(np.float32)),
-    }
 
 def helix_points(
     rho, theta, sin_phi, cos_phi,
@@ -260,10 +144,10 @@ def make_event_display(
     td = build_truth_tracks(features, seg_target, reg_target)
     
     # silicon hits (R < 15 cm) on tracks with no TPC hit (25 < R < 100 cm): excluded from the fit, still drawn
-    silicon_info = get_silicon_tpc_match_mask(features, seg_target,)
-    hit_keep_mask = silicon_info["keep_mask"]
-    silicon_mask = silicon_info["silicon_mask"]
-    unmatched_silicon_mask = silicon_info["unmatched_silicon_mask"]
+    silicon_info = apply_silicon_tpc_mask(td, features, seg_target, apply=not args.no_silicon_tpc_mask)
+    hit_keep_mask = np.asarray(silicon_info["keep_mask"])
+    silicon_mask = np.asarray(silicon_info["silicon_mask"])
+    unmatched_silicon_mask = np.asarray(silicon_info["unmatched_silicon_mask"])
     
     print("\n=== Silicon/TPC masking diagnostic ===")
     print(f"Total hits: {len(features)}")
@@ -273,8 +157,6 @@ def make_event_display(
         f"{int((unmatched_silicon_mask & hit_keep_mask).sum())}")
 
     if not args.no_silicon_tpc_mask:
-        td["mask_probs"][0, ~hit_keep_mask, :] = 0.0
-
         masked_probs = td["mask_probs"][0, unmatched_silicon_mask, :]
         print(f"Unmatched Silicon hits with nonzero assignment probability: "
             f"{int((masked_probs.abs().sum(dim=-1) > 0).sum().item())}")
@@ -293,9 +175,7 @@ def make_event_display(
                 f"assignment_sum={probs.sum().item():.6g}"
             )
 
-    if not args.no_silicon_tpc_mask:
-        td["mask_probs"][0, ~hit_keep_mask, :] = 0.0
-    else:
+    if args.no_silicon_tpc_mask:
         unmatched_silicon_mask = np.zeros(len(features), dtype=bool)
 
     print(f"  Silicon hits       = {int(silicon_mask.sum())}")
@@ -322,36 +202,8 @@ def make_event_display(
     )
     head.eval()
     
-    reg_tensor = torch.from_numpy(reg_target).float()
-    info = get_trackinfo_noiselabel(reg_tensor, noise_pt_threshold=NOISE_PT_THRESHOLD,)
-    
-    track_info = torch.zeros((1, n_tracks, 4), dtype=torch.float32,)
-    noise_labels = torch.zeros((1, n_tracks), dtype=torch.long,)
-    valid_tracks = torch.zeros((1, n_tracks), dtype=torch.long,)
-    
-    id_to_col = {int(tid): col for col, tid in enumerate(track_ids)}
-    track_seen = np.zeros(n_tracks, dtype=bool)
-    
-    for hit_idx, tid in enumerate(seg_target):
-        col = id_to_col[int(tid)]
-        
-        if not track_seen[col]:
-            track_info[0, col] = info["track_info"][hit_idx]
-            noise_labels[0, col] = info["noise_labels"][hit_idx]
-            valid_tracks[0, col] = info["valid_tracks"][hit_idx]
-            track_seen[col] = True
-
     with torch.no_grad():
-        result = head.forward(
-            class_probs      = td["class_probs"],
-            track_reg_result = td["track_reg_result"],
-            mask_probs       = td["mask_probs"],
-            points           = td["points"],
-            padding_mask     = td["padding_mask"],
-            noise_labels     = None if args.no_mask else noise_labels,
-            valid_tracks     = None if args.no_mask else valid_tracks,
-            track_info       = None if args.no_mask else track_info,
-        )
+        result = head(**vertex_head_inputs(td, use_quality_mask=not args.no_mask))
 
     fit_valid  = result["fit_is_valid"][0].item()
     reco_vtx   = result["vertex_estimate"][0].numpy()
@@ -398,7 +250,7 @@ def make_event_display(
     hit_colours  = np.array(hit_colours)
     hit_is_good  = np.array(hit_is_good, dtype=bool)
     
-    trk_params = track_info[0].numpy()
+    trk_params = td["track_reg_result"][0].numpy()
 
     if fit_valid:
         vtx_for_helix = reco_vtx

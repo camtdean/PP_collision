@@ -627,7 +627,7 @@ class VertexHead(nn.Module):
     def forward(
         self,
         class_probs,
-        track_info,
+        track_reg_result,
         mask_probs,
         points,
         padding_mask,
@@ -664,16 +664,6 @@ class VertexHead(nn.Module):
                 Same sourcing rules as noise_labels.
                 If None: no validity filtering (original behaviour preserved).
 
-            track_info : (n_events, n_tracks, 4) float tensor, or None.
-                Optional override for track_reg_result in the fits.
-                Format: (q/(pT+1), theta, sin_phi, cos_phi) -- IDENTICAL to
-                what get_trackinfo_noiselabel() puts in its "track_info" key.
-                Use this when the caller has already derived truth track
-                parameters via get_trackinfo_noiselabel() and wants the fits
-                to use those parameters instead of a separately constructed
-                track_reg_result.
-                If None: track_reg_result is used as-is (original behaviour).
-
         Returns:
             {
               "vertex_estimate": (n_events, 3)  fitted primary vertex
@@ -708,7 +698,7 @@ class VertexHead(nn.Module):
             separated non-zero-weight tracks will have fit_is_valid=False.
         """
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
-        track_direction = track_flight_direction(track_info)
+        track_direction = track_flight_direction(track_reg_result)
 
         probability_track_is_real = class_probs[..., 1]
 
@@ -718,7 +708,7 @@ class VertexHead(nn.Module):
             # learned scoring remains end-to-end differentiable through
             # the reconstruction model even when truth parameters are
             # used for the geometric fit.
-            track_quality_features = torch.cat([class_probs, track_info], dim=-1)
+            track_quality_features = torch.cat([class_probs, track_reg_result], dim=-1)
             learned_weight_scale = self.track_weight_network(track_quality_features).squeeze(-1)
             track_weight = probability_track_is_real * total_hit_weight * learned_weight_scale
         else:
@@ -748,7 +738,7 @@ class VertexHead(nn.Module):
             fit = fit_vertex_by_helix_closest_approach(
                 points,
                 is_assigned,
-                track_info,                    # same parameterisation as flight direction
+                track_reg_result,                    # same parameterisation as flight direction
                 track_position,
                 self.Bz,
                 track_weight,               # already zeroed for bad tracks
