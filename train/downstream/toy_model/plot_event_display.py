@@ -2,14 +2,11 @@
 """
 plot_vertex.py
 
-Figure 1 — Event display
+Figure — Event display
     • Uses the EXACT event saved by test_vertex_simple.py in vertex_test_inputs.pt.
     • Reconstructed vertex is obtained by running VertexHead on the SAVED inputs.
 
-Figure 2 — Truth vs reco scatter
-    • Residual mean mu and standard deviation sigma (in microns) shown in each title.
-
-Figure 1 does NOT regenerate the event. It loads the tensors produced by
+Figure does NOT regenerate the event. It loads the tensors produced by
 test_vertex_simple.py:
 
     vertex_test_inputs.pt
@@ -35,23 +32,19 @@ import argparse
 
 # ── import VertexHead from the same directory as this script ───────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 try:
-    from vertex_head import VertexHead
-    print(f"Loaded VertexHead from: {os.path.join(_HERE, 'vertex_head.py')}\n")
+    from train.downstream.vertex_head import VertexHead
+    print(f"Loaded VertexHead from: {os.path.join(_REPO_ROOT, 'train', 'downstream', 'vertex_head.py')}\n")
 except ImportError as e:
-    sys.exit(
-        f"ImportError: {e}\n\n"
-        f"Fix:\n  cd /Users/nieto/Storage/PP_collision\n"
-        f"       git checkout train/downstream/vertex_head.py"
-    )
+    sys.exit(f"ImportError: {e}\n\nFix:\n  cd /Users/nieto/Storage/PP_collision\n  git checkout train/downstream/vertex_head.py")
 except SyntaxError as e:
     sys.exit(
         f"SyntaxError in vertex_head.py at line {e.lineno}: {e.msg}\n\n"
-        f"Fix:\n  cd /Users/nieto/Storage/PP_collision\n"
-        f"       git checkout train/downstream/vertex_head.py"
+        "Fix:\n  cd /Users/nieto/Storage/PP_collision\n  git checkout train/downstream/vertex_head.py"
     )
 
 
@@ -80,6 +73,13 @@ parser.add_argument(
     help="Generate tracks as helices instead of straight lines"
 )
 
+parser.add_argument(
+    "--input",
+    type=str,
+    default="vertex_test_inputs.pt",
+    help="Saved vertex test event to display",
+)
+
 args = parser.parse_args()
 
 USE_HELIX = args.use_helix
@@ -90,7 +90,7 @@ B_FIELD_Z = 1.4  # Tesla
 HELIX_CONST_CM = 100.0 / 0.3
 
 R_TPC_INNER = 30.0
-R_TPC_OUTER = 78.0
+R_TPC_OUTER = 76.0
 
 def helix_radius_cm(pT, B_z=B_FIELD_Z, q_abs=1.0):
     """Transverse radius of curvature [cm]."""
@@ -104,29 +104,24 @@ def helix_points(
     phi,
     charge,
     B_z=B_FIELD_Z,
-    R_max=R_TPC_OUTER,
+    R_inner=R_TPC_INNER,
+    R_outer=R_TPC_OUTER,
     n_points=300,
 ):
     """
     Generate the helical trajectory using the SAME parameterization
-    as test_vertex_simple.py.
+    as vertex_head.py and test_vertex_simple.py.
 
-    Parameters
-    ----------
-    vertex : array-like
-        Starting vertex [x, y, z] in cm.
-    pT : float
-        Transverse momentum in GeV.
-    theta : float
-        Polar angle.
-    phi : float
-        Initial azimuthal angle.
-    charge : float
-        Particle charge (+1/-1).
-    B_z : float
-        Magnetic field in Tesla.
-    R_max : float
-        Maximum transverse radius to display.
+    phi is the momentum azimuth at the PRIMARY VERTEX.
+
+    The trajectory is generated from the signed curvature radius:
+
+        R_s = pT / (0.3 * q * Bz)
+
+    and the circle-center convention used by VertexHead:
+
+        x0 = x + R_s sin(phi)
+        y0 = y - R_s cos(phi)
     """
 
     vx, vy, vz = np.asarray(vertex, dtype=float)
@@ -137,33 +132,42 @@ def helix_points(
     phi = float(phi)
 
     rho = helix_radius_cm(pT, B_z, abs(q),)
-
-    # Same geometry as test_vertex_simple.py:
-    #
-    # R = 2 rho sin(|alpha|/2)
-    #
-    ratio = R_max / (2.0 * rho)
-
-    # Do not go beyond the maximum transverse displacement 2*rho.
-    ratio = min(ratio, 1.0)
+    radii = np.linspace(0, R_outer, n_points,)
+    ratio = np.clip(radii / (2.0 * rho), 0.0, 1.0,)
 
     alpha_abs = 2.0 * np.arcsin(ratio)
+    alpha = (-q * np.sign(B_z) * alpha_abs)
 
-    # SAME sign convention as test_vertex_simple.py
-    alpha_max = q * np.copysign(alpha_abs, B_z)
+    R_s = rho / q
+    
+    # Circle center corresponding to the momentum direction
+    # phi at the vertex.
+    x0 = vx + R_s * np.sin(phi)
+    y0 = vy - R_s * np.cos(phi)
 
-    alpha = np.linspace(0.0, alpha_max, n_points,)
+    # Position along the helix.
+    x = x0 - R_s * np.sin(phi + alpha)
+    y = y0 + R_s * np.cos(phi + alpha)
 
-    x = (vx + rho * (np.sin(phi + alpha) - np.sin(phi)))
-    y = (vy - rho * (np.cos(phi + alpha) - np.cos(phi)))
+    # Transverse arc length.
+    s_xy = rho * np.abs(alpha)
 
-    # Arc length along the helix
-    s = rho * np.abs(alpha)
+    # Convert transverse arc length to 3-D path length.
+    #
+    # ds_xy = ds * sin(theta)
+    # therefore
+    # ds = ds_xy / sin(theta)
+    sin_theta = np.sin(theta)
 
-    # z advances along the trajectory
-    z = vz + s * np.cos(theta)
+    if abs(sin_theta) < 1e-8:
+        s_3d = np.zeros_like(s_xy)
+    else:
+        s_3d = s_xy / abs(sin_theta)
 
-    return np.column_stack([x, y, z])
+    # z propagation.
+    z = vz + s_3d * np.cos(theta)
+
+    return np.column_stack([x, y, z,])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Line configuration
@@ -211,125 +215,6 @@ def linear_track_points(
     z = vz + s * dz
 
     return np.column_stack([x, y, z])
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SYNTHETIC EVENT GENERATOR
-# Used ONLY for Figure 2.
-#
-# Figure 1 does not use this function; it loads the event saved by
-# test_vertex_simple.py.
-# ══════════════════════════════════════════════════════════════════════════════
-def make_event(
-    vtx_true,
-    n_tracks: int = 5,
-    n_hits_per_track: int = 30,
-    hit_smearing: float = 0.01,
-    tpc_inner_r: float = 30.0,
-    tpc_hit_spacing: float = 1.0,
-    seed=None,
-):
-    """
-    Build the five tensors VertexHead.forward() expects for a single event.
-
-    This generator is used for the NEW events in Figure 2.
-
-    All tracks originate at vtx_true.
-    TPC geometry: hit k is placed where the straight track crosses
-    r_xy = tpc_inner_r + k * tpc_hit_spacing.
-
-    Returns:
-        class_probs
-        track_reg_result
-        mask_probs
-        points
-        padding_mask
-        direction
-    """
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    n_hits = n_tracks * n_hits_per_track
-
-    # Random track kinematics
-    p_total = torch.FloatTensor(n_tracks).uniform_(0.2, 5.0)
-    theta = torch.FloatTensor(n_tracks).uniform_(0.4, math.pi - 0.4)
-    phi = torch.FloatTensor(n_tracks).uniform_(0.0, 2.0 * math.pi)
-    charge = torch.randint(0, 2, (n_tracks,)).float() * 2 - 1
-
-    pT = p_total * torch.sin(theta)
-
-    # Unit flight directions
-    direction = torch.stack([
-        torch.sin(theta) * torch.cos(phi),
-        torch.sin(theta) * torch.sin(phi),
-        torch.cos(theta),
-    ], dim=-1)
-
-    # ── class_probs  (1, n_tracks, 2) ────────────────────────────────────────
-    class_probs = torch.tensor([[[0.05, 0.95]] * n_tracks])
-
-    # ── track_reg_result  (1, n_tracks, 4) ──────────────────────────────────
-    # columns: [q/(pT+1), theta, sin(phi), cos(phi)]
-    track_reg_result = torch.stack([
-        charge / (pT + 1.0),
-        theta,
-        torch.sin(phi),
-        torch.cos(phi),
-    ], dim=-1).unsqueeze(0)
-
-    # ── points  (1, n_hits, 4) ──────────────────────────────────────────────
-    # columns: [E, x, y, z]
-    vx, vy = vtx_true[0].item(), vtx_true[1].item()
-    rows = []
-
-    for t in range(n_tracks):
-        dx = direction[t, 0].item()
-        dy = direction[t, 1].item()
-
-        a = dx * dx + dy * dy
-        b = 2.0 * (vx * dx + vy * dy)
-
-        for k in range(n_hits_per_track):
-            R_k = tpc_inner_r + k * tpc_hit_spacing
-            c_k = vx * vx + vy * vy - R_k * R_k
-            disc = b * b - 4.0 * a * c_k
-            s_k = (-b + math.sqrt(disc)) / (2.0 * a)
-
-            pos = (
-                vtx_true
-                + s_k * direction[t]
-                + torch.randn(3) * hit_smearing
-            )
-
-            rows.append([
-                p_total[t].item(),
-                pos[0].item(),
-                pos[1].item(),
-                pos[2].item(),
-            ])
-
-    points = torch.tensor(rows, dtype=torch.float32).unsqueeze(0)
-
-    # ── mask_probs  (1, n_hits, n_tracks) ───────────────────────────────────
-    mask_probs = torch.full((1, n_hits, n_tracks), 0.02)
-
-    for t in range(n_tracks):
-        s = t * n_hits_per_track
-        e = (t + 1) * n_hits_per_track
-        mask_probs[0, s:e, t] = 0.90
-
-    # ── padding_mask  (1, n_hits) ───────────────────────────────────────────
-    padding_mask = torch.ones(1, n_hits, dtype=torch.bool)
-
-    return dict(
-        class_probs=class_probs,
-        track_reg_result=track_reg_result,
-        mask_probs=mask_probs,
-        points=points,
-        padding_mask=padding_mask,
-        direction=direction,
-    )
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOAD EXACT EVENT FROM test_vertex_simple.py
@@ -392,7 +277,7 @@ def load_saved_test_event(path):
         torch.sin(theta) * torch.sin(phi),
         torch.cos(theta),
     ], dim=-1)
-
+    
     event = {
         "class_probs": saved["class_probs"],
         "track_reg_result": saved["track_reg_result"],
@@ -400,9 +285,34 @@ def load_saved_test_event(path):
         "points": saved["points"],
         "padding_mask": saved["padding_mask"],
         "direction": direction,
+        # Truth kinematics at the PRIMARY VERTEX
+        "theta_vertex": saved["theta_rad"],
+        "phi_vertex": saved["phi_rad"],
     }
 
     return event, saved["true_vertex"], saved
+
+def load_saved_event(path):
+    """
+    Load one event produced by test_vertex_simple.py.
+    """
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    saved = torch.load(path, map_location="cpu")
+
+    event = {
+        "class_probs": saved["class_probs"],
+        "track_reg_result": saved["track_reg_result"],
+        "mask_probs": saved["mask_probs"],
+        "points": saved["points"],
+        "padding_mask": saved["padding_mask"],
+    }
+
+    true_vertex = saved["true_vertex"]
+
+    return event, true_vertex
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -444,15 +354,18 @@ def plot_event_display(event, result, vtx_true, save_path):
     # Actual track parameters stored by test_vertex_simple.py:
     q_over_pt_plus_one = track_reg[:, 0]
     theta = track_reg[:, 1]
-    sin_phi = track_reg[:, 2]
-    cos_phi = track_reg[:, 3]
-
-    # Recover the physical parameters
     charge = np.sign(q_over_pt_plus_one)
-
     pT = 1.0 / np.abs(q_over_pt_plus_one) - 1.0
 
-    phi = np.arctan2(sin_phi, cos_phi,)
+    phi_vertex = event["phi_vertex"].numpy()
+    theta_vertex = event["theta_vertex"].numpy()
+    
+    if USE_HELIX:
+        phi = phi_vertex
+        theta = theta_vertex
+    else:
+        phi = phi_vertex
+        theta = theta_vertex
     
     """
     4-panel event display for the EXACT event loaded from
@@ -468,6 +381,7 @@ def plot_event_display(event, result, vtx_true, save_path):
     """
     # ── unpack tensors to numpy ─────────────────────────────────────────────
     pts_xyz = event["points"][0, :, 1:4].numpy()
+    pts_r = np.sqrt(pts_xyz[:, 0]**2 + pts_xyz[:, 1]**2)
     mprobs = event["mask_probs"][0].numpy()
     n_tracks = mprobs.shape[1]
 
@@ -507,16 +421,24 @@ def plot_event_display(event, result, vtx_true, save_path):
 
     ax3d = fig.add_subplot(2, 2, 1, projection="3d")
     ax_xy = fig.add_subplot(2, 2, 2)
-    ax_xz = fig.add_subplot(2, 2, 3)
-    ax_yz = fig.add_subplot(2, 2, 4)
+    ax_yz = fig.add_subplot(2, 2, 3)
+    ax_rz = fig.add_subplot(2, 2, 4)
 
     # ── helper: draw one truth track in any projection ──────────────────────
-    def draw_track(ax_2d, t, xi, yi, line_len=30.0):
+    def draw_track(ax_2d, t, xi, yi, use_r=False, line_len=30.0):
+
         mask = hit_track == t
 
+        if use_r:
+            x_data = pts_xyz[mask, 2]   # Z
+            y_data = pts_r[mask]        # R
+        else:
+            x_data = pts_xyz[mask, xi]
+            y_data = pts_xyz[mask, yi]
+
         ax_2d.scatter(
-            pts_xyz[mask, xi],
-            pts_xyz[mask, yi],
+            x_data,
+            y_data,
             color=track_colors[t],
             marker=track_markers[t % len(track_markers)],
             s=9,
@@ -525,10 +447,6 @@ def plot_event_display(event, result, vtx_true, save_path):
             zorder=2,
         )
 
-        # Start the truth direction line at the SAVED first hit.
-        #
-        # The first hit is at index t * N_HITS_PER_TRACK because
-        # test_vertex_simple.py stores hits track-by-track.
         if USE_HELIX:
 
             helix_xyz = helix_points(
@@ -538,18 +456,31 @@ def plot_event_display(event, result, vtx_true, save_path):
                 phi=phi[t],
                 charge=charge[t],
                 B_z=B_FIELD_Z,
-                R_max=R_TPC_OUTER,
+                R_inner=R_TPC_INNER,
+                R_outer=R_TPC_OUTER,
                 n_points=300,
             )
 
-            ax_2d.plot(
-                helix_xyz[:, xi],
-                helix_xyz[:, yi],
-                color=track_colors[t],
-                lw=1.2,
-                alpha=0.55,
-                zorder=3,
-            )
+            if use_r:
+                helix_r = np.sqrt(helix_xyz[:, 0]**2 + helix_xyz[:, 1]**2)
+
+                ax_2d.plot(
+                    helix_xyz[:, 2],   # Z
+                    helix_r,           # R
+                    color=track_colors[t],
+                    lw=1.2,
+                    alpha=0.55,
+                    zorder=3,
+                )
+            else:
+                ax_2d.plot(
+                    helix_xyz[:, xi],
+                    helix_xyz[:, yi],
+                    color=track_colors[t],
+                    lw=1.2,
+                    alpha=0.55,
+                    zorder=3,
+                )
 
         else:
 
@@ -561,14 +492,26 @@ def plot_event_display(event, result, vtx_true, save_path):
                 n_points=100,
             )
 
-            ax_2d.plot(
-                trajectory[:, xi],
-                trajectory[:, yi],
-                color=track_colors[t],
-                lw=1.2,
-                alpha=0.55,
-                zorder=3,
-            )
+            if use_r:
+                trajectory_r = np.sqrt(trajectory[:, 0]**2 + trajectory[:, 1]**2)
+
+                ax_2d.plot(
+                    trajectory[:, 2],   # Z
+                    trajectory_r,       # R
+                    color=track_colors[t],
+                    lw=1.2,
+                    alpha=0.55,
+                    zorder=3,
+                )
+            else:
+                ax_2d.plot(
+                    trajectory[:, xi],
+                    trajectory[:, yi],
+                    color=track_colors[t],
+                    lw=1.2,
+                    alpha=0.55,
+                    zorder=3,
+                )
 
     # ── 3-D panel ────────────────────────────────────────────────────────────
     ax3d.set_facecolor(SURFACE)
@@ -602,7 +545,8 @@ def plot_event_display(event, result, vtx_true, save_path):
                 phi=phi[t],
                 charge=charge[t],
                 B_z=B_FIELD_Z,
-                R_max=R_TPC_OUTER,
+                R_inner=R_TPC_INNER,
+                R_outer=R_TPC_OUTER,
                 n_points=300,
             )
 
@@ -676,36 +620,80 @@ def plot_event_display(event, result, vtx_true, save_path):
 
     # ── 2-D projections ─────────────────────────────────────────────────────
     projections = [
-        (ax_xy, 0, 1, "x (cm)", "y (cm)", "Transverse  x-y"),
-        (ax_xz, 0, 2, "x (cm)", "z (cm)", "x-z plane"),
-        (ax_yz, 1, 2, "y (cm)", "z (cm)", "y-z plane"),
+        (ax_xy, 0, 1, "x (cm)", "y (cm)", "Transverse  x-y", False),
+        (ax_yz, 2, 1, "z (cm)", "y (cm)", "y-z plane", False),
+        (ax_rz, 2, 0, "z (cm)", "R (cm)", "R-z plane", True),
     ]
 
-    for ax2, xi, yi, xl, yl, title in projections:
+    for ax2, xi, yi, xl, yl, title, use_r in projections:
         for t in range(n_tracks):
-            draw_track(ax2, t, xi, yi)
+            draw_track(ax2, t, xi, yi, use_r=use_r)
+            
+        if use_r:
+            # Z-R projection
+            true_x = vtx_true_np[2]  # Z
+            true_y = np.sqrt(vtx_true_np[0]**2 + vtx_true_np[1]**2)
 
-        ax2.scatter(
-            vtx_true_np[xi],
-            vtx_true_np[yi],
-            marker="*",
-            s=220,
-            c=TRUE_VTX_COLOR,
-            zorder=8,
-            linewidths=0.5,
-            edgecolors=SURFACE,
-        )
-
-        if is_valid:
             ax2.scatter(
-                vtx_reco_np[xi],
-                vtx_reco_np[yi],
-                marker="X",
-                s=150,
-                c=RECO_VTX_COLOR,
-                zorder=9,
-                linewidths=0.5,
+                true_x,
+                true_y,
+                marker="*",
+                s=180,
+                color="black",
+                edgecolor="white",
+                linewidth=1.0,
+                label="True PV",
+                zorder=10,
             )
+
+            if is_valid:
+                reco_x = vtx_reco_np[2]  # Z
+                reco_y = np.sqrt(vtx_reco_np[0]**2 + vtx_reco_np[1]**2)
+
+                ax2.scatter(
+                    reco_x,
+                    reco_y,
+                    marker="X",
+                    s=120,
+                    color="red",
+                    edgecolor="white",
+                    linewidth=1.0,
+                    label="Reco PV",
+                    zorder=10,
+                )
+
+        else:
+            # X-Y or Z-Y projection
+            true_x = vtx_true_np[xi]
+            true_y = vtx_true_np[yi]
+
+            ax2.scatter(
+                true_x,
+                true_y,
+                marker="*",
+                s=180,
+                color="black",
+                edgecolor="white",
+                linewidth=1.0,
+                label="True PV",
+                zorder=10,
+            )
+
+            if is_valid:
+                reco_x = vtx_reco_np[xi]
+                reco_y = vtx_reco_np[yi]
+
+                ax2.scatter(
+                    reco_x,
+                    reco_y,
+                    marker="X",
+                    s=120,
+                    color="red",
+                    edgecolor="white",
+                    linewidth=1.0,
+                    label="Reco PV",
+                    zorder=10,
+                )
 
         _style_ax(ax2, xl, yl, title)
 
@@ -746,108 +734,11 @@ def plot_event_display(event, result, vtx_true, save_path):
 
     print(f"  Saved event display   →  {save_path}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FIGURE 2 — TRUTH VS RECO
-# ══════════════════════════════════════════════════════════════════════════════
-def plot_truth_vs_reco(vtx_true_list, vtx_reco_list, save_path):
-    """
-    Three-panel scatter:
-        x_reco vs x_true
-        y_reco vs y_true
-        z_reco vs z_true
-
-    These values come from the independent 200-event Figure 2 study.
-    """
-    arr_true = np.array(vtx_true_list)
-    arr_reco = np.array(vtx_reco_list)
-    residuals = arr_reco - arr_true
-
-    N = len(arr_true)
-    coord_labels = ["x", "y", "z"]
-
-    fig, axes = plt.subplots(
-        1,
-        3,
-        figsize=(14, 4.8),
-        facecolor=SURFACE,
-    )
-
-    fig.suptitle(
-    f"Reco vs True Primary Vertex  "
-    f"({N} valid events, Poisson($\\lambda$={MEAN_N_TRACKS:.0f}) tracks, "
-    f"{N_HITS_PER_TRACK} hits/track, "
-    r"$r_{xy}$ = 30–59 cm, $\sigma_\mathrm{hit}$ = 100 µm)",
-    fontsize=12,
-    color=INK_PRIMARY,
-    y=1.02,
-)
-
-    for i, (ax, coord) in enumerate(zip(axes, coord_labels)):
-        t_vals = arr_true[:, i]
-        r_vals = arr_reco[:, i]
-
-        mu = float(residuals[:, i].mean())
-        sigma = float(residuals[:, i].std())
-
-        lo = min(t_vals.min(), r_vals.min()) - 0.15
-        hi = max(t_vals.max(), r_vals.max()) + 0.15
-
-        # Identity line
-        ax.plot(
-            [lo, hi],
-            [lo, hi],
-            color=AXIS_LINE,
-            lw=1.8,
-            zorder=1,
-        )
-
-        # Scatter
-        ax.scatter(
-            t_vals,
-            r_vals,
-            color=cm.tab20(0),
-            marker="o",
-            s=20,
-            alpha=0.55,
-            linewidths=0,
-            zorder=2,
-        )
-
-        title = (
-            f"{coord}:   "
-            f"$\\mu$ = {mu * 1e4:+.1f} µm,   "
-            f"$\\sigma$ = {sigma * 1e4:.1f} µm"
-        )
-
-        _style_ax(
-            ax,
-            xlabel=f"True {coord}  (cm)",
-            ylabel=f"Reco {coord}  (cm)",
-            title=title,
-        )
-
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
-        ax.set_aspect("equal")
-
-    plt.tight_layout()
-    fig.savefig(
-        save_path,
-        dpi=150,
-        facecolor=SURFACE,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    print(f"  Saved truth-vs-reco   →  {save_path}")
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 MEAN_N_TRACKS = 10.0
-N_HITS_PER_TRACK = 30
+N_HITS_PER_TRACK = 47
 N_MULTI_EVENTS = 200
 
 VTX_Z_SIGMA = 3.0
@@ -856,7 +747,7 @@ VTX_Z_MAX = 30.0
 
 
 def main():
-    vertex_head = VertexHead(learn_weights=False)
+    vertex_head = VertexHead(learn_weights=False, use_helix=USE_HELIX, Bz=B_FIELD_Z,)
     vertex_head.eval()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -865,7 +756,7 @@ def main():
     print("─" * 60)
     print("Figure 1: loading exact event from test_vertex_simple.py")
 
-    input_path = os.path.join(_HERE, "vertex_test_inputs.pt")
+    input_path = os.path.join(_HERE, args.input)
 
     try:
         event, vtx_true_saved, saved = load_saved_test_event(input_path)
@@ -926,103 +817,6 @@ def main():
         VTX_TRUE_SINGLE,
         save_display,
     )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Figure 2: 200 NEW synthetic events
-    # ══════════════════════════════════════════════════════════════════════════
-    print("─" * 60)
-    print(f"Figure 2: truth-vs-reco over {N_MULTI_EVENTS} NEW events …")
-
-    vtx_true_list = []
-    vtx_reco_list = []
-
-    for ev in range(N_MULTI_EVENTS):
-
-        # ─────────────────────────────────────────────
-        # Random track multiplicity
-        # N_tracks ~ Poisson(10)
-        # ─────────────────────────────────────────────
-        n_tracks = int(
-            torch.poisson(torch.tensor(MEAN_N_TRACKS)).item()
-        )
-
-        # Skip zero-track events
-        if n_tracks == 0:
-            continue
-
-        # ─────────────────────────────────────────────
-        # Random primary vertex
-        # x = 0
-        # y = 0
-        # z = Gaussian(0, VTX_Z_SIGMA)
-        # restricted to [-30, +30] cm
-        # ─────────────────────────────────────────────
-        while True:
-            vz = torch.randn(1).item() * VTX_Z_SIGMA
-
-            if VTX_Z_MIN <= vz <= VTX_Z_MAX:
-                break
-
-        vtx = torch.tensor([
-            0.0,
-            0.0,
-            vz
-        ])
-
-        # ─────────────────────────────────────────────
-        # Generate event
-        # ─────────────────────────────────────────────
-        ev_data = make_event(
-            vtx,
-            n_tracks=n_tracks,
-            n_hits_per_track=N_HITS_PER_TRACK,
-        )
-
-        # ─────────────────────────────────────────────
-        # Run VertexHead
-        # ─────────────────────────────────────────────
-        with torch.no_grad():
-            res = vertex_head(
-                class_probs=ev_data["class_probs"],
-                track_reg_result=ev_data["track_reg_result"],
-                mask_probs=ev_data["mask_probs"],
-                points=ev_data["points"],
-                padding_mask=ev_data["padding_mask"],
-            )
-
-        # ─────────────────────────────────────────────
-        # Save valid reconstruction
-        # ─────────────────────────────────────────────
-        if res["fit_is_valid"][0].item():
-            vtx_true_list.append(vtx.numpy())
-            vtx_reco_list.append(
-                res["vertex_estimate"][0].numpy()
-            )
-
-    n_valid = len(vtx_true_list)
-
-    print(
-        f"  Valid fits: {n_valid} / {N_MULTI_EVENTS}"
-    )
-
-    if n_valid > 0:
-        save_tvr = os.path.join(
-            _HERE,
-            "truth_vs_reco.png",
-        )
-
-        plot_truth_vs_reco(
-            vtx_true_list,
-            vtx_reco_list,
-            save_tvr,
-        )
-    else:
-        print(
-            "  No valid fits — skipping Figure 2."
-        )
-
-    print("─" * 60)
-    print("Done.")
 
 
 if __name__ == "__main__":

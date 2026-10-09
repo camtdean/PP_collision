@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 def get_trackinfo_noiselabel(reg, noise_pt_threshold=0.06):
@@ -123,4 +124,51 @@ def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None)
         "vertex_target": torch.stack([vx, vy, vz], dim=-1),  # (B, 3)
         "vertex_valid": n_valid > 0,  # (B,)
         "n_valid": n_valid.long(),  # (B,)
+    }
+    
+def get_silicon_tpc_match_mask(
+    features,
+    seg_target,
+    silicon_r_min_cm=0.0,
+    silicon_r_max_cm=15.0,
+    tpc_r_min_cm=25.0,
+    tpc_r_max_cm=100.0,
+):
+    """
+    Mask Silicon hits whose truth track has no TPC hit.
+
+    Silicon: 0 < R < 15 cm
+    TPC:     25 < R < 100 cm
+
+    Returns:
+        keep_mask:              True for hits to keep.
+        silicon_mask:           True for Silicon hits.
+        unmatched_silicon_mask: True for Silicon hits with no TPC hit.
+    """
+    features = np.asarray(features)
+    seg_target = np.asarray(seg_target)
+
+    x = features[:, 1]
+    y = features[:, 2]
+
+    r = np.sqrt(x**2 + y**2)
+
+    silicon_mask = ((r > silicon_r_min_cm) & (r < silicon_r_max_cm))
+
+    tpc_mask = ((r > tpc_r_min_cm) & (r < tpc_r_max_cm))
+
+    tpc_track_ids = np.unique(seg_target[tpc_mask])
+
+    track_has_tpc = np.isin(seg_target, tpc_track_ids)
+
+    unmatched_silicon_mask = silicon_mask & ~track_has_tpc
+
+    keep_mask = np.ones(len(features), dtype=bool)
+
+    keep_mask[unmatched_silicon_mask] = False
+
+    return {
+        "keep_mask": keep_mask,
+        "silicon_mask": silicon_mask,
+        "unmatched_silicon_mask": unmatched_silicon_mask,
     }
