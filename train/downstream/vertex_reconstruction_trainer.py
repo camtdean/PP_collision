@@ -10,10 +10,12 @@ Config, backbone, pretrained weights and data loaders all come from
 track_finding_trainer.DownstreamTrainer.launch(). VertexHead(learn_weights=False) has no
 parameters, so this evaluates; nothing is trained.
 
-PLACEHOLDER: the track finder outputs hit clusters but no track parameters or quality
-labels. truth_track_params() fills both from the truth track holding the plurality of
-each predicted cluster's hits, using vertexhead.build_tracks -- so the numbers measure
-the pipeline and VertexHead, not a fully reconstructed vertex.
+The track finder outputs hit clusters but no track parameters or quality labels.
+params.vertex_track_params chooses where they come from:
+    "hits"  (default) fitted from each predicted cluster's hits (vertexhead.track_params_from_hits);
+            no truth used anywhere except to score the result
+    "truth" PLACEHOLDER for comparison: from the truth track holding the plurality of each
+            predicted cluster's hits (truth_track_params)
 """
 import math
 
@@ -24,7 +26,8 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from train.downstream import track_finding_trainer
-from train.downstream.vertexhead import VertexHead, build_tracks, apply_silicon_tpc_mask, NOISE_PT_THRESHOLD
+from train.downstream.vertexhead import (VertexHead, build_tracks, apply_silicon_tpc_mask,
+                                         track_params_from_hits, NOISE_PT_THRESHOLD)
 from trackinghead import MambaAttentionHead
 from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics
@@ -65,6 +68,9 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
         self.noise_pt_threshold = float(getattr(self.params, "noise_pt_threshold", NOISE_PT_THRESHOLD))
         self.use_quality_mask = bool(getattr(self.params, "vertex_use_quality_mask", True))
         self.use_silicon_tpc_mask = bool(getattr(self.params, "vertex_silicon_tpc_mask", False))
+        self.track_params_source = getattr(self.params, "vertex_track_params", "hits")
+        if self.track_params_source not in ("hits", "truth"):
+            raise ValueError(f"vertex_track_params must be 'hits' or 'truth', got {self.track_params_source!r}")
         self.vertex_head = VertexHead(
             learn_weights=False,
             use_helix=bool(getattr(self.params, "vertex_use_helix", True)),
@@ -159,7 +165,13 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
 
             assign = torch.where(mask_probs.amax(-1) > 0, mask_probs.argmax(-1),
                                  torch.full_like(mask, -1, dtype=torch.long))
-            track_reg_result, noise_labels, valid_tracks = self.truth_track_params(assign, mask, labels, reg)
+            if self.track_params_source == "hits":
+                hp = track_params_from_hits(grouped, mask_probs, mask, Bz=self.vertex_head.Bz,
+                                            scaling_factor=self.vertex_head.scaling_factor,
+                                            noise_pt_threshold=self.noise_pt_threshold)
+                track_reg_result, noise_labels, valid_tracks = hp["track_reg_result"], hp["noise_labels"], hp["valid_tracks"]
+            else:
+                track_reg_result, noise_labels, valid_tracks = self.truth_track_params(assign, mask, labels, reg)
 
             result = self.vertex_head(
                 class_probs=class_probs, track_reg_result=track_reg_result, mask_probs=mask_probs,

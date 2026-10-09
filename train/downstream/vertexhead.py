@@ -20,6 +20,7 @@ Inputs (from MambaAttentionHead.forward, or build_tracks for truth-level tests):
 noise_labels / valid_tracks come from reg_target only in truth-level tests; at inference they
 must come from the tracking output.
 """
+import math
 import os
 
 import numpy as np
@@ -436,6 +437,130 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     intercept = torch.where(valid, intercept, nan)
     return slope, intercept
 
+def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
+    """
+    Taubin algebraic circle fit per track, computed in float64.
+
+    Args:
+        x, y: (n_events, n_hits, n_tracks) hit coordinates.
+        mask: (n_events, n_hits, n_tracks) bool/float, which hits belong to each track.
+        min_hits: tracks with fewer hits get NaN.
+        newton_iters: fixed Newton iterations for the Taubin root.
+        eps: numerical floor for divisions.
+
+    Returns:
+        radius, x_centre, y_centre: (n_events, n_tracks) float64 each; NaN where fewer than min_hits hits.
+    """
+    x, y, mask = x.double(), y.double(), mask.double()
+    n_valid = mask.sum(dim=1)
+    valid = n_valid >= min_hits
+    mean_x = _masked_mean(x, mask, n_valid, eps)
+    mean_y = _masked_mean(y, mask, n_valid, eps)
+    Xi, Yi = x - mean_x.unsqueeze(1), y - mean_y.unsqueeze(1)
+    Zi = Xi * Xi + Yi * Yi
+    Mxy, Mxx, Myy = (_masked_mean(v, mask, n_valid, eps) for v in (Xi * Yi, Xi * Xi, Yi * Yi))
+    Mxz, Myz, Mzz = (_masked_mean(v, mask, n_valid, eps) for v in (Xi * Zi, Yi * Zi, Zi * Zi))
+
+    Mz = Mxx + Myy
+    Cov_xy = Mxx * Myy - Mxy * Mxy
+    Var_z = Mzz - Mz * Mz
+    A3, A2 = 4 * Mz, -3 * Mz * Mz - Mzz
+    A1 = Var_z * Mz + 4 * Cov_xy * Mz - Mxz * Mxz - Myz * Myz
+    A0 = Mxz * (Mxz * Myy - Myz * Mxy) + Myz * (Myz * Mxx - Mxz * Mxy) - Var_z * Cov_xy
+
+    xk, yk = torch.zeros_like(Mz), A0.clone()
+    improving_any = torch.ones_like(Mz, dtype=torch.bool)
+    for _ in range(newton_iters):
+        Dy = A1 + xk * (2 * A2 + 3 * A3 * xk)
+        xnew = xk - yk / torch.where(Dy.abs() < eps, torch.full_like(Dy, eps), Dy)
+        ynew = A0 + xnew * (A1 + xnew * (A2 + xnew * A3))
+        better = (ynew.abs() < yk.abs()) & torch.isfinite(xnew) & improving_any
+        xk, yk = torch.where(better, xnew, xk), torch.where(better, ynew, yk)
+        improving_any = improving_any & better
+
+    DET = xk * xk - xk * Mz + Cov_xy
+    DET = torch.where(DET.abs() < eps, torch.full_like(DET, eps), DET)
+    Xc = (Mxz * (Myy - xk) - Myz * Mxy) / DET / 2
+    Yc = (Myz * (Mxx - xk) - Mxz * Mxy) / DET / 2
+    radius = torch.sqrt((Xc * Xc + Yc * Yc + Mz).clamp(min=0.0))
+
+    nan = torch.full_like(radius, float("nan"))
+    return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
+            torch.where(valid, Yc + mean_y, nan))
+
+
+def track_params_from_hits(points, mask_probs, padding_mask, Bz=DEFAULT_BZ, scaling_factor=100.0,
+                           noise_pt_threshold=NOISE_PT_THRESHOLD, valid_radius=1.0, min_hits=3):
+    """
+    Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
+
+    Circle fit in x-y gives pT and the circle; the direction of travel (innermost -> outermost hit)
+    gives the charge and phi at the innermost hit, in VertexHead's convention
+    (centre = innermost hit + R_s (sin phi, -cos phi), sign(R_s) = sign(q Bz)).
+    A z-against-r line fit gives theta.
+
+    Args:
+        points: (n_events, n_hits, 4) hits (E, x, y, z).
+        mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
+        padding_mask: (n_events, n_hits) True = real hit.
+        Bz: solenoid field along z, Tesla.
+        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
+        noise_pt_threshold: fitted pT below this (GeV) -> noise_labels = 1.
+        valid_radius: fitted circle's closest approach to the beam line below this -> valid_tracks = 1.
+        min_hits: tracks with fewer assigned hits are not fitted.
+
+    Returns:
+        dict:
+            track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi), phi at the
+                innermost hit; finite filler where fit_ok is False.
+            noise_labels: (n_events, n_tracks) long, 1 = noise; 1 where fit_ok is False.
+            valid_tracks: (n_events, n_tracks) long, 1 = circle passes within valid_radius of the beam
+                line; 0 where fit_ok is False.
+            pT, radius, beam_dca: (n_events, n_tracks); NaN where fit_ok is False.
+            fit_ok: (n_events, n_tracks) bool, enough hits and finite fit.
+    """
+    _, _, is_assigned = VertexHead.track_position_from_hits(points, mask_probs, padding_mask)
+    n_tracks = is_assigned.shape[-1]
+    x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks).double()
+    y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks).double()
+    z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks).double()
+    r = torch.sqrt(x * x + y * y)
+
+    radius, xc, yc = _circle_fit(x, y, is_assigned, min_hits=min_hits)
+    zslope, _ = _line_fit(r, z, is_assigned, min_hits=min_hits)
+
+    # innermost and outermost assigned hit of each track
+    inf = torch.full_like(r, float("inf"))
+    i_in = torch.where(is_assigned, r, inf).argmin(dim=1, keepdim=True)
+    i_out = torch.where(is_assigned, r, -inf).argmax(dim=1, keepdim=True)
+    xin, yin = x.gather(1, i_in).squeeze(1), y.gather(1, i_in).squeeze(1)
+    xout, yout = x.gather(1, i_out).squeeze(1), y.gather(1, i_out).squeeze(1)
+
+    # travel inner -> outer: anticlockwise about the centre <=> R_s < 0
+    anticlockwise = ((xin - xc) * (yout - yc) - (yin - yc) * (xout - xc)) > 0
+    sign_Rs = torch.where(anticlockwise, -torch.ones_like(radius), torch.ones_like(radius))
+    ux, uy = (xc - xin) / radius, (yc - yin) / radius
+    sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
+    q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
+    pT = 0.3 * abs(Bz) * radius / scaling_factor
+    theta = torch.atan2(torch.ones_like(zslope), zslope)       # cot(theta) = dz/dr
+    beam_dca = (torch.sqrt(xc * xc + yc * yc) - radius).abs()
+
+    params = torch.stack([q / (pT + 1.0), theta, sin_phi, cos_phi], dim=-1)
+    fit_ok = torch.isfinite(params).all(dim=-1)
+    filler = params.new_tensor([0.5, math.pi / 2, 0.0, 1.0]).expand_as(params)
+    params = torch.where(fit_ok.unsqueeze(-1), params, filler)
+    nan = torch.full_like(pT, float("nan"))
+    pT, radius, beam_dca = (torch.where(fit_ok, v, nan) for v in (pT, radius, beam_dca))
+
+    return {
+        "track_reg_result": params.to(points.dtype),
+        "noise_labels": torch.where(fit_ok, (pT < noise_pt_threshold).long(), torch.ones_like(fit_ok, dtype=torch.long)),
+        "valid_tracks": torch.where(fit_ok, (beam_dca < valid_radius).long(), torch.zeros_like(fit_ok, dtype=torch.long)),
+        "pT": pT, "radius": radius, "beam_dca": beam_dca, "fit_ok": fit_ok,
+    }
+
+
 class VertexHead(nn.Module):
 
     """
@@ -531,7 +656,6 @@ class VertexHead(nn.Module):
     def forward(
         self,
         class_probs,
-        track_reg_result,
         mask_probs,
         points,
         padding_mask,
@@ -541,8 +665,6 @@ class VertexHead(nn.Module):
         """
         Args:
             class_probs: (n_events, n_tracks, 2) P(slot empty), P(slot real).
-            track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi); gives the
-                straight-line directions and the helix parameters, and is a learn_weights input.
             mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
             points: (n_events, n_hits, 4) hits (E, x, y, z).
             padding_mask: (n_events, n_hits) True = real hit.
@@ -564,6 +686,8 @@ class VertexHead(nn.Module):
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
+        track_reg_result = track_params_from_hits(points, mask_probs, padding_mask,
+                                                      Bz=self.Bz, scaling_factor=self.scaling_factor)["track_reg_result"]
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
 
