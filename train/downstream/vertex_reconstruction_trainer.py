@@ -33,7 +33,7 @@ from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics
 
 PAD_VALUE = -100
-EMPTY_SLOT_PARAMS = (0.5, math.pi / 2, 0.0, 1.0)   # finite filler; empty slots are labelled noise anyway
+EMPTY_SLOT_PARAMS = (0.5, torch.pi / 2, 0.0, 1.0)   # finite filler; empty slots are labelled noise anyway
 
 
 class VertexTrainer(track_finding_trainer.DownstreamTrainer):

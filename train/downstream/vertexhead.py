@@ -20,7 +20,6 @@ Inputs (from MambaAttentionHead.forward, or build_tracks for truth-level tests):
 noise_labels / valid_tracks come from reg_target only in truth-level tests; at inference they
 must come from the tracking output.
 """
-import math
 import os
 
 import numpy as np
@@ -488,7 +487,6 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
             torch.where(valid, Yc + mean_y, nan))
 
-
 def track_params_from_hits(points, mask_probs, padding_mask, Bz=DEFAULT_BZ, scaling_factor=100.0,
                            noise_pt_threshold=NOISE_PT_THRESHOLD, valid_radius=1.0, min_hits=3):
     """
@@ -548,7 +546,7 @@ def track_params_from_hits(points, mask_probs, padding_mask, Bz=DEFAULT_BZ, scal
 
     params = torch.stack([q / (pT + 1.0), theta, sin_phi, cos_phi], dim=-1)
     fit_ok = torch.isfinite(params).all(dim=-1)
-    filler = params.new_tensor([0.5, math.pi / 2, 0.0, 1.0]).expand_as(params)
+    filler = params.new_tensor([0.5, torch.pi / 2, 0.0, 1.0]).expand_as(params)
     params = torch.where(fit_ok.unsqueeze(-1), params, filler)
     nan = torch.full_like(pT, float("nan"))
     pT, radius, beam_dca = (torch.where(fit_ok, v, nan) for v in (pT, radius, beam_dca))
@@ -559,7 +557,6 @@ def track_params_from_hits(points, mask_probs, padding_mask, Bz=DEFAULT_BZ, scal
         "valid_tracks": torch.where(fit_ok, (beam_dca < valid_radius).long(), torch.zeros_like(fit_ok, dtype=torch.long)),
         "pT": pT, "radius": radius, "beam_dca": beam_dca, "fit_ok": fit_ok,
     }
-
 
 class VertexHead(nn.Module):
 
