@@ -37,7 +37,7 @@ from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
 from model import MambaAttentionHead
 from train.downstream import track_finding_trainer
-from vertex_head import VertexHead
+from train.downstream.vertexhead import VertexHead
 from downstream_util import get_vertex_label
 from loss import *
 from cached_dataset import get_cached_data_loader

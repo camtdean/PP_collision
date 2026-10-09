@@ -48,8 +48,8 @@ for _candidate in [_HERE, os.path.join(_HERE, "train", "downstream")]:
         sys.path.insert(0, _candidate)
         break
 
-from vertex_head import VertexHead  # noqa: E402
-from vertex_head_inputs import (  # noqa: E402
+from train.downstream.vertexhead import VertexHead  # noqa: E402
+from train.downstream.vertexhead_inputs import (  # noqa: E402
     DEFAULT_DATA_DIR, DEFAULT_EVENT_IDX, DEFAULT_BZ,
     load_event, build_truth_tracks, apply_silicon_tpc_mask, vertex_head_inputs,
 )
