@@ -220,7 +220,6 @@ def fit_vertex_by_closest_approach(
               overall chi_square looks acceptable.
         }
     """
-    n_events, n_tracks, _ = track_position.shape
     device = track_position.device
     dtype = track_position.dtype
 
@@ -628,13 +627,12 @@ class VertexHead(nn.Module):
     def forward(
         self,
         class_probs,
-        track_reg_result,
+        track_info,
         mask_probs,
         points,
         padding_mask,
         noise_labels=None,
         valid_tracks=None,
-        track_info=None,
     ):
         """
         Args:
@@ -709,17 +707,8 @@ class VertexHead(nn.Module):
             tracks" automatically -- events left with fewer than 2 well-
             separated non-zero-weight tracks will have fit_is_valid=False.
         """
-        # ------------------------------------------------------------------
-        # Determine which track parameterisation to use for the fits.
-        # track_info, when provided, has the same (q/(pT+1), theta,
-        # sin_phi, cos_phi) layout as track_reg_result and can be used
-        # as a drop-in replacement when the caller has derived it from
-        # truth reg_target via get_trackinfo_noiselabel().
-        # ------------------------------------------------------------------
-        fitpars = track_info if track_info is not None else track_reg_result
-
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
-        track_direction = track_flight_direction(fitpars)
+        track_direction = track_flight_direction(track_info)
 
         probability_track_is_real = class_probs[..., 1]
 
@@ -729,7 +718,7 @@ class VertexHead(nn.Module):
             # learned scoring remains end-to-end differentiable through
             # the reconstruction model even when truth parameters are
             # used for the geometric fit.
-            track_quality_features = torch.cat([class_probs, track_reg_result], dim=-1)
+            track_quality_features = torch.cat([class_probs, track_info], dim=-1)
             learned_weight_scale = self.track_weight_network(track_quality_features).squeeze(-1)
             track_weight = probability_track_is_real * total_hit_weight * learned_weight_scale
         else:
@@ -737,18 +726,6 @@ class VertexHead(nn.Module):
             # and how confident the track finder is that it's real
             track_weight = probability_track_is_real * total_hit_weight
 
-        # ------------------------------------------------------------------
-        # NEW: apply FM4NPP track-quality mask.
-        #
-        # build_track_quality_mask() returns None when both inputs are None,
-        # which is how we detect "no filtering requested" without adding
-        # an extra boolean flag.
-        #
-        # Masking is multiplicative: bad tracks get weight=0 and are
-        # effectively invisible to both fit functions below.  All shape
-        # checks here are assertions on the per-track dimension so that
-        # a mis-shaped input from the caller is caught immediately.
-        # ------------------------------------------------------------------
         quality_mask = build_track_quality_mask(noise_labels, valid_tracks)
 
         if quality_mask is not None:
@@ -771,7 +748,7 @@ class VertexHead(nn.Module):
             fit = fit_vertex_by_helix_closest_approach(
                 points,
                 is_assigned,
-                fitpars,                    # same parameterisation as flight direction
+                track_info,                    # same parameterisation as flight direction
                 track_position,
                 self.Bz,
                 track_weight,               # already zeroed for bad tracks
@@ -790,7 +767,7 @@ class VertexHead(nn.Module):
             "track_position": track_position,
             "track_direction": track_direction,
             "track_weight": track_weight,
-            "track_quality_mask": quality_mask,         # new: for diagnostics/plotting
+            "track_quality_mask": quality_mask,
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
         }
