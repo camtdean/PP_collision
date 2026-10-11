@@ -21,6 +21,9 @@ defaults in vertex_reconstruction_trainer.py.
 import os
 import sys
 import argparse
+import json
+
+import numpy as np
 
 sys.path.append('../..')
 
@@ -111,8 +114,50 @@ def main():
     trainer = VertexTrainer(params, args)
     trainer.launch()
     trainer.setup_vertexing(track_ckpt)
-    trainer.run_vertexing(pretrain=True, max_events=args.max_events)
+    result = trainer.run_vertexing(pretrain=True, max_events=args.max_events)
+    if trainer.world_rank == 0:
+        save_results(result, trainer, params, args, track_ckpt)
     trainer.cleanup()
+
+
+def _jsonable(v):
+    if hasattr(v, "item") and getattr(v, "numel", lambda: 1)() == 1:
+        return v.item()
+    if hasattr(v, "tolist"):
+        return v.tolist()
+    return v
+
+
+def save_results(result, trainer, params, args, track_ckpt):
+    """Write per-event vertices (.npz) and metrics (.json) to the run dir; append metrics to the performance log."""
+    out_dir = params.experiment_dir            # {root_dir}/{config}/{run_num}, set by launch()
+    tag = f"vertex_{args.track_params or getattr(trainer, 'track_params_source', 'hits')}"
+
+    npz_path = os.path.join(out_dir, f"{tag}_results.npz")
+    np.savez(npz_path,
+             vertex_estimate=result["vertex_estimate"].float().numpy(),
+             vertex_target=result["vertex_target"].float().numpy(),
+             fit_is_valid=result["fit_is_valid"].numpy())
+
+    metrics = {k: _jsonable(v) for k, v in result["metrics"].items()}
+    summary = {
+        "config": args.config,
+        "yaml_config": os.path.abspath(args.yaml_config),
+        "pretrained_ckpt": params.pretrained_ckpt,
+        "track_ckpt": os.path.abspath(track_ckpt),
+        "track_params": trainer.track_params_source,
+        "use_quality_mask": trainer.use_quality_mask,
+        "silicon_tpc_mask": trainer.use_silicon_tpc_mask,
+        "bz": trainer.vertex_head.Bz,
+        "max_events": args.max_events,
+        "metrics": metrics,
+    }
+    json_path = os.path.join(out_dir, f"{tag}_metrics.json")
+    with open(json_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    trainer.log_infile("[vertex] " + json.dumps(metrics))
+    print(f"[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
 
 
 if __name__ == "__main__":
