@@ -42,55 +42,16 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for projection='3d')
 
-# ---------------------------------------------------------------------------
-# Path setup
-# ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _candidate in [_HERE, os.path.join(_HERE, "train", "downstream")]:
     if os.path.isfile(os.path.join(_candidate, "vertex_head.py")):
         sys.path.insert(0, _candidate)
         break
 
-from vertex_head import VertexHead  # noqa: E402
-from downstream_util import (get_trackinfo_noiselabel, get_silicon_tpc_match_mask,)
-
-# ---------------------------------------------------------------------------
-# Re-use helpers from test_vertex_head (same directory)
-# ---------------------------------------------------------------------------
-try:
-    from test_vertex_head import (
-        RaggedMmap,
-        load_event,
-        build_truth_tracks,
-        DEFAULT_DATA_DIR,
-        DEFAULT_EVENT_IDX,
-        DEFAULT_BZ,
-        NOISE_PT_THRESHOLD,
-    )
-except ImportError:
-    # If the file is not on sys.path, inject it now
-    _tvh = os.path.join(_HERE, "test_vertex_head.py")
-    if not os.path.isfile(_tvh):
-        sys.exit(
-            f"ERROR: cannot find test_vertex_head.py beside this file ({_HERE}).\n"
-            "Make sure both scripts are in the same directory."
-        )
-    import importlib.util
-    _spec = importlib.util.spec_from_file_location("test_vertex_head", _tvh)
-    _mod  = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    RaggedMmap        = _mod.RaggedMmap
-    load_event        = _mod.load_event
-    build_truth_tracks = _mod.build_truth_tracks
-    DEFAULT_DATA_DIR  = _mod.DEFAULT_DATA_DIR
-    DEFAULT_EVENT_IDX = _mod.DEFAULT_EVENT_IDX
-    DEFAULT_BZ        = _mod.DEFAULT_BZ
-    NOISE_PT_THRESHOLD = _mod.NOISE_PT_THRESHOLD
-
-
-# ===========================================================================
-# Helix utilities
-# ===========================================================================
+from train.downstream.vertexhead import (  # noqa: E402
+    VertexHead, DEFAULT_DATA_DIR, DEFAULT_EVENT_IDX, DEFAULT_BZ,
+    load_event, build_tracks, apply_silicon_tpc_mask, vertex_head_inputs,
+)
 
 
 def helix_points(
@@ -98,12 +59,10 @@ def helix_points(
     vtx, Bz, scaling_factor=100.0,
     n_pts=1200, R_max_cm=100.0,
 ):
-    """Generate a continuous helix from the vertex to R_max_cm."""
 
     if abs(rho) < 1e-9 or abs(Bz) < 1e-12:
         return None
 
-    # VertexHead parameter convention
     q = np.sign(rho)
     pT = 1.0 / abs(rho) - 1.0
 
@@ -121,29 +80,23 @@ def helix_points(
     xc = xv + R_s * np.sin(phi0)
     yc = yv - R_s * np.cos(phi0)
 
-    # Begin exactly at the vertex.
     phi_start = np.arctan2(yv - yc, xv - xc)
 
-    # Search forward for the first crossing of the outer radius.
-    # One full turn is sufficient to find any reachable radius.
+    # one full turn reaches any reachable radius
     alpha = np.linspace(0.0, 2.0 * np.pi, n_pts)
     phi_arc = phi_start - np.sign(R_s) * alpha
 
     xs = xc + radius * np.cos(phi_arc)
     ys = yc + radius * np.sin(phi_arc)
 
-    # Positive alpha follows the forward transverse tangent.
-    # z advances according to the polar angle theta.
     zs = zv + radius * alpha * cot_th
 
     rr = np.hypot(xs, ys)
     crossings = np.flatnonzero(rr >= R_max_cm)
 
     if crossings.size:
-        # Stop at the first outer-radius crossing.
         end = int(crossings[0])
         if end > 0:
-            # Interpolate the crossing for a more accurate endpoint.
             frac = (
                 (R_max_cm - rr[end - 1])
                 / max(rr[end] - rr[end - 1], 1e-12)
@@ -155,10 +108,8 @@ def helix_points(
 
     return np.column_stack((xs, ys, zs))
 
-
 def straight_line_points(theta, sin_phi, cos_phi, vtx,
                          half_len_cm=35.0, n_pts=2):
-    """Fallback: straight-line segment from vtx in the track direction."""
     phi0 = float(np.arctan2(sin_phi, cos_phi))
     dx   = float(np.cos(phi0) * np.sin(theta))
     dy   = float(np.sin(phi0) * np.sin(theta))
@@ -170,11 +121,9 @@ def straight_line_points(theta, sin_phi, cos_phi, vtx,
                     z0 + t * dz], axis=-1)
     return pts
 
-
 def track_helix_or_line(rho, theta, sin_phi, cos_phi, vtx,
                         Bz, scaling_factor=100.0,
                         arc_half_cm=35.0, n_pts=120):
-    """Try helix first; fall back to straight line."""
     pts = helix_points(rho, theta, sin_phi, cos_phi, vtx,
                        Bz, scaling_factor, n_pts, arc_half_cm)
     if pts is None:
@@ -182,47 +131,22 @@ def track_helix_or_line(rho, theta, sin_phi, cos_phi, vtx,
                                    half_len_cm=arc_half_cm, n_pts=n_pts)
     return pts
 
-
-# ===========================================================================
-# Colour helpers
-# ===========================================================================
-
 def track_colour_map(n_tracks, cmap_name="tab20"):
-    """Return a list of n_tracks distinct colours."""
     cmap = plt.get_cmap(cmap_name)
     return [cmap(i % cmap.N / cmap.N) for i in range(n_tracks)]
-
-
-# ===========================================================================
-# Main display function
-# ===========================================================================
 
 def make_event_display(
     features, seg_target, reg_target,
     args
 ):
-    """
-    Build truth tracks, run VertexHead, and draw the event display.
-
-    Returns the matplotlib Figure.
-    """
-    print("Building truth tracks...", flush=True)
-    td = build_truth_tracks(features, seg_target, reg_target)
+    print("Building tracks...", flush=True)
+    td = build_tracks(features, seg_target, reg_target)
     
-    # ------------------------------------------------------------------
-    # Silicon/TPC matching mask
-    #
-    # Silicon: 0 < R < 15 cm
-    # TPC:     25 < R < 100 cm
-    #
-    # Silicon hits belonging to truth tracks with no TPC hit are
-    # excluded from the VertexHead fit, but are kept for visualization.
-    # ------------------------------------------------------------------
-    silicon_info = get_silicon_tpc_match_mask(features, seg_target,)
-    hit_keep_mask = silicon_info["keep_mask"]
-    silicon_mask = silicon_info["silicon_mask"]
-    unmatched_silicon_mask = silicon_info["unmatched_silicon_mask"]
-    
+    # silicon hits (R < 15 cm) on tracks with no TPC hit (25 < R < 100 cm): excluded from the fit, still drawn
+    silicon_info = apply_silicon_tpc_mask(td, features, seg_target, apply=not args.no_silicon_tpc_mask)
+    hit_keep_mask = np.asarray(silicon_info["keep_mask"])
+    silicon_mask = np.asarray(silicon_info["silicon_mask"])
+    unmatched_silicon_mask = np.asarray(silicon_info["unmatched_silicon_mask"])
     
     print("\n=== Silicon/TPC masking diagnostic ===")
     print(f"Total hits: {len(features)}")
@@ -232,15 +156,11 @@ def make_event_display(
         f"{int((unmatched_silicon_mask & hit_keep_mask).sum())}")
 
     if not args.no_silicon_tpc_mask:
-        td["mask_probs"][0, ~hit_keep_mask, :] = 0.0
-
-        # Verify that masked hits have zero assignment probabilities.
         masked_probs = td["mask_probs"][0, unmatched_silicon_mask, :]
         print(f"Unmatched Silicon hits with nonzero assignment probability: "
             f"{int((masked_probs.abs().sum(dim=-1) > 0).sum().item())}")
     else:
         print("WARNING: Silicon/TPC masking is DISABLED (--no_silicon_tpc_mask)")
-    
     
     bad_indices = np.flatnonzero(unmatched_silicon_mask)
 
@@ -254,20 +174,15 @@ def make_event_display(
                 f"assignment_sum={probs.sum().item():.6g}"
             )
 
-
-    
-    if not args.no_silicon_tpc_mask:
-        td["mask_probs"][0, ~hit_keep_mask, :] = 0.0
-    else:
+    if args.no_silicon_tpc_mask:
         unmatched_silicon_mask = np.zeros(len(features), dtype=bool)
-
 
     print(f"  Silicon hits       = {int(silicon_mask.sum())}")
     print(f"  unmatched Silicon  = {int(unmatched_silicon_mask.sum())}")
     print(f"  masked hits        = {int((~hit_keep_mask).sum())}")
 
     n_tracks = td["track_reg_result"].shape[1]
-    track_ids = td["track_ids"]                  # (n_tracks,)  int32
+    track_ids = td["track_ids"]
     
     r = np.sqrt(features[:, 1]**2 + features[:, 2]**2)
 
@@ -277,9 +192,6 @@ def make_event_display(
 
     track_has_tpc = np.isin(track_ids, tpc_track_ids)
 
-    # ------------------------------------------------------------------
-    # Run VertexHead
-    # ------------------------------------------------------------------
     print("Running VertexHead...", flush=True)
     head = VertexHead(
         learn_weights=False,
@@ -289,60 +201,24 @@ def make_event_display(
     )
     head.eval()
     
-    # Get track parameters + quality labels directly from reg_target
-    reg_tensor = torch.from_numpy(reg_target).float()
-    info = get_trackinfo_noiselabel(reg_tensor, noise_pt_threshold=NOISE_PT_THRESHOLD,)
-    
-    # Convert per-hit truth information to per-track information
-    track_info = torch.zeros((1, n_tracks, 4), dtype=torch.float32,)
-    noise_labels = torch.zeros((1, n_tracks), dtype=torch.long,)
-    valid_tracks = torch.zeros((1, n_tracks), dtype=torch.long,)
-    
-    id_to_col = {int(tid): col for col, tid in enumerate(track_ids)}
-    track_seen = np.zeros(n_tracks, dtype=bool)
-    
-    for hit_idx, tid in enumerate(seg_target):
-        col = id_to_col[int(tid)]
-        
-        if not track_seen[col]:
-            track_info[0, col] = info["track_info"][hit_idx]
-            noise_labels[0, col] = info["noise_labels"][hit_idx]
-            valid_tracks[0, col] = info["valid_tracks"][hit_idx]
-            track_seen[col] = True
-
-
     with torch.no_grad():
-        result = head.forward(
-            class_probs      = td["class_probs"],
-            track_reg_result = td["track_reg_result"],
-            mask_probs       = td["mask_probs"],
-            points           = td["points"],
-            padding_mask     = td["padding_mask"],
-            noise_labels     = None if args.no_mask else noise_labels,
-            valid_tracks     = None if args.no_mask else valid_tracks,
-            track_info       = None if args.no_mask else track_info,
-        )
+        result = head(**vertex_head_inputs(td, use_quality_mask=not args.no_mask))
 
     fit_valid  = result["fit_is_valid"][0].item()
-    reco_vtx   = result["vertex_estimate"][0].numpy()   # (3,)
-    qm         = result["track_quality_mask"]           # (1, n_tracks) bool | None
+    reco_vtx   = result["vertex_estimate"][0].numpy()
+    qm         = result["track_quality_mask"]
 
-    # Quality mask on tracks
     if qm is not None:
-        good_mask_np = qm[0].numpy().astype(bool)       # (n_tracks,)
+        good_mask_np = qm[0].numpy().astype(bool)
     else:
-        good_mask_np = np.ones(n_tracks, dtype=bool)    # all good
+        good_mask_np = np.ones(n_tracks, dtype=bool)
 
-    # ------------------------------------------------------------------
-    # Truth plurality vertex
-    # ------------------------------------------------------------------
-    tvtx_all = td["truth_vtx_per_track"].numpy()        # (n_tracks, 3)
+    tvtx_all = td["truth_vtx_per_track"].numpy()
     tvtx_rounded = np.round(tvtx_all, 3)
     unique_vtx, counts = np.unique(tvtx_rounded, axis=0, return_counts=True)
     order = np.argsort(-counts)
     truth_vtx = unique_vtx[order[0]]                    # plurality (proxy PV)
 
-    # Print summary
     print(f"  n_tracks        = {n_tracks}")
     print(f"  good tracks     = {good_mask_np.sum()}")
     print(f"  truth vtx (PV)  = ({truth_vtx[0]:.3f}, {truth_vtx[1]:.3f}, {truth_vtx[2]:.3f}) cm")
@@ -353,25 +229,17 @@ def make_event_display(
     else:
         print("  reco  vtx       = DEGENERATE FIT")
 
-    # ------------------------------------------------------------------
-    # Hit arrays (N_hits, 3)  --  features columns 1,2,3 are x,y,z
-    # ------------------------------------------------------------------
     hits_x = features[:, 1].astype(np.float32)
     hits_y = features[:, 2].astype(np.float32)
     hits_z = features[:, 3].astype(np.float32)
     hits_e = features[:, 0].astype(np.float32)         # energy (col 0) for sizing
 
-    # ------------------------------------------------------------------
-    # Map each hit to its truth-track colour
-    # ------------------------------------------------------------------
-    # Build track_id → column-index map
     id_to_col = {int(tid): col for col, tid in enumerate(track_ids)}
 
-    # Track colours (n_tracks distinct hues)
     colours = track_colour_map(n_tracks)
 
     hit_colours   = []
-    hit_is_good   = []        # True if hit belongs to a quality-selected track
+    hit_is_good   = []
     for tid in seg_target:
         col = id_to_col.get(int(tid), 0)
         good = bool(good_mask_np[col])
@@ -381,24 +249,14 @@ def make_event_display(
     hit_colours  = np.array(hit_colours)
     hit_is_good  = np.array(hit_is_good, dtype=bool)
     
+    trk_params = td["track_reg_result"][0].numpy()
 
-    # ------------------------------------------------------------------
-    # Track parameters for helix drawing  (n_tracks, 4)
-    # ------------------------------------------------------------------
-    trk_params = track_info[0].numpy()   # (n_tracks, 4)
-    #  columns: rho, theta, sin_phi, cos_phi
-
-    # Vertex to use as helix starting point per track.
-    # Use the reconstructed vertex for reco tracks; for truth display we
-    # use the per-track truth vertex.
     if fit_valid:
         vtx_for_helix = reco_vtx
     else:
         vtx_for_helix = truth_vtx
 
-    # ------------------------------------------------------------------
-    # Layout: 1 large 3-D panel + 2 small 2-D projections
-    # ------------------------------------------------------------------
+    # 1 large 3-D panel + 2 small 2-D projections
     SURFACE = "#fcfcfb"
     INK_PRIMARY = "#0b0b0b"
     INK_SECONDARY = "#52514e"
@@ -442,18 +300,14 @@ def make_event_display(
             zorder=0,
         )
     def _style_ax3d(ax, xlabel="", ylabel="", zlabel="", title=""):
-        # Background
         ax.set_facecolor(SURFACE)
 
-        # Axis labels
         ax.set_xlabel(xlabel, fontsize=9, color=INK_SECONDARY, labelpad=4,)
         ax.set_ylabel(ylabel, fontsize=9, color=INK_SECONDARY, labelpad=4,)
         ax.set_zlabel(zlabel, fontsize=9, color=INK_SECONDARY, labelpad=4,)
 
-        # Tick labels
         ax.tick_params(colors=INK_MUTED, labelsize=8,)
 
-        # 3D panes
         ax.xaxis.pane.fill = False
         ax.yaxis.pane.fill = False
         ax.zaxis.pane.fill = False
@@ -484,13 +338,10 @@ def make_event_display(
     ax3d.yaxis.label.set_color("white")
     ax3d.zaxis.label.set_color("white")
     
-    ax3d.set_xlim(-100, 100)   # x [cm]
-    ax3d.set_ylim(-100, 100)   # y [cm]
-    ax3d.set_zlim(-100, 100)   # z [cm]
+    ax3d.set_xlim(-100, 100)
+    ax3d.set_ylim(-100, 100)
+    ax3d.set_zlim(-100, 100)
 
-    # ------------------------------------------------------------------
-    # Helper: shared scatter + track drawing
-    # ------------------------------------------------------------------
     _HIT_S = np.clip(hits_e * 12 + 1.5, 1.0, 20.0)   # marker size ~ energy
 
     def _scatter_hits(ax, xs, ys, is_3d=False, zs=None):
@@ -549,7 +400,6 @@ def make_event_display(
             """
 
     def _draw_tracks(ax, is_3d=False):
-        """Draw one helix arc per track from the vertex."""
         for t_idx in range(n_tracks):
             
             # Do not draw tracks that have Silicon hits but no TPC hits.
@@ -569,9 +419,7 @@ def make_event_display(
             )
             """
             
-            # Pick vertex starting point:
-            # Use per-track truth vertex so tracks visually originate from
-            # their true production point (more informative than a single vtx).
+            # start each helix at its own track's truth vertex
             vtx_t = td["truth_vtx_per_track"][t_idx].numpy()
             
             pts = helix_points(
@@ -580,7 +428,6 @@ def make_event_display(
                 R_max_cm=100.0,
             )
             
-            # Actual hits assigned to this truth track
             track_hit_mask = (seg_target == track_ids[t_idx])
             track_hit_xyz = features[track_hit_mask, 1:4]
 
@@ -618,28 +465,21 @@ def make_event_display(
                         color=col, lw=lw, zorder=zo)
             else:
                 if ax is ax_xy:
-                    # X-Y
                     ax.plot(pts[:, 0], pts[:, 1], color=col, lw=lw, zorder=zo,)
                 elif ax is ax_yz:
-                    # Y-Z
                     ax.plot(pts[:, 2], pts[:, 1], color=col, lw=lw, zorder=zo,)
                 else:
-                    # R-Z
                     R_t = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2)
                     ax.plot(pts[:, 2], R_t, color=col, lw=lw, zorder=zo,)
 
-    # ------------------------------------------------------------------
     # 3-D panel
-    # ------------------------------------------------------------------
     _scatter_hits(ax3d, hits_x, hits_y, is_3d=True, zs=hits_z)
     _draw_tracks(ax3d, is_3d=True)
 
-    # Truth vertex
     ax3d.scatter(*truth_vtx, marker="*", s=180, color="black",
                  edgecolor="white", linewidths=1.0, zorder=1000,
                  label=f"Truth vtx  ({truth_vtx[0]:.2f}, {truth_vtx[1]:.2f}, {truth_vtx[2]:.2f}) cm")
 
-    # Reco vertex
     if fit_valid:
         ax3d.scatter(*reco_vtx, marker="X", s=120, color="red",
                      edgecolors="white", linewidths=1.0, zorder=1000,
@@ -656,10 +496,7 @@ def make_event_display(
         framealpha=1.0,
     )
     
-
-    # ------------------------------------------------------------------
     # XY projection
-    # ------------------------------------------------------------------
     _scatter_hits(ax_xy, hits_x, hits_y)
     _draw_tracks(ax_xy)
 
@@ -676,7 +513,7 @@ def make_event_display(
     ax_xy.set_xlim(-100, 100)   
     ax_xy.set_ylim(-100, 100)
     
-    # ── YZ projection ─────────────────────────────────────────────
+    # YZ projection
     _scatter_hits(ax_yz, hits_z, hits_y)
     _draw_tracks(ax_yz)
 
@@ -709,9 +546,7 @@ def make_event_display(
     ax_yz.set_xlim(-100, 100)   
     ax_yz.set_ylim(-100, 100)     
 
-    # ------------------------------------------------------------------
     # R-Z projection
-    # ------------------------------------------------------------------
     hits_R = np.sqrt(hits_x**2 + hits_y**2)
 
     _scatter_hits(ax_rz, hits_z, hits_R)
@@ -725,12 +560,9 @@ def make_event_display(
         ax_rz.scatter(reco_vtx[2],reco_R, marker="X", s=120, color="red", edgecolor="white", linewidth=1.0, zorder=10, label="Reco PV",)
     _style_ax(ax_rz, "z (cm)", "R (cm)", "R-z plane",)
     
-    ax_rz.set_xlim(-100, 100)   # z [cm]
-    ax_rz.set_ylim(0, 100)      # R [cm]
+    ax_rz.set_xlim(-100, 100)
+    ax_rz.set_ylim(0, 100)
 
-    # ------------------------------------------------------------------
-    # Figure title
-    # ------------------------------------------------------------------
     n_good  = int(good_mask_np.sum())
     mask_tag = "no mask" if args.no_mask else f"mask ON → {n_good}/{n_tracks} good"
     dist_tag = ""
@@ -740,7 +572,6 @@ def make_event_display(
         dist_tag = f"  |reco−truth| = {res_cm:.2f} cm"
     title = (
         f"FM4NPP Event Display   event {args.event_idx}   "
-        #f"{len(features)} hits  •  {n_tracks} truth tracks"
     )
     fig.suptitle(title, color=INK_PRIMARY, fontsize=11, y=0.97,)
     
@@ -757,11 +588,6 @@ def make_event_display(
         )
 
     return fig
-
-
-# ===========================================================================
-# Entry point
-# ===========================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="FM4NPP 3-D event display")
@@ -791,15 +617,12 @@ def main():
     print(f"  masking   : {'DISABLED' if args.no_mask else 'ENABLED'}")
     print(f"{'='*65}\n")
 
-    # Load event
     print("Loading event from disk...", flush=True)
     features, seg_target, reg_target = load_event(args.data_dir, args.event_idx)
     print(f"  {len(features)} hits loaded")
     
-    # Build display
     fig = make_event_display(features, seg_target, reg_target, args)
     
-    # Output
     """
     if args.out:
         fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight",
@@ -823,17 +646,15 @@ def main():
     print("Done.\n")
     """
     
-    # Output: save event displays in the event_displays directory
+    # save to event_displays/ unless --out is given
     output_dir = os.path.join(_HERE, "event_displays")
     os.makedirs(output_dir, exist_ok=True)
 
     if args.out:
-        # Use the explicitly supplied output path if --out is provided.
         output_path = args.out
         output_parent = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(output_parent, exist_ok=True)
     else:
-        # Otherwise, save in event_displays using the event index.
         output_path = os.path.join(output_dir, f"event_display_ev{args.event_idx}.png",)
 
     fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight", facecolor=fig.get_facecolor(),)
@@ -841,7 +662,6 @@ def main():
 
     plt.close(fig)
     print("Done.\n")
-
 
 if __name__ == "__main__":
     main()
