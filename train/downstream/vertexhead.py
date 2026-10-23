@@ -27,9 +27,6 @@ import torch
 import torch.nn as nn
 from downstream_util import get_trackinfo_noiselabel
 
-DEFAULT_DATA_DIR = os.path.expanduser("~/Storage/PP_collision/train/downstream/test/combined_0")
-DEFAULT_EVENT_IDX = 1   # event 0 has only 10 hits; event 1 has ~1951 hits
-DEFAULT_BZ = 1.4        # Tesla
 NOISE_PT_THRESHOLD = 0.25
 
 # features (E, x, y, z), seg_target (track ID), reg_target (px, py, pz, vx, vy, vz, q, e)
@@ -115,7 +112,7 @@ def vertex_head_inputs(td, use_quality_mask=True):
         "valid_tracks":     td["valid_tracks"] if use_quality_mask else None,
     }
 
-def load_vertex_head_inputs(data_dir=DEFAULT_DATA_DIR, event_idx=DEFAULT_EVENT_IDX,
+def load_vertex_head_inputs(data_dir="", event_idx=0,
                             use_silicon_tpc_mask=False, use_quality_mask=True,
                             noise_pt_threshold=NOISE_PT_THRESHOLD):
     features, seg_target, reg_target = load_event(data_dir, event_idx)
@@ -487,7 +484,7 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
             torch.where(valid, Yc + mean_y, nan))
 
-def track_params_from_hits(points, mask_probs, padding_mask, Bz=DEFAULT_BZ, scaling_factor=100.0,
+def track_params_from_hits(points, mask_probs, padding_mask, Bz=1.4, scaling_factor=100.0,
                            noise_pt_threshold=NOISE_PT_THRESHOLD, valid_radius=1.0, min_hits=3):
     """
     Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
@@ -656,8 +653,6 @@ class VertexHead(nn.Module):
         mask_probs,
         points,
         padding_mask,
-        noise_labels=None,
-        valid_tracks=None,
     ):
         """
         Args:
@@ -683,8 +678,10 @@ class VertexHead(nn.Module):
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
-        track_reg_result = track_params_from_hits(points, mask_probs, padding_mask,
-                                                      Bz=self.Bz, scaling_factor=self.scaling_factor)["track_reg_result"]
+        params = track_params_from_hits(points, mask_probs, padding_mask,
+                                                      Bz=self.Bz, scaling_factor=self.scaling_factor)
+        track_reg_result = params["track_reg_result"]
+        noise_labels, valid_tracks = params["noise_labels"], params["valid_tracks"]
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
 

@@ -17,7 +17,6 @@ params.vertex_track_params chooses where they come from:
     "truth" PLACEHOLDER for comparison: from the truth track holding the plurality of each
             predicted cluster's hits (truth_track_params)
 """
-import math
 
 import numpy as np
 import torch
@@ -165,19 +164,10 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
 
             assign = torch.where(mask_probs.amax(-1) > 0, mask_probs.argmax(-1),
                                  torch.full_like(mask, -1, dtype=torch.long))
-            if self.track_params_source == "hits":
-                hp = track_params_from_hits(grouped, mask_probs, mask, Bz=self.vertex_head.Bz,
-                                            scaling_factor=self.vertex_head.scaling_factor,
-                                            noise_pt_threshold=self.noise_pt_threshold)
-                track_reg_result, noise_labels, valid_tracks = hp["track_reg_result"], hp["noise_labels"], hp["valid_tracks"]
-            else:
-                track_reg_result, noise_labels, valid_tracks = self.truth_track_params(assign, mask, labels, reg)
 
             result = self.vertex_head(
-                class_probs=class_probs, track_reg_result=track_reg_result, mask_probs=mask_probs,
-                points=grouped, padding_mask=mask,
-                noise_labels=noise_labels if self.use_quality_mask else None,
-                valid_tracks=valid_tracks if self.use_quality_mask else None)
+                class_probs=class_probs, mask_probs=mask_probs,
+                points=grouped, padding_mask=mask)
 
             # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
             vtx_r = torch.hypot(reg[..., 3], reg[..., 4])
