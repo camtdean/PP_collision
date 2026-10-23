@@ -25,7 +25,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from downstream_util import get_trackinfo_noiselabel
+from mmap_ninja import RaggedMmap
 
 NOISE_PT_THRESHOLD = 0.25
 
@@ -484,7 +484,7 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
             torch.where(valid, Yc + mean_y, nan))
 
-def track_params_from_hits(points, mask_probs, padding_mask, Bz=1.4, scaling_factor=100.0,
+def _track_params_from_hits(points, mask_probs, padding_mask, Bz=1.4, scaling_factor=100.0,
                            noise_pt_threshold=NOISE_PT_THRESHOLD, valid_radius=1.0, min_hits=3):
     """
     Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
@@ -678,7 +678,7 @@ class VertexHead(nn.Module):
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
-        params = track_params_from_hits(points, mask_probs, padding_mask,
+        params = _track_params_from_hits(points, mask_probs, padding_mask,
                                                       Bz=self.Bz, scaling_factor=self.scaling_factor)
         track_reg_result = params["track_reg_result"]
         noise_labels, valid_tracks = params["noise_labels"], params["valid_tracks"]
@@ -735,20 +735,3 @@ class VertexHead(nn.Module):
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
         }
-
-# reads FM4NPP .mmap dirs: data.ninja + dtype.ninja + starts/ and ends/ index arrays
-class RaggedMmap:
-    def __init__(self, mmap_dir: str, n_cols: int):
-        self.n_cols = n_cols
-        self.dtype = np.dtype(open(os.path.join(mmap_dir, "dtype.ninja")).read().strip())
-        self.flat = np.memmap(os.path.join(mmap_dir, "data.ninja"), dtype=self.dtype, mode="r")
-        self.starts = np.fromfile(os.path.join(mmap_dir, "starts", "data.ninja"), dtype=np.int64)
-        self.ends = np.fromfile(os.path.join(mmap_dir, "ends", "data.ninja"), dtype=np.int64)
-        assert len(self.starts) == len(self.ends), "starts/ends length mismatch"
-
-    def __len__(self):
-        return len(self.starts)
-
-    def __getitem__(self, idx: int) -> np.ndarray:
-        data = np.array(self.flat[self.starts[idx]:self.ends[idx]])   # copy out of memmap
-        return data if self.n_cols == 1 else data.reshape(-1, self.n_cols)
