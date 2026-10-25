@@ -4,36 +4,28 @@ vertex_reconstruction_trainer.py
 Runs VertexHead after an already-trained track-finding head.
 
     frozen backbone -> frozen track finder (train_track_finding.py checkpoint)
-        -> per-prototype track parameters + quality labels -> VertexHead (whole batch)
+        -> hit clusters -> VertexHead (whole batch)
 
 Config, backbone, pretrained weights and data loaders all come from
 track_finding_trainer.DownstreamTrainer.launch(). VertexHead(learn_weights=False) has no
 parameters, so this evaluates; nothing is trained.
 
-The track finder outputs hit clusters but no track parameters or quality labels.
-params.vertex_track_params chooses where they come from:
-    "hits"  (default) fitted from each predicted cluster's hits (vertexhead.track_params_from_hits);
-            no truth used anywhere except to score the result
-    "truth" PLACEHOLDER for comparison: from the truth track holding the plurality of each
-            predicted cluster's hits (truth_track_params)
+The track finder outputs hit clusters but no track parameters or quality labels; VertexHead
+fits both from each predicted cluster's hits. Truth is used only to score the result.
 """
 
-import numpy as np
 import torch
 from contextlib import nullcontext
 from torch.amp import autocast
 from tqdm import tqdm
 
 from train.downstream import track_finding_trainer
-from train.downstream.vertexhead import (VertexHead, build_tracks, apply_silicon_tpc_mask,
-                                         track_params_from_hits, NOISE_PT_THRESHOLD)
+from train.downstream.vertexhead import VertexHead
 from trackinghead import MambaAttentionHead
-from downstream_util import get_vertex_label
+from downstream_util import get_vertex_label, get_silicon_tpc_match_mask
 from loss import compute_vertex_metrics
 
 PAD_VALUE = -100
-EMPTY_SLOT_PARAMS = (0.5, torch.pi / 2, 0.0, 1.0)   # finite filler; empty slots are labelled noise anyway
-
 
 class VertexTrainer(track_finding_trainer.DownstreamTrainer):
 
@@ -64,56 +56,14 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
         for p in self.down_model.parameters():
             p.requires_grad_(False)
 
-        self.noise_pt_threshold = float(getattr(self.params, "noise_pt_threshold", NOISE_PT_THRESHOLD))
-        self.use_quality_mask = bool(getattr(self.params, "vertex_use_quality_mask", True))
         self.use_silicon_tpc_mask = bool(getattr(self.params, "vertex_silicon_tpc_mask", False))
-        self.track_params_source = getattr(self.params, "vertex_track_params", "hits")
-        if self.track_params_source not in ("hits", "truth"):
-            raise ValueError(f"vertex_track_params must be 'hits' or 'truth', got {self.track_params_source!r}")
         self.vertex_head = VertexHead(
             learn_weights=False,
             use_helix=bool(getattr(self.params, "vertex_use_helix", True)),
             Bz=float(getattr(self.params, "vertex_bz", 1.4)),
             scaling_factor=float(getattr(self.params, "vertex_scaling_factor", 100.0)),
+            noise_pt_threshold=float(getattr(self.params, "vertex_noise_pt_threshold", 0.25)),
         ).to(self.device).eval()
-
-    def truth_track_params(self, assign, mask, labels, reg):
-        """
-        PLACEHOLDER for a reconstructed estimate: per-prototype parameters and quality labels
-        taken from the truth track holding the plurality of that prototype's hits.
-
-        Args:
-            assign: (B, N) long, predicted prototype per hit; -1 = unassigned.
-            mask: (B, N) bool, True = real hit.
-            labels: (B, N) truth track ID per hit.
-            reg: (B, N, 8) truth (px, py, pz, vx, vy, vz, q, e) per hit.
-
-        Returns:
-            track_reg_result: (B, C, 4) (q/(pT+1), theta, sin phi, cos phi).
-            noise_labels: (B, C) long, 1 = noise; empty prototypes are labelled noise.
-            valid_tracks: (B, C) long, 1 = production vertex within 1 cm.
-        """
-        B, C = assign.size(0), self.params.max_gt_classes
-        trr = torch.tensor(EMPTY_SLOT_PARAMS).repeat(B, C, 1)
-        noise = torch.ones(B, C, dtype=torch.long)
-        valid = torch.zeros(B, C, dtype=torch.long)
-        for e in range(B):
-            real = mask[e].cpu()
-            seg = labels[e].cpu()[real].numpy().astype(np.int32)
-            proto = assign[e].cpu()[real].numpy()
-            if len(seg) == 0:
-                continue
-            # build_tracks reads reg only for these outputs; features feed points, unused here
-            td = build_tracks(np.zeros((len(seg), 4), np.float32), seg,
-                              reg[e].cpu()[real].numpy().astype(np.float64), self.noise_pt_threshold)
-            col_of = {int(t): k for k, t in enumerate(td["track_ids"])}
-            for c in np.unique(proto[proto >= 0]):
-                ids, counts = np.unique(seg[proto == c], return_counts=True)
-                k = col_of[int(ids[counts.argmax()])]
-                trr[e, c] = td["track_reg_result"][0, k]
-                noise[e, c] = td["noise_labels"][0, k]
-                valid[e, c] = td["valid_tracks"][0, k]
-        return trr.to(self.device), noise.to(self.device), valid.to(self.device)
 
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None):
@@ -138,10 +88,10 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
             if len(batch) != 4:
                 raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
                                    "set params.return_reg_test = True before launch()")
-            grouped, label, _, reg = batch
+            grouped, _, _, reg = batch
             b, c = grouped.size(0), grouped.size(-1)
             grouped = grouped.reshape(b, -1, c).to(self.device)
-            labels, reg = label.to(self.device), reg.to(self.device)
+            reg = reg.to(self.device)
             mask = grouped[..., 0] != PAD_VALUE
 
             with autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext():
@@ -157,13 +107,11 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
                 # reco-level: TPC membership judged from the PREDICTED clusters, not truth
                 for e in range(b):
                     real = mask[e]
-                    td = {"mask_probs": mask_probs[e:e+1, real]}
-                    apply_silicon_tpc_mask(td, grouped[e, real].cpu().numpy(),
-                                           mask_probs[e, real].argmax(-1).cpu().numpy())
-                    mask_probs[e, real] = td["mask_probs"][0]
-
-            assign = torch.where(mask_probs.amax(-1) > 0, mask_probs.argmax(-1),
-                                 torch.full_like(mask, -1, dtype=torch.long))
+                    info = get_silicon_tpc_match_mask(grouped[e, real].cpu().numpy(),
+                                                      mask_probs[e, real].argmax(-1).cpu().numpy())
+                    drop = ~torch.as_tensor(info["keep_mask"], dtype=torch.bool, device=self.device)
+                    hit_index = real.nonzero(as_tuple=True)[0][drop]
+                    mask_probs[e, hit_index] = 0.0
 
             result = self.vertex_head(
                 class_probs=class_probs, mask_probs=mask_probs,

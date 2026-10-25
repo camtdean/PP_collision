@@ -14,9 +14,8 @@ default to what that config and the track-finding naming convention imply:
     track head : --track_ckpt, else
                  {checkpoint_dir}/{config}_nerf_tracking_head_d{eventnumber}_{track_run_num}_seed{seed}_checkpoint.pth
 
-Vertex options (--bz, --track_params, ...) fall back to the YAML keys vertex_bz,
-vertex_track_params, vertex_use_quality_mask, vertex_silicon_tpc_mask, then to the
-defaults in vertex_reconstruction_trainer.py.
+Vertex options (--bz, --silicon_tpc_mask) fall back to the YAML keys vertex_bz,
+vertex_silicon_tpc_mask, then to the defaults in vertex_reconstruction_trainer.py.
 """
 import os
 import sys
@@ -65,10 +64,7 @@ def main():
                    help="must match the track head's --eventnumber for the derived checkpoint name")
     p.add_argument("--max_events", default=None, type=int)
     p.add_argument("--bz", default=None, type=float, help="solenoid field, Tesla; default: YAML vertex_bz or 1.4")
-    p.add_argument("--no_quality_mask", action="store_true", help="don't pass noise/validity labels to VertexHead")
     p.add_argument("--silicon_tpc_mask", action="store_true", help="drop silicon hits whose predicted track has no TPC hit")
-    p.add_argument("--track_params", choices=("hits", "truth"), default=None,
-                   help="track parameters + quality labels source; default: YAML vertex_track_params or 'hits'")
     p.add_argument("--data_root_test", default=None)
     args = p.parse_args()
 
@@ -98,12 +94,8 @@ def main():
     # --- vertex options: CLI flag if given, else YAML key, else trainer default ---
     if args.bz is not None:
         params.vertex_bz = args.bz
-    if args.no_quality_mask:
-        params.vertex_use_quality_mask = False
     if args.silicon_tpc_mask:
         params.vertex_silicon_tpc_mask = True
-    if args.track_params is not None:
-        params.vertex_track_params = args.track_params
     if args.data_root_test:
         params.data_root_test = args.data_root_test
 
@@ -131,7 +123,7 @@ def _jsonable(v):
 def save_results(result, trainer, params, args, track_ckpt):
     """Write per-event vertices (.npz) and metrics (.json) to the run dir; append metrics to the performance log."""
     out_dir = params.experiment_dir            # {root_dir}/{config}/{run_num}, set by launch()
-    tag = f"vertex_{args.track_params or getattr(trainer, 'track_params_source', 'hits')}"
+    tag = "vertex"
 
     npz_path = os.path.join(out_dir, f"{tag}_results.npz")
     np.savez(npz_path,
@@ -145,8 +137,6 @@ def save_results(result, trainer, params, args, track_ckpt):
         "yaml_config": os.path.abspath(args.yaml_config),
         "pretrained_ckpt": params.pretrained_ckpt,
         "track_ckpt": os.path.abspath(track_ckpt),
-        "track_params": trainer.track_params_source,
-        "use_quality_mask": trainer.use_quality_mask,
         "silicon_tpc_mask": trainer.use_silicon_tpc_mask,
         "bz": trainer.vertex_head.Bz,
         "max_events": args.max_events,

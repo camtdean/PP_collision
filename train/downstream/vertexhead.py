@@ -1,125 +1,23 @@
 """
 vertexhead.py
 =============
-Primary-vertex fit from track-finder output, plus truth-level input building for testing it.
+Primary-vertex fit from track-finder output.
 
-VertexHead finds the point minimising the weighted sum of squared distances of closest approach
-to every track, anchoring each track at its innermost assigned hit and weighting it by
-(soft hit count) x P(real). With use_helix and Bz != 0 that straight-line vertex seeds an
-iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to points' units).
+Track parameters and quality labels (noise, beam-line validity) are fitted from each track's
+assigned hits. VertexHead finds the point minimising the weighted sum of squared distances of
+closest approach to every usable track, anchoring each track at its innermost assigned hit and
+weighting it by (soft hit count) x P(real). With use_helix and Bz != 0 that straight-line vertex
+seeds an iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to
+points' units).
 
-Inputs (from MambaAttentionHead.forward, or build_tracks for truth-level tests):
+Inputs (from MambaAttentionHead.forward):
     class_probs      (n_events, n_tracks, 2)        P(slot empty), P(slot real)
-    track_reg_result (n_events, n_tracks, 4)        (q/(pT+1), theta, sin phi, cos phi)
     mask_probs       (n_events, n_hits, n_tracks)   hit-to-track assignment
     points           (n_events, n_hits, 4)          (E, x, y, z)
     padding_mask     (n_events, n_hits)             True = real hit
-    noise_labels     (n_events, n_tracks), optional 1 = noise (pT < threshold)
-    valid_tracks     (n_events, n_tracks), optional 1 = production vertex within 1 cm
-
-noise_labels / valid_tracks come from reg_target only in truth-level tests; at inference they
-must come from the tracking output.
 """
-import os
-
-import numpy as np
 import torch
 import torch.nn as nn
-from mmap_ninja import RaggedMmap
-
-NOISE_PT_THRESHOLD = 0.25
-
-# features (E, x, y, z), seg_target (track ID), reg_target (px, py, pz, vx, vy, vz, q, e)
-def load_event(data_dir: str, event_idx: int):
-    features   = RaggedMmap(os.path.join(data_dir, "features.mmap"),   n_cols=4)[event_idx]
-    seg_target = RaggedMmap(os.path.join(data_dir, "seg_target.mmap"), n_cols=1)[event_idx]
-    reg_target = RaggedMmap(os.path.join(data_dir, "reg_target.mmap"), n_cols=8)[event_idx]
-    return features.astype(np.float32), seg_target.astype(np.int32), reg_target.astype(np.float64)
-
-# per-track tensors (batch dim 1); every unique seg_target is a track, negative IDs included
-def build_tracks(features, seg_target, reg_target, noise_pt_threshold=NOISE_PT_THRESHOLD):
-    unique_ids = np.unique(seg_target)
-    n_hits, n_tracks = len(seg_target), len(unique_ids)
-    id_to_col = {tid: col for col, tid in enumerate(unique_ids)}
-
-    # all hits of a truth track share its reg_target row; take the first
-    track_px  = np.zeros(n_tracks, dtype=np.float64)
-    track_py  = np.zeros(n_tracks, dtype=np.float64)
-    track_pz  = np.zeros(n_tracks, dtype=np.float64)
-    track_vtx = np.zeros((n_tracks, 3), dtype=np.float64)
-    track_q   = np.zeros(n_tracks, dtype=np.float64)
-    track_seen = np.zeros(n_tracks, dtype=bool)
-    mask_probs_np = np.zeros((n_hits, n_tracks), dtype=np.float32)
-
-    for hit_idx, tid in enumerate(seg_target):
-        col = id_to_col[int(tid)]
-        mask_probs_np[hit_idx, col] = 1.0
-        if not track_seen[col]:
-            track_px[col]  = reg_target[hit_idx, 0]
-            track_py[col]  = reg_target[hit_idx, 1]
-            track_pz[col]  = reg_target[hit_idx, 2]
-            track_vtx[col] = reg_target[hit_idx, 3:6]
-            track_q[col]   = reg_target[hit_idx, 6]
-            track_seen[col] = True
-
-    pT    = np.sqrt(track_px**2 + track_py**2)
-    phi   = np.arctan2(track_py, track_px)
-    theta = np.arctan2(pT, track_pz)
-    rho   = track_q / (pT + 1.0)
-
-    # track_reg_result layout: (rho, theta, sin_phi, cos_phi), rho = q / (pT + 1)
-    track_reg = np.stack([rho, theta, np.sin(phi), np.cos(phi)], axis=-1).astype(np.float32)
-
-    # same noise/validity cuts as get_trackinfo_noiselabel
-    vtx_r = np.sqrt(track_vtx[:, 0]**2 + track_vtx[:, 1]**2)
-    noise = (pT < noise_pt_threshold).astype(np.int64)   # 1=noise, 0=good
-    valid = (vtx_r < 1.0).astype(np.int32)               # 1=valid, 0=invalid
-
-    class_probs = torch.zeros(1, n_tracks, 2, dtype=torch.float32)
-    class_probs[..., 1] = 1.0                            # all truth tracks are real
-
-    return {
-        "track_ids":           unique_ids,
-        "track_reg_result":    torch.from_numpy(track_reg).unsqueeze(0),
-        "noise_labels":        torch.from_numpy(noise).unsqueeze(0),
-        "valid_tracks":        torch.from_numpy(valid).unsqueeze(0),
-        "mask_probs":          torch.from_numpy(mask_probs_np).unsqueeze(0),
-        "points":              torch.from_numpy(features).float().unsqueeze(0),
-        "padding_mask":        torch.ones(1, n_hits, dtype=torch.bool),
-        "class_probs":         class_probs,
-        "vtx_per_track":       torch.from_numpy(track_vtx.astype(np.float32)),
-        "pT_per_track":        torch.from_numpy(pT.astype(np.float32)),
-    }
-
-# zeroes mask_probs rows of silicon hits whose track has no TPC hit, in place (apply=False: info only)
-def apply_silicon_tpc_mask(td, features, seg_target, apply=True):
-    from downstream_util import get_silicon_tpc_match_mask
-    info = get_silicon_tpc_match_mask(features, seg_target)
-    if apply:
-        keep = torch.as_tensor(np.asarray(info["keep_mask"]), dtype=torch.bool)
-        td["mask_probs"][0, ~keep, :] = 0.0
-    return info
-
-# exactly VertexHead.forward's keyword arguments; quality labels omitted when use_quality_mask=False
-def vertex_head_inputs(td, use_quality_mask=True):
-    return {
-        "class_probs":      td["class_probs"],
-        "track_reg_result": td["track_reg_result"],
-        "mask_probs":       td["mask_probs"],
-        "points":           td["points"],
-        "padding_mask":     td["padding_mask"],
-        "noise_labels":     td["noise_labels"] if use_quality_mask else None,
-        "valid_tracks":     td["valid_tracks"] if use_quality_mask else None,
-    }
-
-def load_vertex_head_inputs(data_dir="", event_idx=0,
-                            use_silicon_tpc_mask=False, use_quality_mask=True,
-                            noise_pt_threshold=NOISE_PT_THRESHOLD):
-    features, seg_target, reg_target = load_event(data_dir, event_idx)
-    td = build_tracks(features, seg_target, reg_target, noise_pt_threshold)
-    if use_silicon_tpc_mask:
-        td["silicon_info"] = apply_silicon_tpc_mask(td, features, seg_target)
-    return vertex_head_inputs(td, use_quality_mask), td
 
 def build_track_quality_mask(noise_labels=None, valid_tracks=None):
     """
@@ -132,10 +30,9 @@ def build_track_quality_mask(noise_labels=None, valid_tracks=None):
     Returns:
         (n_events, n_tracks) bool, True = track is used in the fit; None if both inputs are None.
     """
-    if noise_labels is None and valid_tracks is None:
-        return None
-
     ref = noise_labels if noise_labels is not None else valid_tracks
+    if ref is None:
+        return None
     mask = torch.ones(ref.shape, dtype=torch.bool, device=ref.device)
 
     if noise_labels is not None:
@@ -484,8 +381,8 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
             torch.where(valid, Yc + mean_y, nan))
 
-def _track_params_from_hits(points, mask_probs, padding_mask, Bz=1.4, scaling_factor=100.0,
-                           noise_pt_threshold=NOISE_PT_THRESHOLD, valid_radius=1.0, min_hits=3):
+def _track_params_from_hits(points, mask_probs, padding_mask, noise_pt_threshold, Bz=1.4,
+                           scaling_factor=100.0, valid_radius=1.0, min_hits=3):
     """
     Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
 
@@ -498,9 +395,9 @@ def _track_params_from_hits(points, mask_probs, padding_mask, Bz=1.4, scaling_fa
         points: (n_events, n_hits, 4) hits (E, x, y, z).
         mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
         padding_mask: (n_events, n_hits) True = real hit.
+        noise_pt_threshold: fitted pT below this (GeV) -> noise_labels = 1.
         Bz: solenoid field along z, Tesla.
         scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
-        noise_pt_threshold: fitted pT below this (GeV) -> noise_labels = 1.
         valid_radius: fitted circle's closest approach to the beam line below this -> valid_tracks = 1.
         min_hits: tracks with fewer assigned hits are not fitted.
 
@@ -568,6 +465,7 @@ class VertexHead(nn.Module):
         Bz: solenoid field along z, Tesla.
         is_cosmics: fit z against x instead of z against transverse radius r.
         scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
+        noise_pt_threshold: tracks with fitted pT below this (GeV) are labelled noise and excluded.
     """
     def __init__(
         self,
@@ -577,7 +475,8 @@ class VertexHead(nn.Module):
         helix_iterations: int = 100,
         Bz: float = 1.4,
         is_cosmics: bool = False,
-        scaling_factor: float = 100.0
+        scaling_factor: float = 100.0,
+        noise_pt_threshold: float = 0.25,
     ):
         super().__init__()
         self.learn_weights = learn_weights
@@ -586,6 +485,7 @@ class VertexHead(nn.Module):
         self.Bz = Bz
         self.is_cosmics = is_cosmics
         self.scaling_factor = scaling_factor
+        self.noise_pt_threshold = noise_pt_threshold
         if learn_weights:
             # 6 inputs: class_probs (2) + track_reg_result (4); position deliberately excluded
             self.track_weight_network = nn.Sequential(
@@ -604,6 +504,9 @@ class VertexHead(nn.Module):
     def setScalingFactor(self, scaling_factor: float = 100.0):
         self.scaling_factor = scaling_factor
 
+    def setNoisePtThreshold(self, noise_pt_threshold: float = 0.25):
+        self.noise_pt_threshold = noise_pt_threshold
+    
     @staticmethod
     def track_position_from_hits(points, mask_probs, padding_mask):
         """
@@ -660,10 +563,6 @@ class VertexHead(nn.Module):
             mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
             points: (n_events, n_hits, 4) hits (E, x, y, z).
             padding_mask: (n_events, n_hits) True = real hit.
-            noise_labels: (n_events, n_tracks) int or None. 1 = noise, 0 = good.
-            valid_tracks: (n_events, n_tracks) int or None. 1 = production vertex within 1 cm.
-                Both quality labels come from reg_target only in truth-level tests; at inference
-                they must come from the tracking output.
 
         Returns:
             dict:
@@ -678,8 +577,8 @@ class VertexHead(nn.Module):
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
-        params = _track_params_from_hits(points, mask_probs, padding_mask,
-                                                      Bz=self.Bz, scaling_factor=self.scaling_factor)
+        params = _track_params_from_hits(points, mask_probs, padding_mask, self.noise_pt_threshold,
+                                         Bz=self.Bz, scaling_factor=self.scaling_factor)
         track_reg_result = params["track_reg_result"]
         noise_labels, valid_tracks = params["noise_labels"], params["valid_tracks"]
         track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
@@ -723,7 +622,10 @@ class VertexHead(nn.Module):
             )
         elif self.Bz == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
-
+        
+        if fit is None:
+            return None
+        
         return {
             "vertex_estimate": fit["vertex_estimate"],
             "chi_square": fit["chi_square"],
