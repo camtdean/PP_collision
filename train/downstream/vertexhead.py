@@ -110,7 +110,19 @@ def fit_vertex_by_closest_approach(
     P_track_position = torch.matmul(P, track_position.unsqueeze(-1)).squeeze(-1)
     weighted_position_sum = (weight.unsqueeze(-1) * P_track_position).sum(dim=1)
 
-    regularized_normal_matrix = normal_matrix + regularization * I3.squeeze(0)
+    # degeneracy check before solving: smallest/largest eigenvalue ratio (0 tracks: all ~0;
+    # 1 track or parallel tracks: one ~0). A rank-deficient matrix can make the solve raise.
+    normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)
+    largest_eigenvalue = normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
+    eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / largest_eigenvalue
+    well_determined = eigenvalue_ratio > minimum_eigenvalue_ratio
+    enough_total_weight = weight.sum(dim=-1) > minimum_total_weight
+    fit_is_valid = well_determined & enough_total_weight
+
+    # invalid events solve against the identity instead; their results are set to NaN below
+    regularized_normal_matrix = torch.where(fit_is_valid.view(-1, 1, 1),
+                                            normal_matrix + regularization * I3.squeeze(0),
+                                            I3.squeeze(0).expand_as(normal_matrix))
     PV = torch.linalg.solve(regularized_normal_matrix, weighted_position_sum)
 
     track_position_minus_PV = track_position - PV.unsqueeze(1)
@@ -119,14 +131,6 @@ def fit_vertex_by_closest_approach(
     chi_square = (weight * track_dca ** 2).sum(dim=-1)
 
     track_closest_approach_point = PV.unsqueeze(1) + dca_vector
-
-    # degeneracy check: smallest/largest eigenvalue ratio (0 tracks: all ~0; 1 track: one ~0)
-    normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)
-    largest_eigenvalue = normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
-    eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / largest_eigenvalue
-    well_determined = eigenvalue_ratio > minimum_eigenvalue_ratio
-    enough_total_weight = weight.sum(dim=-1) > minimum_total_weight
-    fit_is_valid = well_determined & enough_total_weight
 
     PV = PV.clone()
     PV[~fit_is_valid] = float("nan")
