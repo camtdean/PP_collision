@@ -27,7 +27,7 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from train.downstream import track_finding_trainer
-from train.downstream.vertexhead import VertexHead
+from train.downstream.vertexhead import VertexHead, OUTLIER_DCA_CUT
 from trackinghead import MambaAttentionHead
 from downstream_util import get_vertex_label
 from loss import compute_vertex_metrics, assign_points_to_masks
@@ -46,6 +46,10 @@ TEST_COLUMNS = ("test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z",
                 "test_residual_x", "test_residual_y", "test_residual_z", "test_residual_3d")
 
 CSV_COLUMNS = PER_POINT_COLUMNS + TEST_COLUMNS
+
+def outlier_cut(value):
+    """vertex_outlier_dca_cut as VertexHead takes it: None, or <= 0, disables outlier rejection."""
+    return None if value is None or float(value) <= 0 else float(value)
 
 def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, vertex, truth_vertex):
     """
@@ -132,6 +136,7 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
             Bz=float(getattr(self.params, "vertex_bz", 1.4)),
             scaling_factor=float(getattr(self.params, "vertex_scaling_factor", 100.0)),
             noise_pt_threshold=float(getattr(self.params, "vertex_noise_pt_threshold", 0.25)),
+            outlier_dca_cut=outlier_cut(getattr(self.params, "vertex_outlier_dca_cut", OUTLIER_DCA_CUT)),
         ).to(self.device).eval()
 
     @torch.no_grad()
@@ -154,7 +159,7 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
         """
         self.model.eval()
         amp = torch.cuda.is_available() and self.use_amp
-        est, tgt, ok, per_point = [], [], [], []
+        est, tgt, ok, outliers, per_point = [], [], [], [], []
 
         for step, batch in enumerate(tqdm(self.val_data_loader)):
             if len(batch) != 4:
@@ -190,12 +195,14 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
             est.append(result["vertex_estimate"])
             tgt.append(truth["vertex_target"])
             ok.append(result["fit_is_valid"] & truth["vertex_valid"])
+            outliers.append(result["track_is_outlier"].sum(dim=-1))
             if max_events and sum(len(x) for x in est) >= max_events:
                 break
 
-        est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
+        est, tgt, ok, outliers = torch.cat(est), torch.cat(tgt), torch.cat(ok), torch.cat(outliers)
         metrics = compute_vertex_metrics(est, tgt, ok)
-        metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
+        metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item(),
+                       outliers_per_event=outliers.float().mean().item())
         if self.log_to_screen:
             print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                                           for k, v in metrics.items()))

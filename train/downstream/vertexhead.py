@@ -20,6 +20,9 @@ VertexHead.forward inverts the normalization to (E, x, y, z) in cm; every fit be
 import torch
 import torch.nn as nn
 
+# default outlier-rejection cut on a track's distance of closest approach to the vertex, cm
+OUTLIER_DCA_CUT = 2.0    # best 68%/90% residuals on a 100-event scan of 0.25-5 cm
+
 def build_track_quality_mask(noise_labels=None, valid_tracks=None):
     """
     Combine per-track quality labels into one mask of usable tracks.
@@ -452,6 +455,10 @@ class VertexHead(nn.Module):
         is_cosmics: fit z against x instead of z against transverse radius r.
         scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
         noise_pt_threshold: tracks with fitted pT below this (GeV) are labelled noise and excluded.
+        outlier_dca_cut: outlier rejection; after each fit the used track passing farthest from the
+            vertex is dropped and the vertex refitted while that distance (cm) exceeds this, one track
+            per round, never below 2 tracks. None disables it.
+        max_outlier_rounds: maximum tracks dropped per event.
     """
     def __init__(
         self,
@@ -463,6 +470,8 @@ class VertexHead(nn.Module):
         is_cosmics: bool = False,
         scaling_factor: float = 100.0,
         noise_pt_threshold: float = 0.25,
+        outlier_dca_cut: float | None = OUTLIER_DCA_CUT,
+        max_outlier_rounds: int = 10,
     ):
         super().__init__()
         self.learn_weights = learn_weights
@@ -472,6 +481,8 @@ class VertexHead(nn.Module):
         self.is_cosmics = is_cosmics
         self.scaling_factor = scaling_factor
         self.noise_pt_threshold = noise_pt_threshold
+        self.outlier_dca_cut = outlier_dca_cut
+        self.max_outlier_rounds = max_outlier_rounds
         if learn_weights:
             # 6 inputs: class_probs (2) + track_reg_result (4); position deliberately excluded
             self.track_weight_network = nn.Sequential(
@@ -563,6 +574,50 @@ class VertexHead(nn.Module):
         track_position = torch.where(has_any_assigned_hit.unsqueeze(-1), innermost_hit_position, torch.zeros_like(innermost_hit_position))
         return track_position, total_hit_weight, is_assigned
 
+    def _fit(self, track_position, track_direction, params, track_weight):
+        """Straight-line fit, refined by the helix fit when use_helix and Bz != 0."""
+        fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
+        if self.use_helix and self.Bz != 0.0:
+            fit = fit_vertex_by_helix_closest_approach(
+                params["circle_centre"],
+                params["R_s"],
+                params["zslope"],
+                params["z0"],
+                track_weight,               # already zeroed for bad tracks
+                n_iterations=self.helix_iterations,
+                seed_vertex=fit["vertex_estimate"],
+                is_cosmics=self.is_cosmics,
+            )
+        return fit
+
+    def _reject_outliers(self, track_position, track_direction, params, track_weight, fit):
+        """
+        Drop, one per event per round, the used track farthest from the vertex while its DCA exceeds
+        outlier_dca_cut and more than 2 used tracks remain; refit after each round.
+
+        Returns:
+            track_weight with dropped tracks zeroed, track_is_outlier (n_events, n_tracks) bool, and
+            the fit from the final weights.
+        """
+        track_is_outlier = torch.zeros_like(track_weight, dtype=torch.bool)
+        if self.outlier_dca_cut is None:
+            return track_weight, track_is_outlier, fit
+
+        for _ in range(self.max_outlier_rounds):
+            dca = fit["track_dca"]
+            used = (track_weight > 0) & torch.isfinite(dca)     # NaN dca: excluded from this fit
+            candidate = used & (dca > self.outlier_dca_cut)
+            drop_event = fit["fit_is_valid"] & candidate.any(dim=-1) & (used.sum(dim=-1) > 2)
+            if not drop_event.any():
+                break
+            worst = torch.where(candidate, dca, torch.full_like(dca, -1.0)).argmax(dim=-1)
+            drop = torch.zeros_like(track_is_outlier)
+            drop[drop_event, worst[drop_event]] = True
+            track_is_outlier |= drop
+            track_weight = track_weight.masked_fill(drop, 0.0)
+            fit = self._fit(track_position, track_direction, params, track_weight)
+        return track_weight, track_is_outlier, fit
+
     def forward(
         self,
         class_probs,
@@ -585,8 +640,10 @@ class VertexHead(nn.Module):
                 fit_is_valid: (n_events,) bool; False with fewer than 2 usable, non-parallel tracks.
                 track_position: (n_events, n_tracks, 3) innermost assigned hit of each track.
                 track_direction: (n_events, n_tracks, 3) straight-line flight direction.
-                track_weight: (n_events, n_tracks) weight after quality masking; tracks the helix fit
-                    later excludes for too few hits still show their weight here.
+                track_weight: (n_events, n_tracks) weight used in the final fit: after quality masking
+                    and outlier rejection; tracks the helix fit excludes for a failed circle or z fit still
+                    show their weight here.
+                track_is_outlier: (n_events, n_tracks) bool, dropped by outlier rejection.
                 track_quality_mask: (n_events, n_tracks) bool, or None if no labels were given.
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
@@ -623,21 +680,12 @@ class VertexHead(nn.Module):
                 )
             track_weight = track_weight * quality_mask.to(dtype=track_weight.dtype)
 
-        fit = fit_vertex_by_closest_approach(track_position, track_direction, track_weight)
-
-        if (self.use_helix and self.Bz != 0.0):
-            fit = fit_vertex_by_helix_closest_approach(
-                params["circle_centre"],
-                params["R_s"],
-                params["zslope"],
-                params["z0"],
-                track_weight,               # already zeroed for bad tracks
-                n_iterations=self.helix_iterations,
-                seed_vertex=fit["vertex_estimate"],
-                is_cosmics=self.is_cosmics,
-            )
-        elif self.Bz == 0.0:
+        if self.Bz == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
+
+        fit = self._fit(track_position, track_direction, params, track_weight)
+        track_weight, track_is_outlier, fit = self._reject_outliers(
+            track_position, track_direction, params, track_weight, fit)
         
         if fit is None:
             return None
@@ -649,6 +697,7 @@ class VertexHead(nn.Module):
             "track_position": track_position,
             "track_direction": track_direction,
             "track_weight": track_weight,
+            "track_is_outlier": track_is_outlier,
             "track_quality_mask": quality_mask,
             "track_closest_approach_point": fit["track_closest_approach_point"],
             "track_dca": fit["track_dca"],
