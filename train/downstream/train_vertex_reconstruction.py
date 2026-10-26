@@ -20,6 +20,7 @@ vertex_reconstruction_trainer.py.
 import os
 import sys
 import argparse
+import csv
 import json
 
 import numpy as np
@@ -161,10 +162,23 @@ def save_results(result, trainer, params, args, track_ckpt):
     print(f"[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
 
     if "per_point" in result:
-        import pandas as pd
         csv_path = args.csv_output_path or os.path.join(out_dir, f"{tag}_per_point_data.csv")
-        pd.DataFrame(result["per_point"]).to_csv(csv_path, index=False)
+        write_per_point_csv(result["per_point"], csv_path)
         print(f"[vertex] wrote {csv_path} ({len(result['per_point']['batch_idx'])} points)")
+
+
+def write_per_point_csv(columns, path):
+    """
+    Write {column: 1-D array} as CSV in the format pandas' to_csv(index=False) gives
+    track_finding_trainer.inference(): shortest round-trip floats, NaN as an empty field,
+    os.linesep line endings. No pandas dependency.
+    """
+    names = list(columns)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f, lineterminator=os.linesep)
+        writer.writerow(names)
+        for row in zip(*(columns[n].tolist() for n in names)):
+            writer.writerow(["" if v != v else v for v in row])    # v != v only for NaN
 
 
 if __name__ == "__main__":
