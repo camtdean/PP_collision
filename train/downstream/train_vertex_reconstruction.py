@@ -2,20 +2,20 @@
 """
 Run vertex reconstruction after a trained track-finding head.
 
-Everything comes from the same YAML config + config name used for train_track_finding.py
-(scripts/configs/mamba_tracking.yaml). The backbone checkpoint and the track-head checkpoint
-default to what that config and the track-finding naming convention imply:
+Config, data paths and the backbone checkpoint come from the mamba_5m_downstream entry of
+scripts/configs/mamba_tracking.yaml by default (width-256 Mamba2 backbone, the same
+architecture as train_track_finding.py's d9_m1_k30_p20). Run from train/downstream:
 
-    python run_vertex_reconstruction.py \
-        --yaml_config ../../scripts/configs/mamba_tracking.yaml --config d9_m1_k30_p20 \
-        --root_dir out/ [--track_run_num 0] [--seed 42] [--eventnumber 70000]
+    python train_vertex_reconstruction.py --root_dir out/ --track_ckpt <head.pth> [--save_csv]
 
-    backbone   : --pretrained_ckpt, else pretrained_ckpt from the YAML
+    config     : --config (default mamba_5m_downstream) in --yaml_config
+    backbone   : --pretrained_ckpt, else pretrained_ckpt from that config
     track head : --track_ckpt, else
-                 {checkpoint_dir}/{config}_nerf_tracking_head_d{eventnumber}_{track_run_num}_seed{seed}_checkpoint.pth
+                 {checkpoint_dir}/{track_config}_nerf_tracking_head_d{eventnumber}_{track_run_num}_seed{seed}_checkpoint.pth
+                 where track_config is the --config the head was trained with (default d9_m1_k30_p20)
 
-Vertex options (--bz, --silicon_tpc_mask) fall back to the YAML keys vertex_bz,
-vertex_silicon_tpc_mask, then to the defaults in vertex_reconstruction_trainer.py.
+The vertex option --bz falls back to the YAML key vertex_bz, then to the default in
+vertex_reconstruction_trainer.py.
 """
 import os
 import sys
@@ -45,10 +45,19 @@ def default_track_ckpt(params, config, eventnumber, track_run_num, seed, usepret
     return os.path.join(params.checkpoint_dir, base + "_checkpoint.pth")
 
 
+DEFAULT_YAML = "../../scripts/configs/mamba_tracking.yaml"
+DEFAULT_CONFIG = "mamba_5m_downstream"
+DEFAULT_TRACK_CONFIG = "d9_m1_k30_p20"    # train_track_finding.py's name for the same backbone
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--yaml_config", required=True, help="normally scripts/configs/mamba_tracking.yaml")
-    p.add_argument("--config", required=True, help="config name inside the YAML, e.g. d9_m1_k30_p20")
+    p.add_argument("--yaml_config", default=DEFAULT_YAML, help=f"default: {DEFAULT_YAML}")
+    p.add_argument("--config", default=DEFAULT_CONFIG,
+                   help=f"config name inside the YAML; default: {DEFAULT_CONFIG}")
+    p.add_argument("--track_config", default=DEFAULT_TRACK_CONFIG,
+                   help="--config the track head was trained with; only names the derived track checkpoint; "
+                        f"default: {DEFAULT_TRACK_CONFIG}")
     p.add_argument("--pretrained_ckpt", default=None,
                    help="frozen backbone checkpoint; default: pretrained_ckpt from the YAML")
     p.add_argument("--track_ckpt", default=None,
@@ -64,8 +73,12 @@ def main():
                    help="must match the track head's --eventnumber for the derived checkpoint name")
     p.add_argument("--max_events", default=None, type=int)
     p.add_argument("--bz", default=None, type=float, help="solenoid field, Tesla; default: YAML vertex_bz or 1.4")
-    p.add_argument("--silicon_tpc_mask", action="store_true", help="drop silicon hits whose predicted track has no TPC hit")
     p.add_argument("--data_root_test", default=None)
+    p.add_argument("--save_csv", action="store_true",
+                   help="also write eval_track_finding.py's per-point CSV, with vtx_x/y/z the reconstructed "
+                        "vertex; test_* columns (truth vertex, residual) are for testing only")
+    p.add_argument("--csv_output_path", default=None,
+                   help="per-point CSV path; default: {run dir}/vertex_per_point_data.csv")
     args = p.parse_args()
 
     params = YParams(os.path.abspath(args.yaml_config), args.config)
@@ -77,10 +90,11 @@ def main():
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
 
     track_ckpt = args.track_ckpt or default_track_ckpt(
-        params, args.config, args.eventnumber, args.track_run_num, args.seed, args.track_usepretrain)
+        params, args.track_config, args.eventnumber, args.track_run_num, args.seed, args.track_usepretrain)
     if not os.path.isfile(track_ckpt):
         sys.exit(f"track-head checkpoint not found: {track_ckpt}\n"
-                 f"(pass --track_ckpt, or check --track_run_num/--seed/--eventnumber against the training run)")
+                 f"(pass --track_ckpt, or check --track_config/--track_run_num/--seed/--eventnumber "
+                 f"against the training run)")
 
     # --- fixed by how VertexTrainer consumes the loader ---
     params.limit_data = True
@@ -94,8 +108,6 @@ def main():
     # --- vertex options: CLI flag if given, else YAML key, else trainer default ---
     if args.bz is not None:
         params.vertex_bz = args.bz
-    if args.silicon_tpc_mask:
-        params.vertex_silicon_tpc_mask = True
     if args.data_root_test:
         params.data_root_test = args.data_root_test
 
@@ -106,7 +118,7 @@ def main():
     trainer = VertexTrainer(params, args)
     trainer.launch()
     trainer.setup_vertexing(track_ckpt)
-    result = trainer.run_vertexing(pretrain=True, max_events=args.max_events)
+    result = trainer.run_vertexing(pretrain=True, max_events=args.max_events, save_csv=args.save_csv)
     if trainer.world_rank == 0:
         save_results(result, trainer, params, args, track_ckpt)
     trainer.cleanup()
@@ -137,7 +149,6 @@ def save_results(result, trainer, params, args, track_ckpt):
         "yaml_config": os.path.abspath(args.yaml_config),
         "pretrained_ckpt": params.pretrained_ckpt,
         "track_ckpt": os.path.abspath(track_ckpt),
-        "silicon_tpc_mask": trainer.use_silicon_tpc_mask,
         "bz": trainer.vertex_head.Bz,
         "max_events": args.max_events,
         "metrics": metrics,
@@ -148,6 +159,12 @@ def save_results(result, trainer, params, args, track_ckpt):
 
     trainer.log_infile("[vertex] " + json.dumps(metrics))
     print(f"[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
+
+    if "per_point" in result:
+        import pandas as pd
+        csv_path = args.csv_output_path or os.path.join(out_dir, f"{tag}_per_point_data.csv")
+        pd.DataFrame(result["per_point"]).to_csv(csv_path, index=False)
+        print(f"[vertex] wrote {csv_path} ({len(result['per_point']['batch_idx'])} points)")
 
 
 if __name__ == "__main__":

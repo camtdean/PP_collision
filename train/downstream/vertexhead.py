@@ -7,14 +7,15 @@ Track parameters and quality labels (noise, beam-line validity) are fitted from 
 assigned hits. VertexHead finds the point minimising the weighted sum of squared distances of
 closest approach to every usable track, anchoring each track at its innermost assigned hit and
 weighting it by (soft hit count) x P(real). With use_helix and Bz != 0 that straight-line vertex
-seeds an iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to
-points' units).
+seeds an iterative helix fit (uniform Bz along z in Tesla; scaling_factor converts metres to cm).
 
-Inputs (from MambaAttentionHead.forward):
+Inputs (from MambaAttentionHead.forward and TPCBatchDataset):
     class_probs      (n_events, n_tracks, 2)        P(slot empty), P(slot real)
     mask_probs       (n_events, n_hits, n_tracks)   hit-to-track assignment
-    points           (n_events, n_hits, 4)          (E, x, y, z)
+    points           (n_events, n_hits, 4)          normalized (E, eta, phi, r), as the model sees them
     padding_mask     (n_events, n_hits)             True = real hit
+
+VertexHead.forward inverts the normalization to (E, x, y, z) in cm; every fit below works in cm.
 """
 import torch
 import torch.nn as nn
@@ -143,16 +144,14 @@ def fit_vertex_by_closest_approach(
     }
 
 def fit_vertex_by_helix_closest_approach(
-    points,
-    mask,
-    track_reg_result,
-    track_position,
-    Bz,
+    circle_centre,
+    R_s,
+    zslope,
+    z0,
     track_weight,
     n_iterations=100,
     seed_vertex=None,
     d_angle=0.005,
-    scaling_factor = 100.0,  # placeholder for dataset.py's data_scaler
     is_cosmics = False,
     **linear_fit_kwargs,
 ):
@@ -161,27 +160,25 @@ def fit_vertex_by_helix_closest_approach(
     tangent at its point of closest approach to the current vertex.
 
     Args:
-        points: (n_events, n_hits, 4) hits (E, x, y, z).
-        mask: (n_events, n_hits, n_tracks) bool, True where a hit is assigned to a track.
-        track_reg_result: (n_events, n_tracks, 4) (q/(pT+1), theta, sin phi, cos phi).
-        track_position: (n_events, n_tracks, 3) innermost assigned hit of each track.
-        Bz: solenoid field along z, Tesla.
+        circle_centre: (n_events, n_tracks, 2) centre of each track's x-y circle, cm.
+        R_s: (n_events, n_tracks) signed circle radius, cm; sign(R_s) = sign(q Bz).
+        zslope, z0: (n_events, n_tracks) z line, z = zslope * r + z0 (r -> x if is_cosmics).
+            The circle and z line come from _track_params_from_hits.
         track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
         n_iterations: maximum iterations; stops early once every event moves < 1e-4.
         seed_vertex: (n_events, 3) starting vertex; origin if None.
         d_angle: angular step (radians) along the circle used to form the tangent.
-        scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
-        is_cosmics: fit z against x instead of z against transverse radius r.
+        is_cosmics: the z line is z against x instead of z against transverse radius r.
         **linear_fit_kwargs: passed to fit_vertex_by_closest_approach.
 
     Returns:
         dict, same keys as fit_vertex_by_closest_approach, from the last iteration.
-        Tracks with too few hits for a z fit are excluded from it and get NaN
+        Tracks without a fitted circle and z line (NaN) are excluded from it and get NaN
         track_dca and track_closest_approach_point.
     """
-    n_events, n_tracks, _ = track_reg_result.shape
-    device = track_reg_result.device
-    dtype = track_reg_result.dtype
+    n_events, n_tracks = R_s.shape
+    device = R_s.device
+    dtype = R_s.dtype
 
     if seed_vertex is None:
         print("WARNING: no seed_vertex provided, starting helix iteration from the origin.")
@@ -193,35 +190,9 @@ def fit_vertex_by_helix_closest_approach(
     n_iterations_used = torch.zeros(n_events, dtype=torch.long, device=device)
     result = None
 
-    n_tracks = mask.shape[-1]
-    hit_x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks)
-    hit_y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks)
-    hit_z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks)
-
-    rho = track_reg_result[..., 0]
-    sin_phi = track_reg_result[..., 2]
-    cos_phi = track_reg_result[..., 3]
-
-    x_h = track_position[..., 0]
-    y_h = track_position[..., 1]
-
-    q = torch.sign(rho)
-    q = torch.where(q == 0, torch.ones_like(q), q)  # rho == 0 is an invalid slot either way
-    pT = (1.0 / rho.abs()) - 1.0
-
-    b_z_t = torch.full_like(rho, float(Bz))
-    R_s = (pT / (0.3 * q * b_z_t)) * scaling_factor
     radius = R_s.abs()
-
-    x0 = x_h + R_s * sin_phi
-    y0 = y_h - R_s * cos_phi
-
-    if is_cosmics:
-        zslope, z0 = _line_fit(hit_x, hit_z, mask)
-    else:
-        zslope, z0 = _line_fit(torch.sqrt(hit_x**2 + hit_y**2), hit_z, mask)
-
-    origin = torch.stack([x0, y0], dim=-1)
+    x0, y0 = circle_centre.unbind(-1)
+    origin = circle_centre
 
     for iteration in range(n_iterations):
         PV_per_track = PV.unsqueeze(1).expand(-1, n_tracks, -1)
@@ -381,25 +352,27 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     return (torch.where(valid, radius, nan), torch.where(valid, Xc + mean_x, nan),
             torch.where(valid, Yc + mean_y, nan))
 
-def _track_params_from_hits(points, mask_probs, padding_mask, noise_pt_threshold, Bz=1.4,
-                           scaling_factor=100.0, valid_radius=1.0, min_hits=3):
+def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1.4,
+                           scaling_factor=100.0, valid_radius=1.0, min_hits=3, is_cosmics=False):
     """
     Track parameters and quality labels fitted from each track's assigned hits -- no truth needed.
 
     Circle fit in x-y gives pT and the circle; the direction of travel (innermost -> outermost hit)
     gives the charge and phi at the innermost hit, in VertexHead's convention
     (centre = innermost hit + R_s (sin phi, -cos phi), sign(R_s) = sign(q Bz)).
-    A z-against-r line fit gives theta.
+    A z-against-r line fit (z against x for cosmics) gives theta.
 
     Args:
-        points: (n_events, n_hits, 4) hits (E, x, y, z).
-        mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
-        padding_mask: (n_events, n_hits) True = real hit.
+        points: (n_events, n_hits, 4) hits (E, x, y, z), cm.
+        hit_r: (n_events, n_hits) transverse radius of each hit, cm.
+        is_assigned: (n_events, n_hits, n_tracks) bool, hard hit-to-track assignment
+            (from VertexHead.track_position_from_hits).
         noise_pt_threshold: fitted pT below this (GeV) -> noise_labels = 1.
         Bz: solenoid field along z, Tesla.
         scaling_factor: converts pT / (0.3 Bz), in metres, to the units of points.
         valid_radius: fitted circle's closest approach to the beam line below this -> valid_tracks = 1.
         min_hits: tracks with fewer assigned hits are not fitted.
+        is_cosmics: fit z against x instead of z against transverse radius r.
 
     Returns:
         dict:
@@ -410,16 +383,18 @@ def _track_params_from_hits(points, mask_probs, padding_mask, noise_pt_threshold
                 line; 0 where fit_ok is False.
             pT, radius, beam_dca: (n_events, n_tracks); NaN where fit_ok is False.
             fit_ok: (n_events, n_tracks) bool, enough hits and finite fit.
+            circle_centre (n_events, n_tracks, 2); R_s, zslope, z0 (n_events, n_tracks): the fitted
+                circle (sign(R_s) = sign(q Bz)) and z line, in the dtype of points, for
+                fit_vertex_by_helix_closest_approach; NaN where fit_ok is False.
     """
-    _, _, is_assigned = VertexHead.track_position_from_hits(points, mask_probs, padding_mask)
     n_tracks = is_assigned.shape[-1]
     x = points[..., 1].unsqueeze(-1).expand(-1, -1, n_tracks).double()
     y = points[..., 2].unsqueeze(-1).expand(-1, -1, n_tracks).double()
     z = points[..., 3].unsqueeze(-1).expand(-1, -1, n_tracks).double()
-    r = torch.sqrt(x * x + y * y)
+    r = hit_r.unsqueeze(-1).expand(-1, -1, n_tracks).double()
 
     radius, xc, yc = _circle_fit(x, y, is_assigned, min_hits=min_hits)
-    zslope, _ = _line_fit(r, z, is_assigned, min_hits=min_hits)
+    zslope, z0 = _line_fit(x if is_cosmics else r, z, is_assigned, min_hits=min_hits)
 
     # innermost and outermost assigned hit of each track
     inf = torch.full_like(r, float("inf"))
@@ -435,7 +410,9 @@ def _track_params_from_hits(points, mask_probs, padding_mask, noise_pt_threshold
     sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
     q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
     pT = 0.3 * abs(Bz) * radius / scaling_factor
-    theta = torch.atan2(torch.ones_like(zslope), zslope)       # cot(theta) = dz/dr
+    # cot(theta) = dz/ds: dz/dr for tracks from the beam line, dz/dx * dx/ds = zslope cos(phi) for cosmics
+    cot_theta = zslope * cos_phi if is_cosmics else zslope
+    theta = torch.atan2(torch.ones_like(cot_theta), cot_theta)
     beam_dca = (torch.sqrt(xc * xc + yc * yc) - radius).abs()
 
     params = torch.stack([q / (pT + 1.0), theta, sin_phi, cos_phi], dim=-1)
@@ -445,11 +422,16 @@ def _track_params_from_hits(points, mask_probs, padding_mask, noise_pt_threshold
     nan = torch.full_like(pT, float("nan"))
     pT, radius, beam_dca = (torch.where(fit_ok, v, nan) for v in (pT, radius, beam_dca))
 
+    circle_centre = torch.where(fit_ok.unsqueeze(-1), torch.stack([xc, yc], dim=-1), nan.unsqueeze(-1))
+    R_s, zslope, z0 = (torch.where(fit_ok, v, nan) for v in (sign_Rs * radius, zslope, z0))
+
     return {
         "track_reg_result": params.to(points.dtype),
         "noise_labels": torch.where(fit_ok, (pT < noise_pt_threshold).long(), torch.ones_like(fit_ok, dtype=torch.long)),
         "valid_tracks": torch.where(fit_ok, (beam_dca < valid_radius).long(), torch.zeros_like(fit_ok, dtype=torch.long)),
         "pT": pT, "radius": radius, "beam_dca": beam_dca, "fit_ok": fit_ok,
+        "circle_centre": circle_centre.to(points.dtype), "R_s": R_s.to(points.dtype),
+        "zslope": zslope.to(points.dtype), "z0": z0.to(points.dtype),
     }
 
 class VertexHead(nn.Module):
@@ -508,17 +490,45 @@ class VertexHead(nn.Module):
         self.noise_pt_threshold = noise_pt_threshold
     
     @staticmethod
-    def track_position_from_hits(points, mask_probs, padding_mask):
+    def _unnormalize_hits(points):
+        """
+        Invert TPCBatchDataset's normalization and polar transform.
+
+        Args:
+            points: (..., 4) normalized (E, eta, phi, r): z-scored E; eta, phi and transverse r
+                min-max scaled to [0, 1]. eta is the hit position's, seen from the origin.
+
+        Returns:
+            points: (..., 4) (E, x, y, z), cm.
+            r: (...) transverse radius, cm.
+        """
+        # TPCBatchDataset's normalization (fm4npp/datasets/dataset.py, TPCBatchDataset.__init__);
+        # keep these in line with it
+        eta_lim = (-2.0, 2.0)
+        phi_lim = (-torch.pi, torch.pi)
+        r_lim = (31.371997833251953, 75.38493347167969)    # transverse radius, cm
+        E_mean, E_std = 253.0982, 268.7093
+
+        E = points[..., 0] * E_std + E_mean
+        eta = points[..., 1] * (eta_lim[1] - eta_lim[0]) + eta_lim[0]
+        phi = points[..., 2] * (phi_lim[1] - phi_lim[0]) + phi_lim[0]
+        r = points[..., 3] * (r_lim[1] - r_lim[0]) + r_lim[0]
+        return torch.stack([E, r * torch.cos(phi), r * torch.sin(phi), r * torch.sinh(eta)], dim=-1), r
+
+    @staticmethod
+    def track_position_from_hits(points, hit_r, mask_probs, padding_mask):
         """
         Per-track reference point, hit weight and hard hit assignment.
 
         Args:
-            points: (n_events, n_hits, 4) hits (E, x, y, z).
+            points: (n_events, n_hits, 4) hits (E, x, y, z), cm.
+            hit_r: (n_events, n_hits) transverse radius of each hit, cm.
             mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
             padding_mask: (n_events, n_hits) True = real hit.
 
         Returns:
-            track_position: (n_events, n_tracks, 3) innermost assigned hit; (0, 0, 0) for a track with none.
+            track_position: (n_events, n_tracks, 3) innermost assigned hit by transverse radius
+                (the hit _track_params_from_hits gives phi at); (0, 0, 0) for a track with none.
             total_hit_weight: (n_events, n_tracks) sum of mask_probs over real hits.
             is_assigned: (n_events, n_hits, n_tracks) bool, each real hit assigned to its argmax track;
             hits with zero probability for every track are unassigned.
@@ -528,7 +538,6 @@ class VertexHead(nn.Module):
         total_hit_weight = hit_weight.sum(dim=1)
 
         n_events, n_hits, n_tracks = mask_probs.shape
-        hit_radius = hit_position.norm(dim=-1)
 
         # each hit belongs to the track slot with the largest mask_probs
         hard_assigned_track = mask_probs.argmax(dim=-1)
@@ -539,8 +548,8 @@ class VertexHead(nn.Module):
         is_assigned = (is_assigned & padding_mask.unsqueeze(-1) & has_assignment.unsqueeze(-1))
 
         radius_if_assigned = torch.where(is_assigned
-                                       , hit_radius.unsqueeze(-1).expand(-1, -1, n_tracks)
-                                       , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_radius.dtype),)
+                                       , hit_r.unsqueeze(-1).expand(-1, -1, n_tracks)
+                                       , torch.full((n_events, n_hits, n_tracks), float("inf"), device=points.device, dtype=hit_r.dtype),)
         innermost_hit_index = radius_if_assigned.argmin(dim=1)
         has_any_assigned_hit = is_assigned.any(dim=1)
 
@@ -561,11 +570,12 @@ class VertexHead(nn.Module):
         Args:
             class_probs: (n_events, n_tracks, 2) P(slot empty), P(slot real).
             mask_probs: (n_events, n_hits, n_tracks) hit-to-track assignment.
-            points: (n_events, n_hits, 4) hits (E, x, y, z).
+            points: (n_events, n_hits, 4) hits as TPCBatchDataset yields them, normalized
+                (E, eta, phi, r); inverted to (E, x, y, z) in cm before fitting.
             padding_mask: (n_events, n_hits) True = real hit.
 
         Returns:
-            dict:
+            dict, positions in cm:
                 vertex_estimate: (n_events, 3) fitted vertex; NaN where fit_is_valid is False.
                 chi_square: (n_events,) weighted sum of squared DCAs at the vertex; no ndf applied.
                 fit_is_valid: (n_events,) bool; False with fewer than 2 usable, non-parallel tracks.
@@ -577,11 +587,15 @@ class VertexHead(nn.Module):
                 track_closest_approach_point: (n_events, n_tracks, 3) point on each track nearest the vertex.
                 track_dca: (n_events, n_tracks) each track's distance of closest approach.
         """
-        params = _track_params_from_hits(points, mask_probs, padding_mask, self.noise_pt_threshold,
-                                         Bz=self.Bz, scaling_factor=self.scaling_factor)
+        # padded hits are -100 in every column, which overflows sinh(eta); any finite value will do
+        points, hit_r = self._unnormalize_hits(points.masked_fill(~padding_mask.unsqueeze(-1), 0.0))
+        track_position, total_hit_weight, is_assigned = self.track_position_from_hits(
+            points, hit_r, mask_probs, padding_mask)
+        params = _track_params_from_hits(points, hit_r, is_assigned, self.noise_pt_threshold,
+                                         Bz=self.Bz, scaling_factor=self.scaling_factor,
+                                         is_cosmics=self.is_cosmics)
         track_reg_result = params["track_reg_result"]
         noise_labels, valid_tracks = params["noise_labels"], params["valid_tracks"]
-        track_position, total_hit_weight, is_assigned = self.track_position_from_hits(points, mask_probs, padding_mask)
         track_direction = track_flight_direction(track_reg_result)
 
         probability_track_is_real = class_probs[..., 1]
@@ -609,16 +623,14 @@ class VertexHead(nn.Module):
 
         if (self.use_helix and self.Bz != 0.0):
             fit = fit_vertex_by_helix_closest_approach(
-                points,
-                is_assigned,
-                track_reg_result,
-                track_position,
-                self.Bz,
+                params["circle_centre"],
+                params["R_s"],
+                params["zslope"],
+                params["z0"],
                 track_weight,               # already zeroed for bad tracks
                 n_iterations=self.helix_iterations,
                 seed_vertex=fit["vertex_estimate"],
                 is_cosmics=self.is_cosmics,
-                scaling_factor=self.scaling_factor,
             )
         elif self.Bz == 0.0:
             print("WARNING: b_z=0.0, using straight-line fit instead of helix-aware fit.")
