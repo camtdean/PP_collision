@@ -52,18 +52,16 @@ def _fit_vertex_by_closest_approach(
     I3 = torch.eye(3, device=track_position.device, dtype=track_position.dtype)
     P = I3 - track_direction.unsqueeze(-1) * track_direction.unsqueeze(-2)
 
-    normal_matrix = (weight.unsqueeze(-1).unsqueeze(-1) * P).sum(dim=1)
-    weighted_position_sum = (weight.unsqueeze(-1) * 
+    normal_matrix = (weight[..., None, None] * P).sum(dim=1)
+    weighted_position_sum = (weight[..., None] *
                              torch.matmul(P, track_position.unsqueeze(-1)).squeeze(-1)).sum(dim=1)
 
     # degeneracy check before solving: smallest/largest eigenvalue ratio (0 tracks: all ~0;
     # 1 track or parallel tracks: one ~0). A rank-deficient matrix can make the solve raise.
     normal_matrix_eigenvalues = torch.linalg.eigvalsh(normal_matrix)
-    largest_eigenvalue = normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
-    eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / largest_eigenvalue
-    well_determined = eigenvalue_ratio > minimum_eigenvalue_ratio
-    enough_total_weight = weight.sum(dim=-1) > minimum_total_weight
-    fit_is_valid = well_determined & enough_total_weight
+    eigenvalue_ratio = normal_matrix_eigenvalues[:, 0] / normal_matrix_eigenvalues[:, -1].clamp(min=regularization)
+    fit_is_valid = ((eigenvalue_ratio > minimum_eigenvalue_ratio) &
+                     (weight.sum(dim=-1) > minimum_total_weight))
 
     # invalid events solve against the identity instead; their results are set to NaN below
     regularized_normal_matrix = torch.where(fit_is_valid.view(-1, 1, 1),
@@ -78,10 +76,8 @@ def _fit_vertex_by_closest_approach(
     track_closest_approach_point = PV.unsqueeze(1) + dca_vector
 
     PV = PV.masked_fill(~fit_is_valid.unsqueeze(-1), float("nan"))
-    track_closest_approach_point = track_closest_approach_point.clone()
-    track_closest_approach_point[~fit_is_valid] = float("nan")
-    track_dca = track_dca.clone()
-    track_dca[~fit_is_valid] = float("nan")
+    track_closest_approach_point = track_closest_approach_point.masked_fill(~fit_is_valid[:, None, None], float("nan"))
+    track_dca = track_dca.masked_fill(~fit_is_valid.unsqueeze(-1), float("nan"))
 
     return {
         "vertex_estimate": PV,
@@ -128,13 +124,10 @@ def _fit_vertex_by_helix_closest_approach(
     """
     n_events = R_s.shape[0]
 
-    if linear_fit is None:
-        PV = torch.zeros(n_events, 3, dtype=R_s.dtype, device=R_s.device)
-    else:
-        PV = linear_fit["vertex_estimate"].nan_to_num()    # an invalid seed (NaN) starts from the origin
-
     if n_iterations < 1:
         return linear_fit
+
+    PV = linear_fit["vertex_estimate"].nan_to_num() if linear_fit is not None else torch.zeros(n_events, 3, dtype=R_s.dtype, device=R_s.device)
 
     still_moving = torch.ones(n_events, dtype=torch.bool, device=R_s.device)
 
@@ -166,7 +159,7 @@ def _fit_vertex_by_helix_closest_approach(
         newx = radius * torch.cos(new_angle) + x0
         newy = radius * torch.sin(new_angle) + y0
         new_xy = torch.stack([newx, newy], dim=-1)
-
+        
         if is_cosmics:
             new_z = newx * zslope + z0
         else:
@@ -179,13 +172,11 @@ def _fit_vertex_by_helix_closest_approach(
 
         result = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
 
-        new_PV = result["vertex_estimate"]
-        fit_is_valid = result["fit_is_valid"]
-
-        still_moving = still_moving & fit_is_valid & ((new_PV - PV).norm(dim=-1) > 1e-4)
+        still_moving = (still_moving & result["fit_is_valid"] &
+                         ((result["vertex_estimate"] - PV).norm(dim=-1) > 1e-4))
         
         # advance PV only where the fit is valid, so one bad event can't spread NaN
-        PV = torch.where(fit_is_valid.unsqueeze(-1), new_PV, PV)
+        PV = torch.where(result["fit_is_valid"].unsqueeze(-1), result["vertex_estimate"], PV)
        
         if not still_moving.any():
             break
@@ -208,11 +199,11 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
         slope, intercept: (n_events, n_tracks) each; NaN where fewer than min_hits hits.
     """
     mask = mask.to(u.dtype)
-    n_valid = mask.sum(dim=1)
+    n_valid = mask.sum(dim=1).clamp(min=eps)
     valid = n_valid >= min_hits
 
-    mean_u = (u * mask).sum(dim=1) / n_valid.clamp(min=eps)
-    mean_v = (v * mask).sum(dim=1) / n_valid.clamp(min=eps)
+    mean_u = (u * mask).sum(dim=1) / n_valid
+    mean_v = (v * mask).sum(dim=1) / n_valid
 
     du = u - mean_u.unsqueeze(1)
     dv = v - mean_v.unsqueeze(1)
@@ -221,7 +212,7 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     ssd_v  = (dv * dv * mask).sum(dim=1)
     ssd_uv = (du * dv * mask).sum(dim=1)
 
-    ssd_uv_safe = torch.where(ssd_uv.abs() < eps, torch.full_like(ssd_uv, eps), ssd_uv)
+    ssd_uv_safe = torch.where(ssd_uv.abs() < eps, eps, ssd_uv)
     slope = (ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 / ssd_uv_safe
     intercept = mean_v - slope * mean_u
 
@@ -244,14 +235,14 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
         radius, x_centre, y_centre: (n_events, n_tracks) float64 each; NaN where fewer than min_hits hits.
     """
     x, y, mask = x.double(), y.double(), mask.double()
-    n_valid = mask.sum(dim=1)
+    n_valid = mask.sum(dim=1).clamp(min=eps)
     valid = n_valid >= min_hits
-    mean_x = (x * mask).sum(dim=1) / n_valid.clamp(min=eps)
-    mean_y = (y * mask).sum(dim=1) / n_valid.clamp(min=eps)
+    mean_x = (x * mask).sum(dim=1) / n_valid
+    mean_y = (y * mask).sum(dim=1) / n_valid
     Xi, Yi = x - mean_x.unsqueeze(1), y - mean_y.unsqueeze(1)
     Zi = Xi * Xi + Yi * Yi
-    Mxy, Mxx, Myy = ((v * mask).sum(dim=1) / n_valid.clamp(min=eps) for v in (Xi * Yi, Xi * Xi, Yi * Yi))
-    Mxz, Myz, Mzz = ((v * mask).sum(dim=1) / n_valid.clamp(min=eps) for v in (Xi * Zi, Yi * Zi, Zi * Zi))
+    Mxy, Mxx, Myy = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Yi, Xi * Xi, Yi * Yi))
+    Mxz, Myz, Mzz = ((v * mask).sum(dim=1) / n_valid for v in (Xi * Zi, Yi * Zi, Zi * Zi))
 
     Mz = Mxx + Myy
     Cov_xy = Mxx * Myy - Mxy * Mxy
@@ -264,20 +255,20 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     improving_any = torch.ones_like(Mz, dtype=torch.bool)
     for _ in range(newton_iters):
         Dy = A1 + xk * (2 * A2 + 3 * A3 * xk)
-        xnew = xk - yk / torch.where(Dy.abs() < eps, torch.full_like(Dy, eps), Dy)
+        xnew = xk - yk / torch.where(Dy.abs() < eps, eps, Dy)
         ynew = A0 + xnew * (A1 + xnew * (A2 + xnew * A3))
         better = (ynew.abs() < yk.abs()) & torch.isfinite(xnew) & improving_any
         xk, yk = torch.where(better, xnew, xk), torch.where(better, ynew, yk)
         improving_any = improving_any & better
 
     DET = xk * xk - xk * Mz + Cov_xy
-    DET = torch.where(DET.abs() < eps, torch.full_like(DET, eps), DET)
+    DET = torch.where(DET.abs() < eps, eps, DET)
     Xc = (Mxz * (Myy - xk) - Myz * Mxy) / DET / 2
     Yc = (Myz * (Mxx - xk) - Mxz * Mxy) / DET / 2
     radius = torch.sqrt((Xc * Xc + Yc * Yc + Mz).clamp(min=0.0))
 
-    return (radius.masked_fill(~valid, float("nan")), 
-            Xc.masked_fill(~valid, float("nan")) + mean_x, 
+    return (radius.masked_fill(~valid, float("nan")),
+            Xc.masked_fill(~valid, float("nan")) + mean_x,
             Yc.masked_fill(~valid, float("nan")) + mean_y)
 
 def _unnormalize_hits(points):
@@ -400,7 +391,7 @@ def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1
 
     # travel inner -> outer: anticlockwise about the centre <=> R_s < 0
     anticlockwise = ((xin - xc) * (yout - yc) - (yin - yc) * (xout - xc)) > 0
-    sign_Rs = torch.where(anticlockwise, -torch.ones_like(radius), torch.ones_like(radius))
+    sign_Rs = torch.where(anticlockwise, -1.0, 1.0).to(radius.dtype)
     ux, uy = (xc - xin) / radius, (yc - yin) / radius
     sin_phi, cos_phi = sign_Rs * ux, -sign_Rs * uy
     q = sign_Rs * (1.0 if Bz >= 0 else -1.0)
@@ -412,7 +403,7 @@ def _track_params_from_hits(points, hit_r, is_assigned, noise_pt_threshold, Bz=1
 
     params = torch.stack([q / (pT + 1.0), theta, sin_phi, cos_phi], dim=-1)
     fit_ok = torch.isfinite(params).all(dim=-1)
-    filler = params.new_tensor([0.5, torch.pi / 2, 0.0, 1.0]).expand_as(params)
+    filler = params.new_tensor([0.5, torch.pi / 2, 0.0, 1.0])
     params = torch.where(fit_ok.unsqueeze(-1), params, filler)
     nan = torch.full_like(pT, float("nan"))
     pT, radius, beam_dca = (torch.where(fit_ok, v, nan) for v in (pT, radius, beam_dca))
