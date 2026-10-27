@@ -14,8 +14,8 @@ architecture as train_track_finding.py's d9_m1_k30_p20). Run from train/downstre
                  {checkpoint_dir}/{track_config}_nerf_tracking_head_d{eventnumber}_{track_run_num}_seed{seed}_checkpoint.pth
                  where track_config is the --config the head was trained with (default d9_m1_k30_p20)
 
-The vertex options --bz and --outlier_dca_cut fall back to the YAML keys vertex_bz and
-vertex_outlier_dca_cut, then to the defaults in vertex_reconstruction_trainer.py / vertexhead.py.
+The vertex option --bz falls back to the YAML key vertex_bz, then to the default in
+vertex_reconstruction_trainer.py.
 """
 import os
 import sys
@@ -74,9 +74,6 @@ def main():
                    help="must match the track head's --eventnumber for the derived checkpoint name")
     p.add_argument("--max_events", default=None, type=int)
     p.add_argument("--bz", default=None, type=float, help="solenoid field, Tesla; default: YAML vertex_bz or 1.4")
-    p.add_argument("--outlier_dca_cut", default=None, type=float,
-                   help="drop tracks passing farther than this (cm) from the vertex, worst first, and refit; "
-                        "0 disables; default: YAML vertex_outlier_dca_cut or vertexhead.OUTLIER_DCA_CUT")
     p.add_argument("--data_root_test", default=None)
     p.add_argument("--save_csv", action="store_true",
                    help="also write eval_track_finding.py's per-point CSV, with vtx_x/y/z the reconstructed "
@@ -112,8 +109,6 @@ def main():
     # --- vertex options: CLI flag if given, else YAML key, else trainer default ---
     if args.bz is not None:
         params.vertex_bz = args.bz
-    if args.outlier_dca_cut is not None:
-        params.vertex_outlier_dca_cut = args.outlier_dca_cut
     if args.data_root_test:
         params.data_root_test = args.data_root_test
 
@@ -156,7 +151,6 @@ def save_results(result, trainer, params, args, track_ckpt):
         "pretrained_ckpt": params.pretrained_ckpt,
         "track_ckpt": os.path.abspath(track_ckpt),
         "bz": trainer.vertex_head.Bz,
-        "outlier_dca_cut": trainer.vertex_head.outlier_dca_cut,
         "max_events": args.max_events,
         "metrics": metrics,
     }
