@@ -140,7 +140,7 @@ def save_results(result, trainer, params, args, track_ckpt):
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    trainer.log_infile("[vertex] " + json.dumps(metrics))
+    trainer.log_infile("[vertex] " + json.dumps(result["metrics"]))
     print(f"[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
 
     if "per_point" in result:
