@@ -68,7 +68,6 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
     """
     assign = assign_points_to_masks({"pred_probs": class_probs, "pred_masks": mask_probs.permute(0, 2, 1)},
                                     option=2)["assignments"]
-    confidence = mask_probs.max(dim=-1).values
     b, n = mask.nonzero(as_tuple=True)
 
     def col(t):
@@ -87,7 +86,7 @@ def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, 
         "charge": reg_cols["charge"], "energy": reg_cols["energy"],
         "seg_target": label.to(mask.device)[b, n].cpu().numpy(),
         "pred_assignment": assign[b, n].cpu().numpy(),
-        "confidence": col(confidence),
+        "confidence": col(mask_probs.max(dim=-1).values),
     }
     # TESTING ONLY
     residual = vertex.double() - truth_vertex.double()
@@ -115,23 +114,16 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
             num_prototypes=self.params.max_gt_classes,
             embed_method=getattr(self.params, "embed_method", "add")).to(self.device)
 
-        # base load_checkpoint uses strict=False, which would accept a mismatched head silently
         sd = torch.load(track_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
         sd = {k.replace("module.", ""): v for k, v in sd.items()}
-        missing, unexpected = self.down_model.load_state_dict(sd, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(f"track head checkpoint does not match the built head: "
-                               f"missing={missing[:5]} unexpected={unexpected[:5]}")
+        
+        # checks for missing keys and rejects mismatched checkpoints
+        self.down_model.load_state_dict(sd)
+ 
         self.down_model.eval()
-        for p in self.down_model.parameters():
-            p.requires_grad_(False)
 
         self.vertex_head = VertexHead(
-            learn_weights=False,
-            use_helix=bool(getattr(self.params, "vertex_use_helix", True)),
             Bz=float(getattr(self.params, "vertex_bz", 1.4)),
-            scaling_factor=float(getattr(self.params, "vertex_scaling_factor", 100.0)),
-            noise_pt_threshold=float(getattr(self.params, "vertex_noise_pt_threshold", 0.25)),
         ).to(self.device).eval()
 
     @torch.no_grad()
@@ -172,19 +164,15 @@ class VertexTrainer(track_finding_trainer.DownstreamTrainer):
                     out = self.down_model(grouped, torch.stack(pre_embed), pretrain=True, padding_mask=mask)
                 else:
                     out = self.down_model(grouped, feature=None)
-            class_probs, mask_probs = out["class_probs"].float(), out["mask_probs"].float()
-            mask_probs = mask_probs * mask.unsqueeze(-1)
 
             result = self.vertex_head(
-                class_probs=class_probs, mask_probs=mask_probs,
+                class_probs=out["class_probs"].float(), mask_probs=out["mask_probs"].float(),
                 points=grouped, padding_mask=mask)
 
             # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
-            vtx_r = torch.hypot(reg[..., 3], reg[..., 4])
-            truth = get_vertex_label(reg, valid_tracks=(vtx_r < 1.0) & mask)
+            truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask)
             if save_csv:
-                truth_vertex = torch.where(truth["vertex_valid"].unsqueeze(-1), truth["vertex_target"],
-                                           torch.full_like(truth["vertex_target"], float("nan")))
+                truth_vertex = truth["vertex_target"].masked_fill(~truth["vertex_valid"][:, None], float("nan"))
                 per_point.append(per_point_columns(step, grouped, label, reg, mask, out["class_probs"],
                                                    out["mask_probs"], result["vertex_estimate"], truth_vertex))
             est.append(result["vertex_estimate"])

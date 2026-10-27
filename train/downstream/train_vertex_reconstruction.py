@@ -30,14 +30,6 @@ sys.path.append('../..')
 from fm4npp.utils import YParams
 from vertex_reconstruction_trainer import VertexTrainer
 
-
-def _get(params, key, default=None):
-    try:
-        return getattr(params, key)
-    except Exception:
-        return default
-
-
 def default_track_ckpt(params, config, eventnumber, track_run_num, seed, usepretrain=True):
     """Checkpoint name train_track_finding.py + track_finding_trainer.py write for these args."""
     base = f"{config}_nerf_tracking_head_d{eventnumber}_{track_run_num}_seed{seed}"
@@ -87,7 +79,7 @@ def main():
     # --- checkpoints: CLI overrides YAML / naming convention ---
     if args.pretrained_ckpt:
         params.pretrained_ckpt = args.pretrained_ckpt
-    elif not _get(params, "pretrained_ckpt"):
+    elif not getattr(params, "pretrained_ckpt", None):
         sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
 
     track_ckpt = args.track_ckpt or default_track_ckpt(
@@ -125,26 +117,16 @@ def main():
     trainer.cleanup()
 
 
-def _jsonable(v):
-    if hasattr(v, "item") and getattr(v, "numel", lambda: 1)() == 1:
-        return v.item()
-    if hasattr(v, "tolist"):
-        return v.tolist()
-    return v
-
-
 def save_results(result, trainer, params, args, track_ckpt):
     """Write per-event vertices (.npz) and metrics (.json) to the run dir; append metrics to the performance log."""
     out_dir = params.experiment_dir            # {root_dir}/{config}/{run_num}, set by launch()
-    tag = "vertex"
 
-    npz_path = os.path.join(out_dir, f"{tag}_results.npz")
+    npz_path = os.path.join(out_dir, "vertex_results.npz")
     np.savez(npz_path,
              vertex_estimate=result["vertex_estimate"].float().numpy(),
              vertex_target=result["vertex_target"].float().numpy(),
              fit_is_valid=result["fit_is_valid"].numpy())
 
-    metrics = {k: _jsonable(v) for k, v in result["metrics"].items()}
     summary = {
         "config": args.config,
         "yaml_config": os.path.abspath(args.yaml_config),
@@ -152,9 +134,9 @@ def save_results(result, trainer, params, args, track_ckpt):
         "track_ckpt": os.path.abspath(track_ckpt),
         "bz": trainer.vertex_head.Bz,
         "max_events": args.max_events,
-        "metrics": metrics,
+        "metrics": result["metrics"],
     }
-    json_path = os.path.join(out_dir, f"{tag}_metrics.json")
+    json_path = os.path.join(out_dir, "vertex_metrics.json")
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -162,7 +144,7 @@ def save_results(result, trainer, params, args, track_ckpt):
     print(f"[vertex] wrote {npz_path}\n[vertex] wrote {json_path}")
 
     if "per_point" in result:
-        csv_path = args.csv_output_path or os.path.join(out_dir, f"{tag}_per_point_data.csv")
+        csv_path = args.csv_output_path or os.path.join(out_dir, "vertex_per_point_data.csv")
         write_per_point_csv(result["per_point"], csv_path)
         print(f"[vertex] wrote {csv_path} ({len(result['per_point']['batch_idx'])} points)")
 
@@ -173,11 +155,10 @@ def write_per_point_csv(columns, path):
     track_finding_trainer.inference(): shortest round-trip floats, NaN as an empty field,
     os.linesep line endings. No pandas dependency.
     """
-    names = list(columns)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f, lineterminator=os.linesep)
-        writer.writerow(names)
-        for row in zip(*(columns[n].tolist() for n in names)):
+        writer.writerow(columns)
+        for row in zip(*(c.tolist() for c in columns.values())):
             writer.writerow(["" if v != v else v for v in row])    # v != v only for NaN
 
 
