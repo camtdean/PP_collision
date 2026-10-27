@@ -1,292 +1,194 @@
 """
-Route A trainer/evaluator: attaches VertexHead to the OUTPUT of an
-already-trained track-finding head.
+vertex_reconstruction_trainer.py
+================================
+Runs VertexHead after an already-trained track-finding head.
 
-VertexHead is now the closed-form geometric fit (see vertex_head.py). Its
-default configuration (learn_weights=False) has ZERO learnable parameters --
-it's a fixed linear-algebra solve, not a network -- so there is nothing to
-train in that mode; this script becomes a pure evaluation loop and skips
-optimizer/backward entirely. Set learn_weights=True on VertexHead (a small
-MLP that reweights tracks before the same linear solve) if you want a
-trainable variant; the loop below handles both without changes.
+    frozen backbone -> frozen track finder (train_track_finding.py checkpoint)
+        -> hit clusters -> VertexHead (whole batch)
 
-Three tiers, in order of "how much this task retrains":
-    1. self.model        -- the foundation-model backbone (MambaGPT/etc).
-                             Frozen. Always was, for every downstream task.
-    2. self.track_model  -- the ALREADY-TRAINED MambaAttentionHead track
-                             finder. Frozen HERE specifically for Route A:
-                             we're building a new task on top of a solved
-                             one, not re-learning it.
-    3. self.down_model   -- VertexHead. Zero params by default; only
-                             trainable at all if learn_weights=True.
+Config, backbone, pretrained weights and data loaders all come from
+track_finding_trainer.DownstreamTrainer.launch(). VertexHead(learn_weights=False) has no
+parameters, so this evaluates; nothing is trained.
 
-DDP setup, full logging/checkpoint-rotation ceremony, and early-stopping
-bookkeeping are trimmed for clarity -- port those back in from
-track_finding_trainer.py's __init__/init_exp_dir if you need them, they
-don't change for this task.
+The track finder outputs hit clusters but no track parameters or quality labels; VertexHead
+fits both from each predicted cluster's hits. Truth is used only to score the result.
+
+With save_csv, run_vertexing also rebuilds track_finding_trainer.inference()'s per-point CSV
+row for row (same columns, order and values), except vtx_x, vtx_y, vtx_z hold the event's
+reconstructed vertex (NaN where the fit is invalid) instead of the truth production vertex.
+TESTING ONLY truth columns follow, prefixed test_ (see TEST_COLUMNS); they are not
+reconstruction output and must not be used as such.
 """
 
-import os
-import time
 import numpy as np
 import torch
-import torch.optim as optim
+from contextlib import nullcontext
+from torch.amp import autocast
 from tqdm import tqdm
 
-from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
+from train.downstream import track_finding_trainer
+from train.downstream.vertexhead import VertexHead
+from trackinghead import MambaAttentionHead
+from downstream_util import get_vertex_label
+from loss import compute_vertex_metrics, assign_points_to_masks
 
-from model import MambaAttentionHead
-from vertex_head import VertexHead
-from vertex_util import get_vertex_label
-from vertex_loss import vertex_reg_loss, compute_vertex_metrics
+PAD_VALUE = -100
 
+# track_finding_trainer.inference()'s per-point CSV columns, in its order
+PER_POINT_COLUMNS = ("batch_idx", "point_idx", "E_norm", "eta_norm", "phi_norm", "r_norm",
+                     "px", "py", "pz", "vtx_x", "vtx_y", "vtx_z", "charge", "energy",
+                     "seg_target", "pred_assignment", "confidence")
 
-class VertexTrainer:
+# TESTING ONLY, appended after PER_POINT_COLUMNS: the event's truth vertex (get_vertex_label, the
+# one the metrics score against) and the reconstructed-minus-truth residual, all cm; NaN where
+# either vertex is undefined
+TEST_COLUMNS = ("test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z",
+                "test_residual_x", "test_residual_y", "test_residual_z", "test_residual_3d")
 
-    def __init__(self, params, args):
-        self.params = params
-        self.root_dir = args.root_dir
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.log_to_screen = True
-        self.iters = 0
+CSV_COLUMNS = PER_POINT_COLUMNS + TEST_COLUMNS
 
-    # ------------------------------------------------------------------
-    # Model setup
-    # ------------------------------------------------------------------
-    def launch(self):
+def per_point_columns(step, grouped, label, reg, mask, class_probs, mask_probs, vertex, truth_vertex):
+    """
+    One batch of track_finding_trainer.inference()'s per-point CSV, with the reconstructed vertex.
+
+    Args:
+        step: data-loader step, written as batch_idx (as inference() does).
+        grouped: (B, N, 4) normalized (E, eta, phi, r) hits.
+        label: (B, N) truth track ID per hit.
+        reg: (B, N, 8) truth (px, py, pz, vx, vy, vz, q, e) per hit.
+        mask: (B, N) bool, True = real hit.
+        class_probs, mask_probs: track head outputs exactly as it returned them (bf16 under
+            autocast); inference() assigns hits from these, so rounding matches.
+        vertex: (B, 3) reconstructed vertex per event.
+        truth_vertex: (B, 3) truth vertex per event, NaN where undefined; TESTING ONLY.
+
+    Returns:
+        dict of column name -> 1-D numpy array in CSV_COLUMNS order, one entry per real hit,
+        ordered by event then hit.
+    """
+    assign = assign_points_to_masks({"pred_probs": class_probs, "pred_masks": mask_probs.permute(0, 2, 1)},
+                                    option=2)["assignments"]
+    b, n = mask.nonzero(as_tuple=True)
+
+    def col(t):
+        # float64 (exact for bf16 and float32) so the CSV prints each value as inference()'s .item() does
+        t = t[b, n] if t.dim() == 2 else t[b]
+        return t.double().cpu().numpy()
+
+    point_cols = {name: col(grouped[..., k]) for k, name in enumerate(("E_norm", "eta_norm", "phi_norm", "r_norm"))}
+    reg_cols = {name: col(reg[..., k]) for k, name in enumerate(("px", "py", "pz", "vx", "vy", "vz", "charge", "energy"))}
+    columns = {
+        "batch_idx": np.full(len(b), step, dtype=np.int64),
+        "point_idx": n.cpu().numpy(),
+        **point_cols,
+        "px": reg_cols["px"], "py": reg_cols["py"], "pz": reg_cols["pz"],
+        "vtx_x": col(vertex[:, 0]), "vtx_y": col(vertex[:, 1]), "vtx_z": col(vertex[:, 2]),
+        "charge": reg_cols["charge"], "energy": reg_cols["energy"],
+        "seg_target": label.to(mask.device)[b, n].cpu().numpy(),
+        "pred_assignment": assign[b, n].cpu().numpy(),
+        "confidence": col(mask_probs.max(dim=-1).values),
+    }
+    # TESTING ONLY
+    residual = vertex.double() - truth_vertex.double()
+    for k, axis in enumerate("xyz"):
+        columns[f"test_truth_vtx_{axis}"] = col(truth_vertex[:, k])
+        columns[f"test_residual_{axis}"] = col(residual[:, k])
+    columns["test_residual_3d"] = col(residual.norm(dim=-1))
+    return {k: columns[k] for k in CSV_COLUMNS}
+
+class VertexTrainer(track_finding_trainer.DownstreamTrainer):
+
+    def setup_vertexing(self, track_ckpt):
         """
-        Loads the two frozen tiers (foundation backbone + trained track
-        finder) and builds VertexHead. Call once, before train()/evaluate().
-        """
-        # --- Tier 1: frozen foundation-model backbone -------------------
-        from fm4npp.models.mambagpt import MambaGPT  # or whichever variant params selects
-        self.model = MambaGPT(
-            embed_dim=self.params.embed_dim,
-            num_layers=self.params.num_layers_backbone,
-            d_state=self.params.d_state,
-            embed_method=self.params.embed_method,
-            pe_method=self.params.pe_method,
-        ).to(self.device)
-        self._load_weights_only(self.model, self.params.pretrained_ckpt, key="model_state")
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
+        Build the track head exactly as track_finding_trainer does, load it strictly, build VertexHead.
+        Call after launch().
 
-        # --- Tier 2: frozen, ALREADY-TRAINED track finder ----------------
-        self.track_model = MambaAttentionHead(
-            input_dim=self.params.embed_dim,
-            num_feature_layers=self.params.num_layers_backbone,
+        Args:
+            track_ckpt: path to a train_track_finding.py checkpoint.
+        """
+        n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
+        self.down_model = MambaAttentionHead(
+            input_dim=self.params.embed_dim, num_layers=0,
+            num_embedder_layers=self.params.num_embedder_layers,
+            d_state=64, d_conv=4, expand=2, num_feature_layers=n_feat,
             num_prototypes=self.params.max_gt_classes,
-            embed_method=self.params.embed_method,
-        ).to(self.device)
-        self._load_weights_only(self.track_model, self.params.track_finder_ckpt, key="model_state_dict")
-        self.track_model.eval()
-        for p in self.track_model.parameters():
-            p.requires_grad_(False)
+            embed_method=getattr(self.params, "embed_method", "add")).to(self.device)
 
-        # --- Tier 3: the geometric vertex fit ----------------------------
-        self.down_model = VertexHead(
-            learn_weights=getattr(self.params, "vertex_learn_weights", False),
-        ).to(self.device)
-
-        trainable_params = [p for p in self.down_model.parameters() if p.requires_grad]
-        print(f"Total trainable parameters in VertexHead: {sum(p.numel() for p in trainable_params)}")
-
-        if trainable_params:
-            self.down_optimizer = optim.AdamW(trainable_params, lr=self.params.max_lr, weight_decay=0.0001)
-            self.down_scheduler = CosineAnnealingWarmupRestarts(
-                self.down_optimizer,
-                first_cycle_steps=200,
-                max_lr=self.params.max_lr,
-                min_lr=self.params.min_lr,
-                warmup_steps=20,
-            )
-        else:
-            # Zero-parameter default: nothing to optimize. train() below
-            # detects this and just evaluates once instead of looping
-            # epochs against an empty optimizer.
-            self.down_optimizer = None
-            self.down_scheduler = None
-            if self.log_to_screen:
-                print("VertexHead has no trainable parameters (learn_weights=False) -- "
-                      "train() will run a single evaluation pass, not an optimization loop.")
-
-        self.train_data_loader, self.val_data_loader = self._get_data_loaders()
-
-        self.best_loss = np.inf
-        self.down_results = {
-            "train": [], "val": [], "chi2": [], "fit_valid_rate": [],
-            "accuracy@0.5cm": [], "accuracy@1.0cm": [], "accuracy@2.0cm": [],
-            "mae_x": [], "mae_y": [], "mae_z": [], "rmse_3d": [],
-        }
-
-    def _load_weights_only(self, module, ckpt_path, key):
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        state_dict = {k.replace("module.", ""): v for k, v in ckpt[key].items()}
-        module.load_state_dict(state_dict)
-        if self.log_to_screen:
-            print(f"Loaded frozen weights for {module.__class__.__name__} from {ckpt_path}")
-
-    def _get_data_loaders(self):
-        # Wire this up to whatever get_data_loader(...) your repo already
-        # uses for track finding -- the batch needs the same fields:
-        # points/grouped (B,N,4) and reg (B,N,8) for get_vertex_label.
-        raise NotImplementedError("reuse the existing get_data_loader(...) used by track_finding_trainer.py")
-
-    # ------------------------------------------------------------------
-    # Forward through the frozen tiers -> VertexHead
-    # ------------------------------------------------------------------
-    def _forward(self, grouped, mask):
-        """
-        grouped: (B, N, 4) raw points, mask: (B, N) bool (points[...,0] != -100)
-        Returns VertexHead's output dict (vertex_estimate, chi_square, fit_is_valid, ...).
-        """
-        with torch.no_grad():
-            _, pre_embed, _ = self.model(grouped, return_z=True)
-            feature = torch.stack(pre_embed)  # (S, B, N, D)
-            track_out = self.track_model(grouped, feature, pretrain=True, padding_mask=mask)
-
-        # Only matters at all if learn_weights=True -- otherwise this call
-        # has no parameters to take gradients w.r.t. anyway.
-        vertex_out = self.down_model(
-            class_probs=track_out["class_probs"],
-            track_reg_result=track_out["track_reg_result"],
-            mask_probs=track_out["mask_probs"],
-            points=grouped,
-            padding_mask=mask,
-        )
-        return vertex_out
-
-    def _combined_valid(self, vertex_out, vertex_label):
-        """
-        An event only gets scored if BOTH the ground truth had a defined
-        vertex (vertex_label['vertex_valid']) AND the geometric fit itself
-        had enough independent tracks to solve
-        (vertex_out['fit_is_valid']) -- vertex_estimate is NaN otherwise,
-        which would silently corrupt a mean if included.
-        """
-        return vertex_label["vertex_valid"] & vertex_out["fit_is_valid"]
-
-    # ------------------------------------------------------------------
-    # Training loop (only exercises the optimizer if learn_weights=True)
-    # ------------------------------------------------------------------
-    def train(self, num_epochs=None):
-        if self.down_optimizer is None:
-            print("No trainable parameters -- running a single evaluation pass instead of training.")
-            self._validate_one_epoch()
-            self._report_epoch(epoch=0, train_loss=float("nan"), t0=time.time())
-            return
-
-        num_epochs = num_epochs or self.params.max_epochs
-        for epoch in range(num_epochs):
-            t0 = time.time()
-            self._train_one_epoch()
-            val_loss = self._validate_one_epoch()
-            train_loss = np.mean(self.down_results["train"]) if self.down_results["train"] else float("nan")
-            self._report_epoch(epoch, train_loss, t0)
-
-            if val_loss < self.best_loss:
-                self.best_loss = val_loss
-                self._save_checkpoint(epoch, is_best=True, loss=val_loss)
-
-            self.down_scheduler.step()
-            for k in self.down_results:
-                self.down_results[k] = []
-
-    def _report_epoch(self, epoch, train_loss, t0):
-        val_loss = np.mean(self.down_results["val"])
-        acc_1cm = np.mean(self.down_results["accuracy@1.0cm"])
-        mae_x = np.mean(self.down_results["mae_x"])
-        mae_y = np.mean(self.down_results["mae_y"])
-        mae_z = np.mean(self.down_results["mae_z"])
-        rmse_3d = np.mean(self.down_results["rmse_3d"])
-        chi2 = np.mean(self.down_results["chi2"])
-        fit_valid_rate = np.mean(self.down_results["fit_valid_rate"])
-
-        # Same shape of per-epoch log line as track_finding_trainer.py's
-        # "Epoch\tTrain_Loss\tVal_Loss\tARI\t...", with chi2 (a real
-        # goodness-of-fit number, not a learned metric) and fit_valid_rate
-        # (how often the event even had >=2 usable tracks) alongside the
-        # regression metrics.
-        print(
-            f"Epoch {epoch}\tTrain_Loss {train_loss:.4f}\tVal_Loss {val_loss:.4f}\t"
-            f"Acc@1cm {acc_1cm:.4f}\tMAE(x,y,z) ({mae_x:.3f},{mae_y:.3f},{mae_z:.3f})\t"
-            f"RMSE_3D {rmse_3d:.4f}\tChi2 {chi2:.3f}\tFit_valid_rate {fit_valid_rate:.3f}\t"
-            f"Time {time.time() - t0:.1f}s"
-        )
-
-    def _train_one_epoch(self):
-        self.track_model.eval()
-        self.model.eval()
-        self.down_model.train()
-
-        for i, inputdict in enumerate(tqdm(self.train_data_loader)):
-            self.iters += 1
-            grouped = inputdict["points"].to(self.device)
-            b, c = grouped.size(0), grouped.size(-1)
-            grouped = grouped.reshape(b, -1, c)
-            mask = grouped[..., 0] != -100
-            reg = inputdict["reg_target"].to(self.device)  # (B, N, 8)
-
-            vertex_label = get_vertex_label(reg)
-            vertex_out = self._forward(grouped, mask)
-            valid = self._combined_valid(vertex_out, vertex_label)
-
-            self.down_optimizer.zero_grad()
-            losses = vertex_reg_loss(vertex_out["vertex_estimate"], vertex_label["vertex_target"], valid)
-            loss = losses["loss"]
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.down_model.parameters() if p.requires_grad], max_norm=1.0
-            )
-            self.down_optimizer.step()
-
-            self.down_results["train"].append(loss.item())
-
-    @torch.no_grad()
-    def _validate_one_epoch(self):
-        self.track_model.eval()
-        self.model.eval()
+        sd = torch.load(track_ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        
+        # checks for missing keys and rejects mismatched checkpoints
+        self.down_model.load_state_dict(sd)
+ 
         self.down_model.eval()
 
-        for i, inputdict in enumerate(tqdm(self.val_data_loader)):
-            grouped = inputdict["points"].to(self.device)
+        self.vertex_head = VertexHead(
+            Bz=float(getattr(self.params, "vertex_bz", 1.4)),
+        ).to(self.device).eval()
+
+    @torch.no_grad()
+    def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
+        """
+        Backbone -> track head -> VertexHead over the validation loader.
+
+        Args:
+            pretrain: True = frozen-backbone features (as trained); False = head on raw points.
+            max_events: stop after this many events; None = whole loader.
+            save_csv: also build the per-point CSV columns (see per_point_columns).
+
+        Returns:
+            dict:
+                metrics: compute_vertex_metrics output plus n_events and fit_valid_rate.
+                vertex_estimate, vertex_target: (n_events, 3).
+                fit_is_valid: (n_events,) bool, fit valid and truth vertex defined.
+                per_point: dict column -> numpy array, inference()'s per-point CSV with the
+                    reconstructed vertex, then the TESTING ONLY truth columns; only with save_csv.
+        """
+        self.model.eval()
+        amp = torch.cuda.is_available() and self.use_amp
+        est, tgt, ok, per_point = [], [], [], []
+
+        for step, batch in enumerate(tqdm(self.val_data_loader)):
+            if len(batch) != 4:
+                raise RuntimeError("loader must yield (grouped, label, knearest, reg); "
+                                   "set params.return_reg_test = True before launch()")
+            grouped, label, _, reg = batch
             b, c = grouped.size(0), grouped.size(-1)
-            grouped = grouped.reshape(b, -1, c)
-            mask = grouped[..., 0] != -100
-            reg = inputdict["reg_target"].to(self.device)
+            grouped = grouped.reshape(b, -1, c).to(self.device)
+            reg = reg.to(self.device)
+            mask = grouped[..., 0] != PAD_VALUE
 
-            vertex_label = get_vertex_label(reg)
-            vertex_out = self._forward(grouped, mask)
-            valid = self._combined_valid(vertex_out, vertex_label)
+            with autocast("cuda", dtype=torch.bfloat16) if amp else nullcontext():
+                if pretrain:
+                    _, pre_embed, _ = self.model(grouped, return_z=True)
+                    out = self.down_model(grouped, torch.stack(pre_embed), pretrain=True, padding_mask=mask)
+                else:
+                    out = self.down_model(grouped, feature=None)
 
-            losses = vertex_reg_loss(vertex_out["vertex_estimate"], vertex_label["vertex_target"], valid)
-            metrics = compute_vertex_metrics(vertex_out["vertex_estimate"], vertex_label["vertex_target"], valid)
+            result = self.vertex_head(
+                class_probs=out["class_probs"].float(), mask_probs=out["mask_probs"].float(),
+                points=grouped, padding_mask=mask)
 
-            self.down_results["val"].append(losses["loss"].item())
-            self.down_results["chi2"].append(vertex_out["chi_square"][valid].mean().item() if valid.any() else float("nan"))
-            self.down_results["fit_valid_rate"].append(vertex_out["fit_is_valid"].float().mean().item())
-            for k, v in metrics.items():
-                self.down_results[k].append(v)
+            # padded rows are zeros and would pass get_vertex_label's 1 cm cut; exclude them
+            truth = get_vertex_label(reg, valid_tracks=(torch.hypot(reg[..., 3], reg[..., 4]) < 1.0) & mask)
+            if save_csv:
+                truth_vertex = truth["vertex_target"].masked_fill(~truth["vertex_valid"][:, None], float("nan"))
+                per_point.append(per_point_columns(step, grouped, label, reg, mask, out["class_probs"],
+                                                   out["mask_probs"], result["vertex_estimate"], truth_vertex))
+            est.append(result["vertex_estimate"])
+            tgt.append(truth["vertex_target"])
+            ok.append(result["fit_is_valid"] & truth["vertex_valid"])
+            if max_events and sum(len(x) for x in est) >= max_events:
+                break
 
-        return float(np.mean(self.down_results["val"]))
-
-    # ------------------------------------------------------------------
-    # Checkpointing -- only meaningful if learn_weights=True; harmless
-    # (and small) to call either way.
-    # ------------------------------------------------------------------
-    def _save_checkpoint(self, epoch, is_best, loss):
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": self.down_model.state_dict(),
-            "optimizer_state_dict": self.down_optimizer.state_dict() if self.down_optimizer else None,
-            "scheduler_state_dict": self.down_scheduler.state_dict() if self.down_scheduler else None,
-            "best_loss": self.best_loss,
-            "current_loss": loss,
-            "params": vars(self.params),
-        }
-        os.makedirs(self.params.checkpoint_dir, exist_ok=True)
-        fname = "vertex_head_checkpoint.pth"
-        torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, fname))
+        est, tgt, ok = torch.cat(est), torch.cat(tgt), torch.cat(ok)
+        metrics = compute_vertex_metrics(est, tgt, ok)
+        metrics.update(n_events=len(ok), fit_valid_rate=ok.float().mean().item())
         if self.log_to_screen:
-            print(f"Saved {'best ' if is_best else ''}checkpoint at epoch {epoch} with loss {loss:.4f}")
+            print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                          for k, v in metrics.items()))
+        output = {"metrics": metrics, "vertex_estimate": est.cpu(), "vertex_target": tgt.cpu(),
+                  "fit_is_valid": ok.cpu()}
+        if save_csv:
+            output["per_point"] = {k: np.concatenate([p[k] for p in per_point]) for k in CSV_COLUMNS}
+        return output

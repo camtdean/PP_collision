@@ -612,16 +612,18 @@ class DownstreamTrainer():
                             confidence = max_probs[batch_idx, point_idx].item()
                             
                             # Get point coordinates
-                            point_coords = grouped[batch_idx, point_idx]  # 4 values (E, x, y, z)
-                            E, x, y, z = point_coords[0].item(), point_coords[1].item(), point_coords[2].item(), point_coords[3].item()
+                            # 4 values, normalized as TPCBatchDataset yields them: z-scored E,
+                            # and eta, phi, transverse r each min-max scaled to [0, 1]
+                            point_coords = grouped[batch_idx, point_idx]
+                            E, eta, phi, r = point_coords[0].item(), point_coords[1].item(), point_coords[2].item(), point_coords[3].item()
                             
                             csv_data.append({
                                 'batch_idx': i,  # Global batch index from data loader
                                 'point_idx': point_idx,
-                                'E': E,
-                                'x': x, 
-                                'y': y,
-                                'z': z,
+                                'E_norm': E,
+                                'eta_norm': eta,
+                                'phi_norm': phi,
+                                'r_norm': r,
                                 'px': px,
                                 'py': py,
                                 'pz': pz,
