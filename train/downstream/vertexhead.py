@@ -143,8 +143,8 @@ def _fit_vertex_by_helix_closest_approach(
 
     for _ in range(n_iterations):
         diff = PV[:, None, :2] - circle_centre
-        norm = diff.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-        pca_circle = circle_centre + radius.unsqueeze(-1) * diff / norm
+        pca_circle = (circle_centre + radius.unsqueeze(-1) * diff / 
+                      diff.norm(dim=-1, keepdim=True).clamp(min=1e-12))
 
         angle_pca = torch.atan2(diff[..., 1], diff[..., 0])
 
@@ -168,7 +168,7 @@ def _fit_vertex_by_helix_closest_approach(
         second_point_pca = torch.cat([new_xy, new_z.unsqueeze(-1)], dim=-1)
 
         raw_tangent = second_point_pca - pca
-        tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        tangent = raw_tangent / raw_tangent.norm(dim=-1, keepdim=True).clamp(min=1e-12)
 
         result = _fit_vertex_by_closest_approach(pca, tangent, track_weight, **linear_fit_kwargs)
 
@@ -212,8 +212,8 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     ssd_v  = (dv * dv * mask).sum(dim=1)
     ssd_uv = (du * dv * mask).sum(dim=1)
 
-    ssd_uv_safe = torch.where(ssd_uv.abs() < eps, eps, ssd_uv)
-    slope = (ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 / ssd_uv_safe
+    slope = ((ssd_v - ssd_u + torch.sqrt((ssd_v - ssd_u) ** 2 + 4 * ssd_uv ** 2)) / 2.0 /
+              torch.where(ssd_uv.abs() < eps, eps, ssd_uv))
     intercept = mean_v - slope * mean_u
 
     slope = slope.masked_fill(~valid, float("nan"))
