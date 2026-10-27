@@ -98,7 +98,7 @@ def _fit_vertex_by_helix_closest_approach(
     z0,
     track_weight,
     n_iterations=100,
-    seed_vertex=None,
+    linear_fit=None,
     d_angle=0.005,
     is_cosmics = False,
     **linear_fit_kwargs,
@@ -113,26 +113,28 @@ def _fit_vertex_by_helix_closest_approach(
         zslope, z0: (n_events, n_tracks) z line, z = zslope * r + z0 (r -> x if is_cosmics).
             The circle and z line come from _track_params_from_hits.
         track_weight: (n_events, n_tracks) non-negative weight; 0 = track ignored.
-        n_iterations: maximum iterations; stops early once every event moves < 1e-4.
-        seed_vertex: (n_events, 3) starting vertex; origin if None.
+        n_iterations: maximum iterations; stops early once every event moves < 1e-4. Below 1,
+            linear_fit is returned unchanged.
+        linear_fit: _fit_vertex_by_closest_approach's output dict for the same tracks; its
+            vertex_estimate is the starting vertex (origin where NaN, or if None).
         d_angle: angular step (radians) along the circle used to form the tangent.
         is_cosmics: the z line is z against x instead of z against transverse radius r.
         **linear_fit_kwargs: passed to _fit_vertex_by_closest_approach.
 
     Returns:
-        dict, same keys as _fit_vertex_by_closest_approach, from the last iteration.
-        Tracks without a fitted circle and z line (NaN) are excluded from it and get NaN
-        track_dca and track_closest_approach_point.
+        dict, same keys as _fit_vertex_by_closest_approach, from the last iteration (linear_fit
+        itself when n_iterations < 1). Tracks without a fitted circle and z line (NaN) are
+        excluded from it and get NaN track_dca and track_closest_approach_point.
     """
     n_events = R_s.shape[0]
 
-    if seed_vertex is None:
+    if linear_fit is None:
         PV = torch.zeros(n_events, 3, dtype=R_s.dtype, device=R_s.device)
     else:
-        PV = seed_vertex.nan_to_num()    # an invalid seed (NaN) starts from the origin
+        PV = linear_fit["vertex_estimate"].nan_to_num()    # an invalid seed (NaN) starts from the origin
 
     if n_iterations < 1:
-        return seed_vertex
+        return linear_fit
 
     still_moving = torch.ones(n_events, dtype=torch.bool, device=R_s.device)
 
@@ -180,20 +182,17 @@ def _fit_vertex_by_helix_closest_approach(
         new_PV = result["vertex_estimate"]
         fit_is_valid = result["fit_is_valid"]
 
+        still_moving = still_moving & fit_is_valid & ((new_PV - PV).norm(dim=-1) > 1e-4)
+        
         # advance PV only where the fit is valid, so one bad event can't spread NaN
         PV = torch.where(fit_is_valid.unsqueeze(-1), new_PV, PV)
-
-        still_moving = still_moving & fit_is_valid & ((new_PV - PV).norm(dim=-1) > 1e-4)
+       
         if not still_moving.any():
             break
 
     result["track_dca"] = result["track_dca"].masked_fill(failed, float("nan"))
     result["track_closest_approach_point"] = result["track_closest_approach_point"].masked_fill(failed.unsqueeze(-1), float("nan"))
     return result
-
-def _masked_mean(value, mask, denom, eps=1e-12):
-    """sum(value * mask) over hits, divided by denom (floored at eps)."""
-    return (value * mask).sum(dim=1) / denom.clamp(min=eps)
 
 def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     """
@@ -212,8 +211,8 @@ def _line_fit(u, v, mask, min_hits=2, eps=1e-12):
     n_valid = mask.sum(dim=1)
     valid = n_valid >= min_hits
 
-    mean_u = _masked_mean(u, mask, n_valid, eps)
-    mean_v = _masked_mean(v, mask, n_valid, eps)
+    mean_u = (u * mask).sum(dim=1) / n_valid.clamp(min=eps)
+    mean_v = (v * mask).sum(dim=1) / n_valid.clamp(min=eps)
 
     du = u - mean_u.unsqueeze(1)
     dv = v - mean_v.unsqueeze(1)
@@ -247,12 +246,12 @@ def _circle_fit(x, y, mask, min_hits=3, newton_iters=20, eps=1e-12):
     x, y, mask = x.double(), y.double(), mask.double()
     n_valid = mask.sum(dim=1)
     valid = n_valid >= min_hits
-    mean_x = _masked_mean(x, mask, n_valid, eps)
-    mean_y = _masked_mean(y, mask, n_valid, eps)
+    mean_x = (x * mask).sum(dim=1) / n_valid.clamp(min=eps)
+    mean_y = (y * mask).sum(dim=1) / n_valid.clamp(min=eps)
     Xi, Yi = x - mean_x.unsqueeze(1), y - mean_y.unsqueeze(1)
     Zi = Xi * Xi + Yi * Yi
-    Mxy, Mxx, Myy = (_masked_mean(v, mask, n_valid, eps) for v in (Xi * Yi, Xi * Xi, Yi * Yi))
-    Mxz, Myz, Mzz = (_masked_mean(v, mask, n_valid, eps) for v in (Xi * Zi, Yi * Zi, Zi * Zi))
+    Mxy, Mxx, Myy = ((v * mask).sum(dim=1) / n_valid.clamp(min=eps) for v in (Xi * Yi, Xi * Xi, Yi * Yi))
+    Mxz, Myz, Mzz = ((v * mask).sum(dim=1) / n_valid.clamp(min=eps) for v in (Xi * Zi, Yi * Zi, Zi * Zi))
 
     Mz = Mxx + Myy
     Cov_xy = Mxx * Myy - Mxy * Mxy
@@ -550,7 +549,7 @@ class VertexHead(nn.Module):
                 params["z0"],
                 track_weight,               # already zeroed for bad tracks
                 n_iterations=self.helix_iterations,
-                seed_vertex=fit["vertex_estimate"],
+                linear_fit=fit,
                 is_cosmics=self.is_cosmics,
             )
         elif self.Bz == 0.0:
