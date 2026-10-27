@@ -65,7 +65,7 @@ def main():
     p.add_argument("--eventnumber", default=70000, type=int,
                    help="must match the track head's --eventnumber for the derived checkpoint name")
     p.add_argument("--max_events", default=None, type=int)
-    p.add_argument("--bz", default=None, type=float, help="solenoid field, Tesla; default: YAML vertex_bz or 1.4")
+    p.add_argument("--bz", default=1.4, type=float, help="solenoid field, Tesla; default: YAML vertex_bz or 1.4")
     p.add_argument("--data_root_test", default=None)
     p.add_argument("--save_csv", action="store_true",
                    help="also write eval_track_finding.py's per-point CSV, with vtx_x/y/z the reconstructed "
