@@ -168,7 +168,6 @@ d9_m1_k30_p20:
   klen: 30
   dropout: 0.0          # frozen backbone: keep at 0 for the released weights
   mambaversion: mamba2
-  pretrained_ckpt:      #TODO: add path to the released checkpoint for width 256 (5.3M params)
 
 d9_m3_k30_p20:
   <<: *default
