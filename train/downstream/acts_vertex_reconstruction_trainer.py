@@ -20,6 +20,16 @@ The output files are compatible with train_vertex_reconstruction.py:
     - vertex_per_point_data_acts.csv  (optional)
 """
 
+import os as _os
+import sys as _sys
+# Ensure PP_collision/ is on sys.path so 'from train.downstream import ...' works
+_here = _os.path.dirname(_os.path.abspath(__file__))
+_repo = _os.path.normpath(_os.path.join(_here, '..', '..'))
+if _repo not in _sys.path:
+    _sys.path.insert(0, _repo)
+if _here not in _sys.path:
+    _sys.path.insert(0, _here)
+
 from __future__ import annotations
 
 import json

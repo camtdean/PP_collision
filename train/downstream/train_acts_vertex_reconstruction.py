@@ -27,8 +27,13 @@ import argparse
 import os
 import sys
 
-# Ensure the downstream package is on the path
-sys.path.insert(0, os.path.dirname(__file__))
+# Run from train/downstream/ (same convention as train_vertex_reconstruction.py)
+# '../..' adds PP_collision/ so 'from train.downstream import ...' works
+sys.path.append('../..')
+# Also add this directory for the local acts_* modules
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
 
 from acts_vertex_reconstruction_trainer import ActsVertexTrainer
 
