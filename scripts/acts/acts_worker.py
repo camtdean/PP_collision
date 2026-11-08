@@ -35,21 +35,27 @@ def build_field(bz_tesla, field_map, field_map_kind):
     return acts.ConstantBField(acts.Vector3(0.0, 0.0, float(bz_tesla) * u.T))
 
 
+def _perigee_module():
+    """The perigee module (perigee_propagator/build/install), its path added once."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import acts_perigee_propagator
+    return acts_perigee_propagator
+
+
 def build_tracking_geometry(geometry, geometry_config, material_map=None, quiet=False):
     """ACTS tracking geometry from TGeo (the perigee module's build_tgeo_geometry: TGeoDetector's layout with its JSON
     configuration, ACTS Core and plugins only), with a JSON material map if given. quiet: ACTS logs fatal errors only
     while building (README: sPHENIX inputs). Returns (owner, geometry): the owner holds the detector elements and must
     be kept alive."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
-    import acts_perigee_propagator
-    owner = acts_perigee_propagator.build_tgeo_geometry(geometry, geometry_config, material_map or "", quiet)
+    owner = _perigee_module().build_tgeo_geometry(geometry, geometry_config, material_map or "", quiet)
     return owner, owner.tracking_geometry()
 
 
 def build_propagator(config):
     """(PerigeePropagator, objects to keep alive) from a config dict (see the module docstring)."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install"))
-    import acts_perigee_propagator
+    acts_perigee_propagator = _perigee_module()
     # ACTS reads a missing file as empty input ("parse error ... empty input"): name it instead
     missing = [f"{k}={config[k]}" for k in ("field_map", "geometry", "geometry_config", "material_map")
                if config[k] and not os.path.isfile(config[k])]

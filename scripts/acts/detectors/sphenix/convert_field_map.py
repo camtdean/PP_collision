@@ -54,14 +54,9 @@ def main():
         raise ValueError(f"not a full grid: {len(columns[coords[0]])} points, {n_grid} grid points "
                          f"({' x '.join(str(len(a)) for a in axes.values())}); ACTS needs every grid point")
     order = np.lexsort([columns[c] for c in reversed(coords)])           # lexsort: last key slowest
-    if args.kind == "xyz":
-        table = np.stack([columns[k][order] * (field if k.startswith("b") else 1.0)
-                          for k in ("x", "y", "z", "bx", "by", "bz")], -1)
-        header = "# x y z [mm]  Bx By Bz [T]"
-    else:
-        table = np.stack([columns[k][order] * (field if k.startswith("b") else 1.0) for k in ("r", "z", "br", "bz")], -1)
-        header = "# r z [mm]  Br Bz [T]"
-    np.savetxt(args.output, table, fmt="%.9g", header=header[2:], comments="# ")
+    table = np.stack([columns[k][order] * (field if k.startswith("b") else 1.0) for k in names], -1)
+    header = f"{' '.join(names[:len(coords)])} [mm]  {' '.join(k.capitalize() for k in names[len(coords):])} [T]"
+    np.savetxt(args.output, table, fmt="%.9g", header=header, comments="# ")
     ranges = ", ".join(f"{c} {a[0]:.1f}..{a[-1]:.1f} mm ({len(a)})" for c, a in axes.items())
     print(f"wrote {args.output}: {len(table)} points, {ranges}; |B| max {np.abs(table[:, len(coords):]).max():.4f} T")
     return 0

@@ -20,15 +20,10 @@ import torch
 import torch.nn as nn
 from torch.func import jacrev, vmap
 
-from .common import C_LIGHT, CM_PER_M
+from .common import K_CM, _wrap
 
-K_CM = C_LIGHT / CM_PER_M          # pT [GeV] = K_CM x B [T] x R [cm]
 _CURVILINEAR_TOLERANCE = 0.999995  # |direction . z| above which the curvilinear frame uses x instead of z
-
-
-def _wrap(angle):
-    """Angle in [-pi, pi)."""
-    return torch.remainder(angle + math.pi, 2 * math.pi) - math.pi
+_NO_ORDER = 10 ** 9                # creation order of a vertex slot not kept
 
 
 def _soft_below(value, cut, width):
@@ -39,13 +34,23 @@ def _soft_below(value, cut, width):
     return torch.where(finite, soft, 0.0)
 
 
+def _soft_above(value, cut, width):
+    """1 where value > cut (as _soft_below)."""
+    return _soft_below(-value, -cut, width)
+
+
+def _expand(mask, like):
+    """mask viewed with trailing singleton dimensions to broadcast against like."""
+    return mask.view(*mask.shape, *[1] * (like.dim() - mask.dim()))
+
+
 # ------------------------------------------------------------------------------------------------
 # One track's helix (perigee p = (d0, z0, phi, theta, q/p) at the beam line, z reference 0), vmapped below
 # ------------------------------------------------------------------------------------------------
 
 def _helix_radius(p, bz):
-    """Signed radius rho = sin(theta) / (q/p K Bz) (cm; > 0: clockwise seen from +z)."""
-    return torch.sin(p[3]) / (p[4] * K_CM * bz)
+    """Signed radius rho = sin(theta) / (q/p K Bz) (cm; > 0: clockwise seen from +z); p (..., 5)."""
+    return torch.sin(p[..., 3]) / (p[..., 4] * K_CM * bz)
 
 
 def _perigee_at(p, bz, beam, point):
@@ -143,8 +148,8 @@ def _linearise(perigee, covariance, bz, beam, point):
     Returns A, B (..., 5, 3), q - c (..., 5) at the linearisation and the weight G = cov^-1 (..., 5, 5).
     """
     q, cov, pca = _transport(perigee, covariance, bz, beam, point)
-    d0, phi, theta = q[..., 0], q[..., 2], q[..., 3]
-    rho = torch.sin(theta) / (q[..., 4] * K_CM * bz)
+    phi, theta = q[..., 2], q[..., 3]
+    rho = _helix_radius(q, bz)
     h = torch.where(rho < 0, -1.0, 1.0).to(rho.dtype)
     X = pca[..., 0] - point[..., 0] + rho * torch.sin(phi)
     Y = pca[..., 1] - point[..., 1] - rho * torch.cos(phi)
@@ -159,7 +164,6 @@ def _linearise(perigee, covariance, bz, beam, point):
     B = torch.stack([torch.stack([zero, zero, zero], -1), torch.stack([rho_cot * (1 - abs_rho_over_s), zero, zero], -1),
                      torch.stack([abs_rho_over_s, zero, zero], -1), torch.stack([zero, one, zero], -1),
                      torch.stack([zero, zero, one], -1)], -2)
-    del d0
     momentum = torch.stack([phi, theta, q[..., 4]], -1)
     # q - c = A x_pca + B p (ACTS's constant term c = q - A x_pca - B p)
     q_minus_c = (A @ pca.unsqueeze(-1) + B @ momentum.unsqueeze(-1)).squeeze(-1)
@@ -339,12 +343,12 @@ class VertexFinder(nn.Module):
         """
         perigee, cov, bz = tracks["perigee"], tracks["covariance"], tracks["bz"]
         beam = perigee.new_tensor(self.beam_position)
-        point = seeds.nan_to_num().unsqueeze(2)
+        finite = seeds.nan_to_num()          # unused slots (NaN seeds) get finite stand-ins (weight 0)
+        point = finite.unsqueeze(2)
         expand = lambda v: v.unsqueeze(1).expand(-1, seeds.shape[1], *v.shape[1:])  # noqa: E731
         impact = _guarded_impact_with_jacobian if guarded else _impact_with_jacobian
         loc, axes, J = impact(expand(perigee), expand(bz), beam, point)
         loc_cov = J @ expand(cov) @ J.transpose(-1, -2)
-        finite = seeds.nan_to_num()          # unused slots (NaN seeds) get finite stand-ins (weight 0)
         state = {"seed": seeds, "prior": finite if prior is None else prior.nan_to_num(), "position": finite.clone(),
                  "lin_point": finite.clone(), "links": links, "ip_loc": loc, "ip_axes": axes,
                  "ip_weight": torch.linalg.inv(loc_cov),
@@ -441,7 +445,7 @@ class VertexFinder(nn.Module):
             fit_weight = weight * (weight > self.fit_min_weight) * track_weight.unsqueeze(1)
             position, covariance, chi2, ndf = self._kalman(state, fit_weight)
             for key, value in (("position", position), ("covariance", covariance), ("chi2", chi2), ("ndf", ndf)):
-                state[key] = torch.where(active.view(*active.shape, *[1] * (value.dim() - 2)), value, state[key])
+                state[key] = torch.where(_expand(active, value), value, state[key])
             d = (old - state["position"]).unsqueeze(-1)
             shift = (d.transpose(-1, -2) @ torch.linalg.solve(state["covariance"], d)).squeeze(-1).squeeze(-1)
             small = ((shift <= self.max_relative_shift) | ~active).all(dim=1)
@@ -471,11 +475,11 @@ class VertexFinder(nn.Module):
         perigee, cov = tracks["perigee"], tracks["covariance"]
         state = self._empty_vertices(n_events, K, n_tracks, dtype, device)
         kept = torch.zeros(n_events, K, dtype=torch.bool, device=device)
-        order = torch.full((n_events, K), 10 ** 9, dtype=torch.long, device=device)
+        order = torch.full((n_events, K), _NO_ORDER, dtype=torch.long, device=device)
         pool = tracks["input"].clone()
         alive = pool.sum(-1) >= 2
         events = torch.arange(n_events, device=device)
-        for iteration in range(1000):
+        for iteration in range(n_tracks):           # each pass takes >= 1 track from the pool of alive events
             alive = alive & (kept.sum(dim=1) < self.max_vertices)
             if not alive.any():
                 break
@@ -503,7 +507,7 @@ class VertexFinder(nn.Module):
             # the new vertex's state (its prior: the density seed, also where the seed moved)
             fresh = self._new_vertices(seed.unsqueeze(1), links.unsqueeze(1), tracks, prior.unsqueeze(1))
             for key, value in fresh.items():
-                state[key] = torch.where(new.view(*new.shape, *[1] * (value.dim() - 2)), value, state[key])
+                state[key] = torch.where(_expand(new, value), value, state[key])
             order = torch.where(new, iteration, order)
             # the vertices to fit: the new one and every kept vertex connected to it through shared tracks
             linked = state["links"] > 0.5
@@ -520,18 +524,16 @@ class VertexFinder(nn.Module):
             good = alive & (compatible.sum(-1) >= 2)
             remove = compatible & alive.unsqueeze(-1)
             none = alive & ~compatible.any(dim=-1)
-            worst = torch.where(new_links & pool & (compatibility > 0), compatibility, -torch.inf).argmax(dim=-1)
-            has_worst = (new_links & pool & (compatibility > 0)).any(dim=-1)
-            fitted_z = (state["position"][..., 2] * new).sum(1, keepdim=True)
-            nearest = torch.where(pool, (perigee[..., 1] - fitted_z).abs(), torch.inf).argmin(dim=-1)
-            drop = torch.where(has_worst, worst, nearest)
+            unused = new_links & pool & (compatibility > 0)
+            z_new = (state["position"][..., 2] * new).sum(1, keepdim=True)
+            nearest = torch.where(pool, (perigee[..., 1] - z_new).abs(), torch.inf).argmin(dim=-1)
+            drop = torch.where(unused.any(dim=-1), torch.where(unused, compatibility, -torch.inf).argmax(dim=-1), nearest)
             remove = remove | (torch.nn.functional.one_hot(drop, n_tracks).bool() & none.unsqueeze(-1))
             pool = pool & ~remove
             # kept: good, contamination <= maximum_vertex_contamination, not within max_merge_vertex_significance
             # sigma in z of another vertex
             w = torch.where(new.unsqueeze(-1), state["weight"], 0.0).sum(dim=1) * new_links
             contamination = (w * (1 - w)).sum(-1) / (w * w).sum(-1).clamp(min=1e-300)
-            z_new = (state["position"][..., 2] * new).sum(1, keepdim=True)
             var_new = (state["covariance"][..., 2, 2] * new).sum(1, keepdim=True)
             merged = (kept & ((state["position"][..., 2] - z_new).abs()
                               < self.max_merge_vertex_significance * (state["covariance"][..., 2, 2] + var_new).sqrt())
@@ -545,7 +547,7 @@ class VertexFinder(nn.Module):
                 state["weight"] = state["weight"].masked_fill(rejected.unsqueeze(-1), 0.0)
                 state["compatibility"] = state["compatibility"].masked_fill(rejected.unsqueeze(-1), torch.inf)
                 state["seed"] = state["seed"].masked_fill(rejected.unsqueeze(-1), torch.nan)
-                order = order.masked_fill(rejected, 10 ** 9)
+                order = order.masked_fill(rejected, _NO_ORDER)
                 self._fit(state, fit & ~rejected & rejected.any(dim=1, keepdim=True), track_weight, tracks)
             alive = alive & (pool.sum(-1) >= 2)
         return state, kept, order
@@ -563,8 +565,8 @@ class VertexFinder(nn.Module):
         """
         perigee, bz = tracks["perigee"], tracks["bz"]
         beam = perigee.new_tensor(self.beam_position)
-        d0, z0, phi, theta = perigee[..., 0], perigee[..., 1], perigee[..., 2], perigee[..., 3]
-        rho = torch.sin(theta) / (perigee[..., 4] * K_CM * bz)
+        d0, phi = perigee[..., 0], perigee[..., 2]
+        rho = _helix_radius(perigee, bz)
         centre = beam + d0.unsqueeze(-1) * torch.stack([-torch.sin(phi), torch.cos(phi)], -1) \
             + rho.unsqueeze(-1) * torch.stack([torch.sin(phi), -torch.cos(phi)], -1)
         n_tracks = perigee.shape[1]
@@ -606,13 +608,13 @@ class VertexFinder(nn.Module):
                  * _soft_below(points.norm(dim=-1), self.sv_max_radius, cm)
                  * _soft_below((x1[..., 2] - x2[..., 2]).abs(), self.sv_max_projected_dz, cm)
                  * _soft_below(pair_dca, self.sv_max_pair_dca, cm)
-                 * _soft_below(-(midpoint - pv.unsqueeze(1).unsqueeze(1)).norm(dim=-1), -self.sv_min_path, cm))
+                 * _soft_above((midpoint - pv.unsqueeze(1).unsqueeze(1)).norm(dim=-1), self.sv_min_path, cm))
         n_events = perigee.shape[0]
         pairs = torch.stack([i, j], -1).unsqueeze(1).expand(-1, 2, -1).reshape(-1, 2)
         return (midpoint.reshape(n_events, -1, 3), pair_dca.reshape(n_events, -1), score.reshape(n_events, -1),
                 pairs.unsqueeze(0).expand(n_events, -1, -1))
 
-    def _find_secondary(self, tracks, track_weight, pv, pv_state, pv_slot):
+    def _find_secondary(self, tracks, track_weight, pv, pv_state):
         """SV finding after the PV (track_weight: without the other primary vertices' tracks): sv_* outputs,
         displaced_mask, displaced_weight; the SV states and which are valid."""
         n_events, n_tracks = track_weight.shape
@@ -626,12 +628,11 @@ class VertexFinder(nn.Module):
         pv_chi2 = self._compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)
         displaced = torch.where(
             tracks["n_silicon_hits"] > 0,
-            _soft_below(-q[..., 0].abs(), -self.sv_min_track_dca_xy, cm) * _soft_below(-q[..., 1].abs(),
-                                                                                    -self.sv_min_track_dca_z, cm),
-            _soft_below(-pv_chi2, -self.sv_min_track_pv_chi2, sigma * 2 * math.sqrt(self.sv_min_track_pv_chi2)))
+            _soft_above(q[..., 0].abs(), self.sv_min_track_dca_xy, cm) * _soft_above(q[..., 1].abs(),
+                                                                                  self.sv_min_track_dca_z, cm),
+            _soft_above(pv_chi2, self.sv_min_track_pv_chi2, sigma * 2 * math.sqrt(self.sv_min_track_pv_chi2)))
         candidate_weight = (displaced * (track_weight > 0) * tracks["input"].to(dtype)
-                            * _soft_below(-(tracks["n_hits"] - tracks["n_silicon_hits"]), -(self.sv_min_track_hits - 0.5),
-                                          hits)
+                            * _soft_above(tracks["n_hits"] - tracks["n_silicon_hits"], self.sv_min_track_hits - 0.5, hits)
                             * torch.isfinite(pv).all(-1, keepdim=True))
         candidate = candidate_weight > 0.5
         if n_tracks >= 2:
@@ -655,7 +656,7 @@ class VertexFinder(nn.Module):
         state = self._new_vertices(seed, torch.zeros(n_events, K, n_tracks, dtype=dtype, device=device), tracks,
                                    guarded=True)
         compatible = _soft_below(self._compatibility(state, seed), self.sv_max_track_chi2,
-                                 self._width("sigma") * 2 * math.sqrt(self.sv_max_track_chi2))
+                                 sigma * 2 * math.sqrt(self.sv_max_track_chi2))
         in_pair = torch.zeros_like(compatible, dtype=torch.bool).scatter_(2, pair, True)
         links = torch.where(in_pair, 1.0, compatible) * candidate_weight.unsqueeze(1) * seed_ok.unsqueeze(-1)
         state["links"] = links
@@ -663,8 +664,7 @@ class VertexFinder(nn.Module):
         linked = links > 0.5
         n_good = (linked & (state["compatibility"] < self.max_vertex_chi2)).sum(-1)
         chi2_per_dof = state["chi2"] / state["ndf"].clamp(min=1e-12)
-        path = state["position"] - pv.unsqueeze(1)
-        length = path.norm(dim=-1)
+        length = (state["position"] - pv.unsqueeze(1)).norm(dim=-1)
         ok = (seed_ok & (n_good >= 2) & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
               & (length > self.sv_min_path))
         # one SV per group within sv_merge_distance: the lowest chi2/ndf (ties: the lower slot)
@@ -673,7 +673,7 @@ class VertexFinder(nn.Module):
         beats = (quality.unsqueeze(1) < quality.unsqueeze(2)) | ((quality.unsqueeze(1) == quality.unsqueeze(2))
                                                                   & torch.ones(K, K, dtype=torch.bool, device=device).tril(-1))
         ok = ok & ~(ok.unsqueeze(1) & (distance < self.sv_merge_distance) & beats).any(dim=2)
-        result = self._sv_outputs(state, ok, pv, pv_state["covariance"][torch.arange(n_events), pv_slot])
+        result = self._sv_outputs(state, ok, pv, pv_state["covariance"][:, 0])
         result.update({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
                        "displaced_weight": track_weight * candidate_weight})
         return result, state, ok
@@ -689,7 +689,7 @@ class VertexFinder(nn.Module):
         covariance = state["covariance"] + torch.nan_to_num(pv_covariance).unsqueeze(1)
         unit = path / length.unsqueeze(-1).clamp(min=1e-12)
         sigma = (unit.unsqueeze(-2) @ covariance @ unit.unsqueeze(-1)).squeeze(-1).squeeze(-1).sqrt()
-        nan = lambda v: v.masked_fill(~ok.view(*ok.shape, *[1] * (v.dim() - 2)), torch.nan)  # noqa: E731
+        nan = lambda v: v.masked_fill(~_expand(ok, v), torch.nan)  # noqa: E731
         return {
             "sv_estimate": nan(state["position"]), "sv_is_valid": ok, "sv_covariance": nan(state["covariance"]),
             "sv_chi2": nan(state["chi2"]), "sv_chi2_per_dof": nan(state["chi2"] / state["ndf"].clamp(min=1e-12)),
@@ -760,24 +760,20 @@ class VertexFinder(nn.Module):
             # the other primary vertices' tracks are theirs (weight x (1 - their fit weight))
             others = (state["weight"] * (state["links"] > 0.5) * (kept & (order != order.gather(1, pv_slot[:, None]))
                                                                  ).unsqueeze(-1)).amax(dim=1)
-            secondary, sv_state, sv_ok = self._find_secondary(inputs, track_weight * (others < 0.5), pv, pv_state,
-                                                              torch.zeros_like(pv_slot))
+            secondary, sv_state, sv_ok = self._find_secondary(inputs, track_weight * (others < 0.5), pv, pv_state)
             result.update(secondary)
             if self.refit_pv and sv_ok.any():
                 # the PV and its SVs fitted together (tracks shared); used where the event has an SV
-                joint = {k: torch.cat([pv_state[k], sv_state[k]], dim=1) for k in pv_state if k in sv_state}
+                joint = {k: torch.cat([v, sv_state[k]], dim=1) for k, v in pv_state.items()}
                 which = torch.cat([(valid & sv_ok.any(dim=1)).unsqueeze(1), sv_ok], dim=1)
                 self._fit(joint, which, track_weight, inputs)
                 refit = which[:, 0]
-                for key in slot_state:
-                    if key in joint:
-                        mask = refit.view(-1, *[1] * (slot_state[key].dim() - 1))
-                        slot_state[key] = torch.where(mask, joint[key][:, 0], slot_state[key])
+                slot_state = {k: torch.where(_expand(refit, v), joint[k][:, 0], v) for k, v in slot_state.items()}
                 pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
                 # the SV outputs from the same refit, measured from the refitted PV (the SV selection is unchanged)
                 joint_sv = self._sv_outputs({k: v[:, 1:] for k, v in joint.items()}, sv_ok, pv, slot_state["covariance"])
                 for key, value in joint_sv.items():
-                    result[key] = torch.where(refit.view(-1, *[1] * (value.dim() - 1)), value, result[key])
+                    result[key] = torch.where(_expand(refit, value), value, result[key])
 
         # the PV's outputs; per-track ones NaN for tracks without a fit
         weight = slot_state["weight"] * (slot_state["links"] > 0.5)
@@ -786,8 +782,7 @@ class VertexFinder(nn.Module):
         loc, axes, _ = _impact_with_jacobian(inputs["perigee"], inputs["bz"], inputs["perigee"].new_tensor(
             self.beam_position), pv.nan_to_num().unsqueeze(1))
         closest = pv.nan_to_num().unsqueeze(1) + (loc.unsqueeze(-1) * axes).sum(-2)
-        per_track = lambda v: v.masked_fill((bad | ~valid.unsqueeze(-1)).view(*bad.shape, *[1] * (v.dim() - 2)),  # noqa: E731
-                                            torch.nan)
+        per_track = lambda v: v.masked_fill(_expand(bad | ~valid.unsqueeze(-1), v), torch.nan)  # noqa: E731
         result.update({
             "vertex_estimate": pv, "fit_is_valid": valid, "vertex_from_fallback": from_fallback,
             "vertex_fallback_step": step,
@@ -799,7 +794,7 @@ class VertexFinder(nn.Module):
             "track_closest_approach_point": per_track(closest),
         })
         # all primary vertices (pileup), in the order found; each track's (weight >= 0.5, else -1)
-        rank = torch.where(kept, order, order.new_tensor(10 ** 9)).argsort(dim=1)
+        rank = torch.where(kept, order, order.new_tensor(_NO_ORDER)).argsort(dim=1)
         vertices_kept = kept.gather(1, rank)
         fit_weight = (state["weight"] * (state["links"] > 0.5)).gather(1, rank.unsqueeze(-1).expand_as(state["weight"]))
         fit_weight = fit_weight * vertices_kept.unsqueeze(-1)
