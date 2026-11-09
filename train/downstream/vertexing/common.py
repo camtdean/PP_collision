@@ -19,6 +19,7 @@ def _arc_length(x, y, xc, yc, R_s, beam_position):
     """
     beam_angle = torch.atan2(-(yc - beam_position[1]), -(xc - beam_position[0]))
     return _wrap(torch.atan2(y - yc, x - xc) - beam_angle) * -R_s
+
 def _circle_point(circle_centre, R_s, xy):
     """Each circle's point nearest xy (..., 2) and the unit direction of travel there (anticlockwise <=> R_s < 0)."""
     n = xy - circle_centre
