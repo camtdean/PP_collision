@@ -248,7 +248,7 @@ def residual_panels(row, tracks, runs, limit, what, unit):
 def sv_counts(ax, tracks, n_found, n_true, n_findable, n_matched):
     """Histogram of SVs per event: the true ones, the findable true ones (>= 2 candidate tracks), VertexHead's and
     those matched to a true SV."""
-    edges = np.arange(5 - 0.5)
+    edges = np.arange(6-0.5)
     #ax.hist(n_true, bins=edges, label=f"true SVs, all ({n_true.sum()})", **STYLE["truth"])
     ax.hist(n_findable, bins=edges, label=f"true SVs, findable: >= 2 candidate tracks ({n_findable.sum()})",
             **STYLE["truth"])
