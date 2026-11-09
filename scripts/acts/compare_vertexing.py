@@ -211,7 +211,7 @@ def table_row(label, residual):
     if not len(residual):
         return f"{label} {0:6d}"
     err, bias = np.linalg.norm(residual, axis=1), np.median(residual, axis=0)
-    sigma = 1.4826 * np.median(np.abs(residual - bias), axis=0)
+    sigma = np.std(np.abs(residual - bias), axis=1)
     return (f"{label} {len(err):6d} " + " ".join(f"{np.percentile(err, q):7.4f}" for q in (50, 68, 90))
             + f" {(err < 1.0).mean():6.1%} " + " ".join(f"{v:7.4f}" for v in (*bias, *sigma)))
 
