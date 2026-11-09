@@ -769,6 +769,7 @@ class VertexFinder(nn.Module):
                 self._fit(joint, which, track_weight, inputs)
                 refit = which[:, 0]
                 slot_state = {k: torch.where(_expand(refit, v), joint[k][:, 0], v) for k, v in slot_state.items()}
+                state = {k: v.index_put((events, pv_slot), slot_state[k]) for k, v in state.items()}   # pileup list too
                 pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
                 # the SV outputs from the same refit, measured from the refitted PV (the SV selection is unchanged)
                 joint_sv = self._sv_outputs({k: v[:, 1:] for k, v in joint.items()}, sv_ok, pv, slot_state["covariance"])
