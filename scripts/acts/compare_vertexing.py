@@ -236,7 +236,7 @@ def residual_panels(row, tracks, runs, limit, what, unit):
             value = np.linalg.norm(residual, axis=1) if k == 3 else residual[:, k]
             if not len(value):
                 continue
-            sigma = 1.4826 * np.median(np.abs(value - np.median(value))) if k < 3 else np.median(value)
+            sigma = np.std(value) if k < 3 else np.median(value)
             ax.hist(np.clip(value, edges[0], edges[-1]), bins=edges, label=f"{label} ({len(value)}, "
                     f"{'sigma' if k < 3 else 'median'} {sigma:.3f})", **STYLE[label])
         ax.set_xlabel(f"{'|reco - true|' if k == 3 else f'reco - true, {name}'} (cm)")
