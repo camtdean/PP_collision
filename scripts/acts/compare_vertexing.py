@@ -251,7 +251,7 @@ def sv_counts(ax, tracks, n_found, n_true, n_findable, n_matched):
     edges = np.arange(max(n_found.max(initial=0), n_true.max(initial=0)) + 2) - 0.5
     #ax.hist(n_true, bins=edges, label=f"true SVs, all ({n_true.sum()})", **STYLE["truth"])
     ax.hist(n_findable, bins=edges, label=f"true SVs, findable: >= 2 candidate tracks ({n_findable.sum()})",
-            **STYLE["VertexHead, AMVF events"])
+            **STYLE["truth"])
     ax.hist(n_found, bins=edges, label=f"{SV_ALL} ({n_found.sum()})", **STYLE[SV_ALL])
     ax.hist(n_matched, bins=edges, label=f"{SV_MATCHED} ({n_matched.sum()})", **STYLE[SV_MATCHED])
     ax.set_xlabel("SVs per event")
