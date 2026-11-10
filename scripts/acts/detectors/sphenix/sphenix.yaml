@@ -1,4 +1,4 @@
-# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexing/model.py) and its ACTS
+# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexing/vertexhead.py) and its ACTS
 # worker. Relative paths are relative to this file; VertexHead binds the ACTS input directories into the
 # container. A site's copy (scripts/run/vertexing.sh setup writes one into scripts/configs/) holds its ACTS paths;
 # for another detector, copy this folder and fill in the same keys (README: Adding a detector).

@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from .acts import ACTS_WORKER_SCRIPT, _acts_worker
-from .common import K_CM, MM_PER_CM, _arc_length, _circle_point
+from .helix_tools import K_CM, MM_PER_CM, _arc_length, _circle_point
 
 # ------------------------------------------------------------------------------------------------
 # Track model: hit normalization, hard hit-to-track assignment, and each track's circle and z line
@@ -518,7 +518,7 @@ class TrackBuilder(nn.Module):
         Returns:
             dict: track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
             track_quality_mask, track_sigma (B, T, 2); acts_failed, acts_refit_failed, track_covariance as
-            VertexHead.forward; for VertexFinder: _covariance (B, T, 5, 5) the perigee covariance (cm) x
+            VertexHead.forward; for the vertex finding: _covariance (B, T, 5, 5) the perigee covariance (cm) x
             track_error_scale^2, _bz (B, T) Bz at the perigee, _n_hits (inf for given tracks), _n_silicon_hits (B, T), _bad (B, T)
             tracks without a fit.
         """
@@ -666,7 +666,7 @@ class TrackBuilder(nn.Module):
             outputs["acts_refit_failed"] = refit_failed
         if track_covariance is not None:
             outputs["track_covariance"] = track_covariance
-        # for VertexFinder: the full perigee covariance (cm) x track_error_scale^2, Bz at the perigee, hits per track
+        # for the vertex finding: the full perigee covariance (cm) x track_error_scale^2, Bz at the perigee, hits per track
         return {**outputs, "_covariance": covariance_cm.to(dtype) * self.track_error_scale ** 2,
                 "_bz": torch.as_tensor(perigee_bz, dtype=dtype, device=perigee.device).expand(bad.shape),
                 "_n_hits": n_hits, "_n_silicon_hits": n_silicon_hits, "_bad": bad}
