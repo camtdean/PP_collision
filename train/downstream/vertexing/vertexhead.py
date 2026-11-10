@@ -1,19 +1,14 @@
 """
 vertexhead.py: VertexHead, vertex reconstruction from track-finder output and the training interface: TrackBuilder
 (tracks.py) then the primary and secondary vertices (primaryvertex.py's PrimaryVertices, secondaryvertex.py's
-SecondaryVertices, both on vertexfit.py's VertexFit: settings and the shared fit).
-
-Primary vertices: ACTS's adaptive multi-vertex finder (AMVF) with the settings of its shipped example
-(AdaptiveMultiVertexFinderAlgorithm, Gaussian track-density seeder): seed, preselect tracks, fit all connected
-vertices together (adaptive multi-vertex fit: Kalman vertex updates on linearised helices, annealed weights shared
-between vertices), keep or delete the new vertex, repeat on the tracks left. The PV is the first vertex kept.
-Secondary vertices: sPHENIX's SecondaryVertexFinder pair selection (circle intersections of displaced tracks), each
-seed fitted with the same vertex fit; the PV is then refitted with the SVs sharing tracks. ACTS's hard cuts are soft
-(sigmoids of width cut_softness_*); hard_cuts=True restores them (the check against ACTS).
+SecondaryVertices, both on vertexfit.py's VertexFit: settings and the shared fit). The PV is the first vertex the
+AMVF keeps, refitted with the SVs sharing its tracks. ACTS's hard cuts are soft (sigmoids of width cut_softness_*);
+hard_cuts=True restores them (the check against ACTS).
 
 Inputs: class_probs (B, T, 2), mask_probs (B, N, T), normalized points (B, N, 4), padding_mask (B, N);
 B events, N hits, T track slots, K = max_sv_per_event. Positions in cm.
 """
+import functools
 import inspect
 import math
 import os
@@ -27,8 +22,18 @@ from .tracks import TrackBuilder
 from .vertexfit import VertexFit
 
 
+@functools.cache
 def _setting_names(part):
-    return set(inspect.signature(part.__init__).parameters) - {"self"}
+    """The keyword settings part.__init__ takes (each named: VertexHead routes settings by these names)."""
+    parameters = inspect.signature(part.__init__).parameters
+    if any(p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL) for p in parameters.values()):
+        raise TypeError(f"{part.__name__}.__init__ takes *args/**kwargs; VertexHead needs every setting named")
+    return frozenset(parameters) - {"self"}
+
+
+if _setting_names(TrackBuilder) & _setting_names(VertexFit) != {"beam_position"}:
+    raise TypeError(f"TrackBuilder and VertexFit share {sorted(_setting_names(TrackBuilder) & _setting_names(VertexFit))}; "
+                    "only beam_position may go to both")
 
 
 class VertexHead(PrimaryVertices, SecondaryVertices):

@@ -91,8 +91,9 @@ def _impact_3d(p, bz, beam, point, iterations=20, guarded=False):
         return phi - first / second
 
     def root(phi):
-        for _ in range(iterations - 1):
-            phi = step(phi.detach())
+        with torch.no_grad():
+            for _ in range(iterations - 1):
+                phi = step(phi)
         return phi.detach()
     phi = root(phi0)
     if guarded:

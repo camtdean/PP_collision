@@ -7,7 +7,7 @@ import math
 
 import torch
 
-from .helix_tools import _expand, _soft_below, _transport
+from .helix_tools import _soft_below, _transport
 from .vertexfit import VertexFit
 
 _NO_ORDER = 10 ** 9                # creation order of a vertex slot not kept
@@ -112,7 +112,7 @@ class PrimaryVertices(VertexFit):
             # the new vertex's state (its prior: the density seed, also where the seed moved)
             fresh = self._new_vertices(seed.unsqueeze(1), links.unsqueeze(1), tracks, prior.unsqueeze(1))
             for key, value in fresh.items():
-                state[key] = torch.where(_expand(new, value), value, state[key])
+                state[key] = state[key].index_put((events[alive], slot[alive]), value[alive, 0])
             order = torch.where(new, iteration, order)
             # the vertices to fit: the new one and every kept vertex connected to it through shared tracks
             linked = state["links"] > 0.5

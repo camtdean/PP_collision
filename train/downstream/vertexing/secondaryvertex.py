@@ -6,9 +6,8 @@ import math
 
 import torch
 
-from .helix_tools import _expand, _helix_radius, _soft_above, _soft_below, _transport, _wrap
+from .helix_tools import _circle_point, _expand, _helix_radius, _soft_above, _soft_below, _transport, _wrap
 from .vertexfit import VertexFit
-
 
 
 class SecondaryVertices(VertexFit):
@@ -42,10 +41,8 @@ class SecondaryVertices(VertexFit):
         def at(track, xy):
             """Each track's helix at the x-y point xy: position (z by arc length) and unit direction."""
             q = perigee[:, track].unsqueeze(2).expand(-1, -1, 2, -1)
-            p_rho, p_centre = rho[:, track].unsqueeze(2), centre[:, track].unsqueeze(2)
-            u = xy - p_centre
-            u = u / u.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-            t = torch.sign(p_rho).unsqueeze(-1) * torch.stack([u[..., 1], -u[..., 0]], -1)
+            p_rho = rho[:, track].unsqueeze(2)
+            _, t = _circle_point(centre[:, track].unsqueeze(2), p_rho, xy)
             phi_at = torch.atan2(t[..., 1], t[..., 0])
             z = q[..., 1] - p_rho * _wrap(phi_at - q[..., 2]) / torch.tan(q[..., 3])
             sin_t = torch.sin(q[..., 3]).unsqueeze(-1)
