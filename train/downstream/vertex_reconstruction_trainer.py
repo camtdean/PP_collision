@@ -524,7 +524,8 @@ class DownstreamTrainer():
         Train LearnedVertexHead (vertex_method learned) on the frozen backbone's features, in fp32. AdamW (max_lr,
         weight decay 1e-4), gradient norm clipped to 1, cosine schedule with warmup stepped per epoch
         (first_cycle_steps, default max_epochs; min_lr; warmup_steps). Each epoch: the training set, then the
-        validation set (its first learned_vertex_val_events events, default all).
+        validation set (its first learned_vertex_val_events events, default all; the training set with
+        learned_vertex_val_on_train).
 
         Writes to params.checkpoint_dir: the log (log_file_name: per epoch the losses, the PV residual medians, the
         validation loss terms), <log name>_checkpoint.pth at the best validation loss and
@@ -544,6 +545,8 @@ class DownstreamTrainer():
         head = self.learned_vertex.head
         print(f"Total parameters in LearnedVertexHead: {sum(p.numel() for p in head.parameters())}")
         self.train_data_loader.dataset.return_reg = True        # the training set yields reg too
+        if getattr(self.params, "learned_vertex_val_on_train", False):
+            self.val_data_loader = self.train_data_loader
         get = lambda name, default: (lambda v: default if v is None else v)(  # noqa: E731
             getattr(self.params, "learned_vertex_" + name, None))
         self.loss_weights = {term: get(term + "_weight", weight) for term, weight in self.LEARNED_LOSS_WEIGHTS.items()}

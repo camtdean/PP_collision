@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--pretrained_ckpt", default=None, type=str,
                         help="Frozen backbone checkpoint (default: pretrained_ckpt from the config)")
     parser.add_argument("--run_num", default='0', type=str, help="Sub run number")
-    parser.add_argument("--root_dir", required=True, type=str, help="Root dir to store results")
+    parser.add_argument("--root_dir", default=None, type=str, help="Root dir to store results")
     parser.add_argument("--global_log_dir", default='globallogs', type=str, help="Global dir to store logging only")
     parser.add_argument("--eventnumber", default=70000, type=int, help="downstream training event number")
     parser.add_argument(
@@ -68,8 +68,36 @@ def main():
     parser.add_argument("--checkpoint_dir", default=None, type=str,
                         help="where the log and checkpoints go (default: checkpoint_dir from the config)")
     parser.add_argument("--val_events", default=None, type=int, help="validation events per epoch (default: all)")
+    parser.add_argument("--val_on_train", action="store_true",
+                        help="validate on the training set (the overfit test: the log's terms are then the training set's)")
+    parser.add_argument("--max_lr", default=None, type=float, help="peak learning rate (default: the config's)")
+    parser.add_argument("--min_lr", default=None, type=float, help="lowest learning rate (default: the config's)")
     parser.add_argument("--max_epochs", default=None, type=int, help="epochs (default: max_epochs from the config)")
+    parser.add_argument("--run_config", default=None, type=str,
+                        help="YAML file of options (the eval's, e.g. scripts/configs/vertex_m5_gpuserver0.yaml): its "
+                             "keys this script has set the defaults (others ignored); command-line options "
+                             "override it, relative paths are relative to the file")
+    path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint_dir", "root_dir", "detector"}
+    run_config = parser.parse_known_args()[0].run_config
+    if run_config:
+        import yaml
+        with open(run_config) as f:
+            run = yaml.safe_load(f) or {}
+        base = os.path.dirname(os.path.abspath(run_config))
+        # each value converted as the command line would be (e.g. run_num: 2 -> "2")
+        types = {a.dest: a.type for a in parser._actions if a.type is not None}
+        parser.set_defaults(**{
+            k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str)
+            else types[k](v) if k in types and v is not None else v
+            for k, v in run.items() if k in types and k not in ("eventnumber", "run_num")})
     args = parser.parse_args()
+    # paths: ~ expanded, absolute (not relative to this folder once the working directory changes)
+    for key in path_keys:
+        if getattr(args, key, None):
+            setattr(args, key, os.path.abspath(os.path.expanduser(getattr(args, key))))
+
+    if not args.root_dir:
+        parser.error("--root_dir is required (on the command line or in --run_config)")
 
     # seed before anything touches an RNG
     set_seed(args.seed)
@@ -96,7 +124,8 @@ def main():
     params.return_dict = False
     params.vertex_method, params.truth_radius = args.vertex_method, args.truth_radius
     for key, value in (("vertex_detector", args.detector), ("learned_vertex_val_events", args.val_events),
-                       ("max_epochs", args.max_epochs), ("checkpoint_dir", args.checkpoint_dir)):
+                       ("max_epochs", args.max_epochs), ("max_lr", args.max_lr), ("min_lr", args.min_lr),
+                       ("learned_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
         if value is not None:
             params[key] = value
 
