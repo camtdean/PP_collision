@@ -29,6 +29,13 @@ TPC_NORMALIZATION = {
     "E_std": 268.7093,
 }
 
+def assign_hits(mask_probs, padding_mask):
+    """Each hit's track slot (..., N): its most probable one, and which hits have one (real, some probability > 0;
+    the others: slot 0)."""
+    assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
+    return mask_probs.argmax(dim=-1).masked_fill(~assigned, 0), assigned
+
+
 def _per_track_sum(values, track, n_tracks):
     """Sum per-hit values (B, N) into their track slots (B, T); hits on no track must carry 0."""
     return values.new_zeros(values.shape[0], n_tracks).scatter_add_(1, track, values)
@@ -503,13 +510,14 @@ class TrackBuilder(nn.Module):
 
         Returns:
             dict: track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
-            track_quality_mask, track_sigma (B, T, 2); acts_failed, acts_refit_failed, track_covariance as
-            VertexHead.forward; for the vertex finding: _covariance (B, T, 5, 5) the perigee covariance (cm) x
-            track_error_scale^2, _bz (B, T) Bz at the perigee, _n_hits (inf for given tracks), _n_silicon_hits (B, T), _bad (B, T)
-            tracks without a fit.
+            track_quality_mask, track_sigma (B, T, 2), track_input_mask; acts_failed, acts_refit_failed,
+            track_covariance as VertexHead.forward.
+            dict, the vertex fit's tracks (stand-ins where not input): perigee (B, T, 5) cm, covariance (B, T, 5, 5)
+            x track_error_scale^2, bz (B, T) Bz at the perigee, n_hits (inf for given tracks), n_silicon_hits,
+            input (track_input_mask), weight (B, T) (0 where not input), beam (2,) the beam line's (x, y).
         """
         acts_failed = refit_failed = None
-        base_weight = class_probs[..., 1]
+        base_weight = class_probs[..., 1].double()
         n_hits = torch.full(base_weight.shape, torch.inf, dtype=torch.float64, device=base_weight.device)
         n_silicon_hits = torch.zeros_like(n_hits)
         if track_parameters is None:
@@ -517,8 +525,7 @@ class TrackBuilder(nn.Module):
             hits, hit_r = _unnormalize_hits(points.double().masked_fill(~padding_mask.unsqueeze(-1), 0.0), self.normalization)
             # each real hit goes to its most probable track slot (none if all probabilities are 0)
             n_tracks = mask_probs.shape[-1]
-            assigned = padding_mask & (mask_probs.max(dim=-1).values > 0)
-            track = mask_probs.argmax(dim=-1).masked_fill(~assigned, 0)
+            track, assigned = assign_hits(mask_probs, padding_mask)
             n_hits = _per_track_sum(assigned.to(torch.float64), track, n_tracks)
             # with a field map: each track's Bz, the mean over its hits (signed; tracks without hits: Bz)
             track_bz = self.Bz
@@ -600,16 +607,14 @@ class TrackBuilder(nn.Module):
             covariance_cm = track_covariance[..., :5, :5].double() * to_cm[:, None] * to_cm[None, :]
         track_sigma = torch.stack([covariance_cm[..., 0, 0], covariance_cm[..., 1, 1]], dim=-1).sqrt()
         # every route: perigee tracks (cm) -> pT and usability; the vertex fit in float64
-        dtype = torch.float64
-        base_weight = base_weight.to(dtype)
         bad = ~torch.isfinite(perigee[..., :5]).all(dim=-1)          # tracks without a fit
         pT, beam_dca = torch.sin(perigee[..., 3]) / perigee[..., 4].abs(), perigee[..., 0].abs()
         # tracks without a usable covariance get no weight (and a finite stand-in error) and are not usable
         has_sigma = (torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
                      & torch.isfinite(covariance_cm).all(dim=(-2, -1)))
         quality = ~bad & has_sigma & self._usable(pT, beam_dca)
-        base_weight = base_weight * has_sigma.to(dtype)
-        track_sigma = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0).to(dtype)
+        base_weight = base_weight * has_sigma
+        track_sigma = torch.where(has_sigma.unsqueeze(-1), track_sigma * self.track_error_scale, 1.0)
         perigee = perigee.masked_fill(bad.unsqueeze(-1), float("nan"))
 
         # straight line of each track at its perigee; tracks without a fit get a finite stand-in (weight 0)
@@ -618,10 +623,10 @@ class TrackBuilder(nn.Module):
                                       self.beam_position[1] + d0 * torch.cos(phi), z0], dim=-1)
         track_direction = torch.stack([torch.sin(theta) * torch.cos(phi), torch.sin(theta) * torch.sin(phi),
                                        torch.cos(theta)], dim=-1)
-        track_position = torch.where(bad.unsqueeze(-1), 0.0, track_position).to(dtype)
-        track_direction = torch.where(bad.unsqueeze(-1), track_direction.new_tensor([1.0, 0.0, 0.0]), track_direction).to(dtype)
+        track_position = torch.where(bad.unsqueeze(-1), 0.0, track_position)
+        track_direction = torch.where(bad.unsqueeze(-1), track_direction.new_tensor([1.0, 0.0, 0.0]), track_direction)
 
-        track_weight, usable = base_weight, quality.to(dtype)
+        track_weight, usable = base_weight, quality
         if self.learn_weights:
             # features: class_probs (2) + (q/(pT+1), theta, sin phi, cos phi) at the perigee; filler without a fit
             pT, beam_dca = pT.nan_to_num(0.0), beam_dca.nan_to_num(1e6)
@@ -630,16 +635,16 @@ class TrackBuilder(nn.Module):
                                           torch.cos(phi).nan_to_num(1.0)], dim=-1)
             network_dtype = next(self.track_weight_network.parameters()).dtype
             learned_weight_scale = self.track_weight_network(torch.cat([class_probs.to(network_dtype),
-                                                                        track_features.to(network_dtype)], dim=-1)).squeeze(-1).to(dtype)
+                                                                        track_features.to(network_dtype)], dim=-1)).squeeze(-1).double()
             track_weight = base_weight * learned_weight_scale
             # straight-through gates: hard cuts forward, sigmoid gradients backward
-            soft = (torch.sigmoid((pT.to(track_weight.dtype) - self.pt_threshold) / self.log_gate_width_pt.exp())
-                    * torch.sigmoid((self.beam_radius - beam_dca.to(track_weight.dtype)) / self.log_gate_width_r.exp()))
+            soft = (torch.sigmoid((pT - self.pt_threshold) / self.log_gate_width_pt.exp())
+                    * torch.sigmoid((self.beam_radius - beam_dca) / self.log_gate_width_r.exp()))
             quality = ~bad & has_sigma & (pT >= self.pt_threshold.detach()) & (beam_dca < self.beam_radius.detach())  # SVs too
-            usable = quality.to(track_weight.dtype) + soft - soft.detach()
+            usable = quality + soft - soft.detach()
         track_weight = track_weight * usable
         outputs = {
-            "track_parameters": perigee.to(dtype),
+            "track_parameters": perigee,
             "track_position": track_position,
             "track_direction": track_direction,
             "track_weight": track_weight,
@@ -652,7 +657,14 @@ class TrackBuilder(nn.Module):
             outputs["acts_refit_failed"] = refit_failed
         if track_covariance is not None:
             outputs["track_covariance"] = track_covariance
-        # for the vertex finding: the full perigee covariance (cm) x track_error_scale^2, Bz at the perigee, hits per track
-        return {**outputs, "_covariance": covariance_cm.to(dtype) * self.track_error_scale ** 2,
-                "_bz": torch.as_tensor(perigee_bz, dtype=dtype, device=perigee.device).expand(bad.shape),
-                "_n_hits": n_hits, "_n_silicon_hits": n_silicon_hits, "_bad": bad}
+        # the vertex fit's tracks: those with a weight, a fit and a finite covariance (the others: stand-ins, weight 0)
+        covariance = covariance_cm * self.track_error_scale ** 2
+        fitted = (track_weight > 0) & ~bad & torch.isfinite(covariance).all(dim=(-2, -1))
+        return {**outputs, "track_input_mask": fitted}, {
+            "perigee": torch.where(fitted.unsqueeze(-1), perigee[..., :5],
+                                   perigee.new_tensor([0.0, 0.0, 0.0, math.pi / 2, 1.0])),
+            "covariance": torch.where(fitted[..., None, None], covariance,
+                                      torch.eye(5, dtype=covariance.dtype, device=covariance.device)),
+            "bz": torch.as_tensor(perigee_bz, dtype=torch.float64, device=perigee.device).expand(bad.shape),
+            "n_hits": n_hits, "n_silicon_hits": n_silicon_hits, "input": fitted, "weight": track_weight * fitted,
+            "beam": perigee.new_tensor(self.beam_position)}

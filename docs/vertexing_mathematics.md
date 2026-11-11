@@ -27,8 +27,8 @@ vertices (primaryvertex.py, secondaryvertex.py on vertexfit.py; helix geometry i
 vertex outputs (vertexhead.py: VertexHead.forward)
 ```
 
-`VertexHead` ([vertexhead.py:VertexHead](../train/downstream/vertexing/vertexhead.py#L34)) is `TrackBuilder` followed by
-the vertex finding (`PrimaryVertices`, `SecondaryVertices` on `VertexFit`); [`from_detector`](../train/downstream/vertexing/vertexhead.py#L52) reads the settings from a detector file
+`VertexHead` ([vertexhead.py:VertexHead](../train/downstream/vertexing/vertexhead.py#L40)) is `TrackBuilder` followed by
+the vertex finding (`PrimaryVertices`, `SecondaryVertices` on `VertexFit`); [`from_detector`](../train/downstream/vertexing/vertexhead.py#L64) reads the settings from a detector file
 (e.g. [`scripts/acts/detectors/sphenix/sphenix.yaml`](../scripts/acts/detectors/sphenix/sphenix.yaml)).
 
 ## 1. Conventions and units
@@ -76,9 +76,9 @@ $r <$ `silicon_max_radius` (25 cm) are silicon hits, with their own errors.
 With a field map, a track's $B_z$ is the mean over its hits of the map's $B_z$ (trilinear interpolation, clamped to the
 grid); otherwise the uniform `Bz` (1.4 T).
 
-**Sources** — Code: [tracks.py:_unnormalize_hits](../train/downstream/vertexing/tracks.py#L132),
+**Sources** — Code: [tracks.py:_unnormalize_hits](../train/downstream/vertexing/tracks.py#L139),
 [tracks.py:TrackBuilder.forward](../train/downstream/vertexing/tracks.py#L529) (assignment, field, silicon),
-[tracks.py:_FieldMap.bz](../train/downstream/vertexing/tracks.py#L320).
+[tracks.py:_FieldMap.bz](../train/downstream/vertexing/tracks.py#L313).
 ACTS: none (input preparation). Maths: —.
 
 ## 3. Helix hit fit
@@ -181,11 +181,11 @@ $C = I^{-1}$. Hit errors: TPC $\sigma_{r\phi} = 0.034$ cm, $\sigma_z = 0.1$ cm; 
 **Differs from ACTS:** ACTS has no counterpart for this step (it starts tracks from seeds and fits them with its
 Kalman filter, §5). z is fitted against the arc length $s$ (exact for a helix), not against $r$.
 
-**Sources** — Code: [tracks.py:_circle_fit](../train/downstream/vertexing/tracks.py#L72),
-[tracks.py:_helix_from_hits](../train/downstream/vertexing/tracks.py#L151),
-[helix_tools.py:_arc_length](../train/downstream/vertexing/helix_tools.py#L14),
-[tracks.py:_line_fit](../train/downstream/vertexing/tracks.py#L47),
-[tracks.py:_track_covariance](../train/downstream/vertexing/tracks.py#L209).
+**Sources** — Code: [tracks.py:_circle_fit](../train/downstream/vertexing/tracks.py#L79),
+[tracks.py:_helix_from_hits](../train/downstream/vertexing/tracks.py#L158),
+[helix_tools.py:_arc_length](../train/downstream/vertexing/helix_tools.py#L19),
+[tracks.py:_line_fit](../train/downstream/vertexing/tracks.py#L54),
+[tracks.py:_track_covariance](../train/downstream/vertexing/tracks.py#L216).
 ACTS: none. Maths: Taubin fit [7], its Newton form [8]; Deming regression [9]; least-squares covariance [4].
 
 ## 4. Perigee parameters
@@ -211,8 +211,8 @@ $$
 
 Without ACTS, the track's covariance is the hit-fit covariance (§3.5) at $s_r = 0$ with $l_1 = z_0$.
 
-**Sources** — Code: [tracks.py:_perigee_from_circle](../train/downstream/vertexing/tracks.py#L261),
-[tracks.py:_circle_from_perigee](../train/downstream/vertexing/tracks.py#L279).
+**Sources** — Code: [tracks.py:_perigee_from_circle](../train/downstream/vertexing/tracks.py#L268),
+[helix_tools.py:_helix_centre](../train/downstream/vertexing/helix_tools.py#L61).
 ACTS: [PerigeeSurface.hpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/include/Acts/Surfaces/PerigeeSurface.hpp).
 Maths: [12].
 
@@ -295,7 +295,7 @@ $w$ multiplies each track's weight in every vertex fit (§9).
 **Differs from ACTS:** ACTS's vertexing has no per-track weight ($w = 1$); here it is the track finder's
 $P(\text{real})$ and a place for learning.
 
-**Sources** — Code: [tracks.py:TrackBuilder._usable](../train/downstream/vertexing/tracks.py#L498),
+**Sources** — Code: [tracks.py:TrackBuilder._usable](../train/downstream/vertexing/tracks.py#L491),
 [tracks.py:TrackBuilder.forward](../train/downstream/vertexing/tracks.py#L604) (from line 604 on).
 ACTS: none. Maths: —.
 
@@ -351,10 +351,10 @@ $\mathbf{c}_0 = \mathbf{q}' - A\mathbf{p} - B\boldsymbol{\pi}'$, and the track w
 **Differs from ACTS:** ACTS propagates numerically to the perigee surface; here the helix is transported
 analytically (uniform $B_z$ per track, the value at its perigee), in cm.
 
-**Sources** — Code: [helix_tools.py:_perigee_at](../train/downstream/vertexing/helix_tools.py#L61),
-[helix_tools.py:_impact_3d](../train/downstream/vertexing/helix_tools.py#L77),
-[helix_tools.py:_transport](../train/downstream/vertexing/helix_tools.py#L142),
-[helix_tools.py:_linearise](../train/downstream/vertexing/helix_tools.py#L149).
+**Sources** — Code: [helix_tools.py:_perigee_at](../train/downstream/vertexing/helix_tools.py#L76),
+[helix_tools.py:_impact_3d](../train/downstream/vertexing/helix_tools.py#L91),
+[helix_tools.py:_transport](../train/downstream/vertexing/helix_tools.py#L170),
+[helix_tools.py:_linearise](../train/downstream/vertexing/helix_tools.py#L177).
 ACTS: [HelicalTrackLinearizer.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/HelicalTrackLinearizer.cpp),
 [ImpactPointEstimator.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/ImpactPointEstimator.cpp).
 Maths: [2], [6].
@@ -386,8 +386,8 @@ $$
 Each track's momentum refitted to the vertex: $\tilde{\boldsymbol{\pi}}_i = W_i B_i^T G_i\,\mathbf{r}_i$ (used for SV
 momenta, §12).
 
-**Sources** — Code: [vertexfit.py:VertexFit._kalman](../train/downstream/vertexing/vertexfit.py#L189),
-[secondaryvertex.py:SecondaryVertices._vertex_momentum](../train/downstream/vertexing/secondaryvertex.py#L159).
+**Sources** — Code: [vertexfit.py:VertexFit._kalman](../train/downstream/vertexing/vertexfit.py#L137),
+[secondaryvertex.py:SecondaryVertices._vertex_momentum](../train/downstream/vertexing/secondaryvertex.py#L190).
 ACTS: [KalmanVertexUpdater.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/KalmanVertexUpdater.cpp),
 [KalmanVertexUpdater.hpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/include/Acts/Vertexing/KalmanVertexUpdater.hpp).
 Maths: [4], [5], [6].
@@ -419,10 +419,10 @@ Temperatures: one, $T = 1$ (as ACTS's example algorithm). The fit stops after th
 shift satisfies $\Delta\mathbf{x}^T C_v^{-1}\Delta\mathbf{x} \le 0.01$ (`max_relative_shift`), or after 30 iterations.
 With `shared=False` (SV seeds) the sum in the denominator has only the vertex's own term.
 
-**Sources** — Code: [vertexfit.py:VertexFit._fit](../train/downstream/vertexing/vertexfit.py#L211),
-[vertexfit.py:VertexFit._compatibility](../train/downstream/vertexing/vertexfit.py#L171),
-[vertexfit.py:VertexFit._relinearise](../train/downstream/vertexing/vertexfit.py#L178),
-[vertexfit.py:VertexFit._new_vertices](../train/downstream/vertexing/vertexfit.py#L134).
+**Sources** — Code: [vertexfit.py:VertexFit.fit](../train/downstream/vertexing/vertexfit.py#L155),
+[vertexfit.py:VertexFit.compatibility](../train/downstream/vertexing/vertexfit.py#L121),
+[vertexfit.py:VertexFit._relinearise](../train/downstream/vertexing/vertexfit.py#L128),
+[vertexfit.py:VertexFit.new_vertices](../train/downstream/vertexing/vertexfit.py#L85).
 ACTS: [AdaptiveMultiVertexFitter.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/AdaptiveMultiVertexFitter.cpp),
 [AdaptiveMultiVertexFitter.hpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/include/Acts/Vertexing/AdaptiveMultiVertexFitter.hpp),
 [AnnealingUtility.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Utilities/AnnealingUtility.cpp),
@@ -486,9 +486,9 @@ fallback with relaxed preselection (ACTS returns no vertex); a cap of `max_verti
 beam-spot constraint, as in ACTS's shipped AMVF: the prior is the seed with 1 cm² in each coordinate.
 
 **Sources** — Code: [primaryvertex.py:_density_seed](../train/downstream/vertexing/primaryvertex.py#L15),
-[primaryvertex.py:PrimaryVertices._links](../train/downstream/vertexing/primaryvertex.py#L61),
-[primaryvertex.py:PrimaryVertices._find_primary](../train/downstream/vertexing/primaryvertex.py#L72),
-[vertexhead.py:VertexHead.forward](../train/downstream/vertexing/vertexhead.py#L148) (fallback, PV).
+[primaryvertex.py:PrimaryVertices._links](../train/downstream/vertexing/primaryvertex.py#L125),
+[primaryvertex.py:PrimaryVertices._amvf](../train/downstream/vertexing/primaryvertex.py#L137),
+[primaryvertex.py:PrimaryVertices.forward](../train/downstream/vertexing/primaryvertex.py#L103) (fallback), [vertexhead.py:VertexHead.forward](../train/downstream/vertexing/vertexhead.py#L110) (PV).
 ACTS: [AdaptiveMultiVertexFinder.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/AdaptiveMultiVertexFinder.cpp)
 (`doSeeding`, `canRecoverFromNoCompatibleTracks`, `keepNewVertex`, `isMergedVertex`),
 [AdaptiveMultiVertexFinder.hpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/include/Acts/Vertexing/AdaptiveMultiVertexFinder.hpp),
@@ -516,7 +516,7 @@ selection of §12 step 4 stay hard.
 **Differs from ACTS:** ACTS uses hard cuts throughout.
 
 **Sources** — Code: [helix_tools.py:_soft_below](../train/downstream/vertexing/helix_tools.py#L35),
-[vertexfit.py:VertexFit._width](../train/downstream/vertexing/vertexfit.py#L125).
+[vertexfit.py:VertexFit.width](../train/downstream/vertexing/vertexfit.py#L76).
 ACTS: none (ACTS cuts are hard). Maths: —.
 
 ## 12. Secondary vertices
@@ -572,10 +572,10 @@ with the refitted momenta $\tilde{\boldsymbol{\pi}}_i$ of §8; plus the seed's p
 **Differs from sPHENIX/ACTS:** soft candidate and seed cuts; the TPC-only displacement test by $\chi^2_\text{PV}$; helix
 (not straight-line) intersections, tangents and 3D impact; the ACTS vertex fit (§9) for every seed.
 
-**Sources** — Code: [secondaryvertex.py:SecondaryVertices._find_secondary](../train/downstream/vertexing/secondaryvertex.py#L72),
-[secondaryvertex.py:SecondaryVertices._sv_seeds](../train/downstream/vertexing/secondaryvertex.py#L14),
-[secondaryvertex.py:SecondaryVertices._sv_outputs](../train/downstream/vertexing/secondaryvertex.py#L136),
-[secondaryvertex.py:SecondaryVertices._vertex_momentum](../train/downstream/vertexing/secondaryvertex.py#L159).
+**Sources** — Code: [secondaryvertex.py:SecondaryVertices.forward](../train/downstream/vertexing/secondaryvertex.py#L101),
+[secondaryvertex.py:SecondaryVertices._sv_seeds](../train/downstream/vertexing/secondaryvertex.py#L59),
+[secondaryvertex.py:SecondaryVertices.outputs](../train/downstream/vertexing/secondaryvertex.py#L168),
+[secondaryvertex.py:SecondaryVertices._vertex_momentum](../train/downstream/vertexing/secondaryvertex.py#L190).
 sPHENIX: [SecondaryVertexFinder.cc](https://github.com/sPHENIX-Collaboration/coresoftware/blob/master/offline/packages/trackreco/SecondaryVertexFinder.cc),
 [SecondaryVertexFinder.h](https://github.com/sPHENIX-Collaboration/coresoftware/blob/master/offline/packages/trackreco/SecondaryVertexFinder.h)
 (master branch; not pinned). ACTS: as §9.

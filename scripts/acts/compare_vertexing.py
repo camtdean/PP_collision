@@ -50,7 +50,7 @@ TRACK_COLUMNS = ["trackId", *PARAMS, *(f"var_{a}" for a in PARAMS),
                  *(f"cov_{a}{b}" for a in PARAMS for b in PARAMS if a != b)]   # CsvTrackParameterReader's columns
 COLUMNS = ("batch_idx", "E_norm", "eta_norm", "phi_norm", "r_norm", "pred_assignment", "seg_target", "reco_vtx_x",
            "reco_vtx_y", "reco_vtx_z", "test_truth_vtx_x", "test_truth_vtx_y", "test_truth_vtx_z", "vtx_x", "vtx_y", "vtx_z")
-TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "displaced_mask")
+TRACK_KEYS = ("track_parameters", "track_covariance", "track_weight", "track_input_mask", "displaced_mask")
 SV_TRACK_KEYS = ("sv_track_mask", "sv_track_weight")
 
 
@@ -176,7 +176,7 @@ def secondary_vertices(outs, events):
 
 
 def acts_vertices(head, outs):
-    """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (weight > 0), errors
+    """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (track_input_mask), errors
     scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one) and the vertices per
     event."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -184,7 +184,7 @@ def acts_vertices(head, outs):
             params = o["track_parameters"][0].double().numpy().copy()
             params[:, :2] *= vh.MM_PER_CM                                         # d0, z0: cm -> mm
             cov = o["track_covariance"][0].double().numpy() * head.tracks.track_error_scale ** 2
-            keep = (o["track_weight"][0] > 0).numpy() & np.isfinite(params[:, :5]).all(1) & np.isfinite(cov).all((1, 2))
+            keep = o["track_input_mask"][0].numpy()
             with open(os.path.join(tmp, f"event{e:09d}-tracks.csv"), "w", newline="") as f:
                 writer = csv.writer(f, lineterminator="\n")   # LF only: ACTS keeps a CR in the last column
                 writer.writerow(TRACK_COLUMNS)

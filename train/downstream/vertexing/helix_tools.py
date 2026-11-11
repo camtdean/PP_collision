@@ -58,12 +58,26 @@ def _helix_radius(p, bz):
     return torch.sin(p[..., 3]) / (p[..., 4] * K_CM * bz)
 
 
+def _helix_centre(p, bz, beam):
+    """The helix's circle centre in x-y (..., 2) and its signed radius (...); p (..., 5)."""
+    rho, phi = _helix_radius(p, bz), p[..., 2]
+    return (beam + p[..., 0].unsqueeze(-1) * torch.stack([-torch.sin(phi), torch.cos(phi)], -1)
+            + rho.unsqueeze(-1) * torch.stack([torch.sin(phi), -torch.cos(phi)], -1)), rho
+
+
+def _helix_at(p, rho, centre, xy):
+    """The helix at the x-y point xy (..., 2): its position (..., 3) (z by arc length) and unit direction."""
+    _, t = _circle_point(centre, rho, xy)
+    z = p[..., 1] - rho * _wrap(torch.atan2(t[..., 1], t[..., 0]) - p[..., 2]) / torch.tan(p[..., 3])
+    return (torch.cat([xy, z.unsqueeze(-1)], -1),
+            torch.cat([torch.sin(p[..., 3]).unsqueeze(-1) * t, torch.cos(p[..., 3]).unsqueeze(-1)], -1))
+
+
 def _perigee_at(p, bz, beam, point):
     """The helix's perigee parameters (5,) at the line along z through point (3,) (z0 relative to point), and its
     point of closest approach in x-y (3,)."""
-    d0, z0, phi, theta = p[0], p[1], p[2], p[3]
-    rho = _helix_radius(p, bz)
-    centre = beam + d0 * torch.stack([-torch.sin(phi), torch.cos(phi)]) + rho * torch.stack([torch.sin(phi), -torch.cos(phi)])
+    z0, phi, theta = p[1], p[2], p[3]
+    centre, rho = _helix_centre(p, bz, beam)
     u = point[:2] - centre
     u = u / u.norm()
     pca = centre + rho.abs() * u
@@ -160,13 +174,14 @@ def _transport(perigee, covariance, bz, beam, point):
     return new, J @ covariance @ J.transpose(-1, -2), pca
 
 
-def _linearise(perigee, covariance, bz, beam, point):
+def _linearise(perigee, covariance, bz, beam, point, transport=None):
     """
     The tracks linearised at point (..., 3) (Piacquadio's helix Jacobians, as ACTS's HelicalTrackLinearizer):
     perigee parameters q(x, p) ~ c + A x + B p of the vertex x and the momentum p = (phi, theta, q/p) there.
     Returns A, B (..., 5, 3), q - c (..., 5) at the linearisation and the weight G = cov^-1 (..., 5, 5).
+    transport: the tracks already transported to point (_transport's).
     """
-    q, cov, pca = _transport(perigee, covariance, bz, beam, point)
+    q, cov, pca = _transport(perigee, covariance, bz, beam, point) if transport is None else transport
     phi, theta = q[..., 2], q[..., 3]
     rho = _helix_radius(q, bz)
     h = torch.where(rho < 0, -1.0, 1.0).to(rho.dtype)

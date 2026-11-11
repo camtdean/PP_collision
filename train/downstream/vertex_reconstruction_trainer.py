@@ -479,7 +479,7 @@ class DownstreamTrainer():
         VertexHead once over several loader batches, padded to a common size; returns each batch's
         (vertex_estimate, fit_is_valid, per event: usable, acts_failed, acts_refit_failed (0 without) track counts and
         vertex_from_fallback). Each event keeps only the track slots VertexHead can fit, those at least
-        min_hits real hits are assigned to (VertexHead's argmax), and the hits of the others stay unassigned: the
+        min_hits real hits are assigned to (vertexing.assign_hits), and the hits of the others stay unassigned: the
         same result, without the track head's mostly empty max_gt_classes slots. VertexHead runs on vertex_device;
         the results come back to the CPU.
         """
@@ -487,8 +487,7 @@ class DownstreamTrainer():
         for r in records:
             for e in range(r["mask"].shape[0]):
                 probs, real = r["mask_probs"][e].float(), r["mask"][e]
-                assigned = real & (probs.max(dim=-1).values > 0)
-                best = probs.argmax(dim=-1)
+                best, assigned = vertexing.assign_hits(probs, real)
                 keep = torch.bincount(best[assigned], minlength=probs.shape[-1]) >= self.vertex_head.tracks.min_hits
                 slots = keep.nonzero(as_tuple=True)[0]
                 probs = probs * keep[best].unsqueeze(-1)    # hits on the other slots: unassigned

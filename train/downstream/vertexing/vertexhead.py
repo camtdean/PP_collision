@@ -1,8 +1,8 @@
 """
 vertexhead.py: VertexHead, vertex reconstruction from track-finder output and the training interface: TrackBuilder
 (tracks.py) then the primary and secondary vertices (primaryvertex.py's PrimaryVertices, secondaryvertex.py's
-SecondaryVertices, both on vertexfit.py's VertexFit: settings and the shared fit). The PV is the first vertex the
-AMVF keeps, refitted with the SVs sharing its tracks. ACTS's hard cuts are soft (sigmoids of width cut_softness_*);
+SecondaryVertices, both on vertexfit.py's VertexFit, the shared fit). The PV is the first vertex the AMVF keeps,
+refitted with the SVs sharing its tracks. ACTS's hard cuts are soft (sigmoids of width cut_softness_*);
 hard_cuts=True restores them (the check against ACTS).
 
 Inputs: class_probs (B, T, 2), mask_probs (B, N, T), normalized points (B, N, 4), padding_mask (B, N);
@@ -10,16 +10,18 @@ B events, N hits, T track slots, K = max_sv_per_event. Positions in cm.
 """
 import functools
 import inspect
-import math
 import os
 
 import torch
+import torch.nn as nn
 
 from .helix_tools import _expand, _impact_at_points
 from .primaryvertex import PrimaryVertices
 from .secondaryvertex import SecondaryVertices
 from .tracks import TrackBuilder
 from .vertexfit import VertexFit
+
+_PARTS = (TrackBuilder, VertexFit, PrimaryVertices, SecondaryVertices)
 
 
 @functools.cache
@@ -28,30 +30,35 @@ def _setting_names(part):
     parameters = inspect.signature(part.__init__).parameters
     if any(p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL) for p in parameters.values()):
         raise TypeError(f"{part.__name__}.__init__ takes *args/**kwargs; VertexHead needs every setting named")
-    return frozenset(parameters) - {"self"}
+    return frozenset(parameters) - {"self", "vertex_fit"}
 
 
-if _setting_names(TrackBuilder) & _setting_names(VertexFit) != {"beam_position"}:
-    raise TypeError(f"TrackBuilder and VertexFit share {sorted(_setting_names(TrackBuilder) & _setting_names(VertexFit))}; "
-                    "only beam_position may go to both")
+if sum(len(_setting_names(part)) for part in _PARTS) != len(frozenset().union(*map(_setting_names, _PARTS))):
+    raise TypeError("TrackBuilder, VertexFit, PrimaryVertices and SecondaryVertices must not share a setting's name")
 
 
-class VertexHead(PrimaryVertices, SecondaryVertices):
+class VertexHead(nn.Module):
     """
-    TrackBuilder (self.tracks) then the primary and secondary vertices. Takes the settings of TrackBuilder and VertexFit
-    as keywords (beam_position goes to both).
+    TrackBuilder (self.tracks) then the primary and secondary vertices (self.primary, self.secondary, on the fit
+    self.vertex_fit). Takes their settings as keywords.
+
+    Args:
+        find_secondary, refit_pv: SVs, and the PV refitted together with them (tracks shared).
     """
-    def __init__(self, **settings):
+    def __init__(self, find_secondary: bool = True, refit_pv: bool = True, **settings):
+        super().__init__()
         unknown = sorted(set(settings) - self.setting_names())
         if unknown:
             raise TypeError(f"VertexHead has no settings {unknown}")
-        super().__init__(**{k: v for k, v in settings.items() if k in _setting_names(VertexFit)})
-        self.tracks = TrackBuilder(**{k: v for k, v in settings.items() if k in _setting_names(TrackBuilder)})
+        part = lambda cls, *args: cls(*args, **{k: v for k, v in settings.items() if k in _setting_names(cls)})  # noqa: E731
+        self.find_secondary, self.refit_pv = find_secondary, refit_pv
+        self.tracks, self.vertex_fit = part(TrackBuilder), part(VertexFit)
+        self.primary, self.secondary = part(PrimaryVertices, self.vertex_fit), part(SecondaryVertices, self.vertex_fit)
 
     @staticmethod
     def setting_names():
-        """The settings VertexHead takes: those of TrackBuilder and VertexFit."""
-        return _setting_names(TrackBuilder) | _setting_names(VertexFit)
+        """The settings VertexHead takes: its own and those of TrackBuilder, VertexFit and the two vertex searches."""
+        return frozenset({"find_secondary", "refit_pv"}).union(*map(_setting_names, _PARTS))
 
     @classmethod
     def from_detector(cls, path, **overrides):
@@ -66,7 +73,7 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
         resolve = lambda p: p if p is None else os.path.join(base, os.path.expanduser(p))  # noqa: E731 - absolute stays
         field, acts, hit_errors = d.get("field", {}), d.get("acts", {}) or {}, d.get("hit_errors_cm", {})
         silicon = d.get("silicon_hit_errors_cm") or {}
-        # unset keys (None) take TrackBuilder's / VertexFit's defaults
+        # unset keys (None) take the parts' defaults
         kwargs = {
             "Bz": field.get("bz_tesla"),
             "beam_position": d.get("beam_position_cm"),
@@ -117,11 +124,12 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
                 vertex_from_fallback (B,) found with a looser track preselection (ACTS's kept none),
                 vertex_fallback_step (B,) which (0: as ACTS, -1: none); its quality: vertex_n_tracks (B,)
                 tracks with weight >= 0.5, vertex_ndf (B,) 2 sum(weights) - 3.
-                primary_vertices (B, V, 3) all vertices the finder kept, in the order found (V = max_vertices + 1;
-                the PV first, pv_index 0), primary_vertex_valid, primary_vertex_n_tracks (B, V), pv_index (B,),
+                primary_vertices (B, V, 3) all vertices the finder kept, in the order found (V = max_vertices;
+                the PV first), primary_vertex_valid, primary_vertex_n_tracks (B, V),
                 track_primary_vertex (B, T) each track's vertex (-1: none).
                 track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
-                track_quality_mask, track_sigma (B, T, 2) d0, z0 errors (cm) x track_error_scale, track_vertex_weight
+                track_quality_mask, track_input_mask (the vertex fit's tracks: a weight, a fit and a finite
+                covariance), track_sigma (B, T, 2) d0, z0 errors (cm) x track_error_scale, track_vertex_weight
                 (B, T) each track's weight in the PV fit, track_chi2 (its 3D compatibility), track_dca (B, T) and
                 track_closest_approach_point (B, T, 3) (the helix's 3D closest approach to the PV);
                 acts_failed (B, T) with use_acts: usable by the hit fit, lost by ACTS;
@@ -134,32 +142,10 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
                 (B, K), sv_momentum (B, K, 3) GeV, sv_track_mask, sv_track_weight (B, K, T), displaced_mask,
                 displaced_weight (B, T) the candidates.
         """
-        tracks = self.tracks(class_probs, mask_probs, points, padding_mask, track_parameters, track_covariance)
-        bad, track_weight = tracks["_bad"], tracks["track_weight"]
-        inputs = {"perigee": tracks["track_parameters"][..., :5], "covariance": tracks["_covariance"], "bz": tracks["_bz"],
-                  "n_hits": tracks["_n_hits"], "n_silicon_hits": tracks["_n_silicon_hits"]}
-        inputs["input"] = (track_weight > 0) & ~bad & torch.isfinite(inputs["covariance"]).all(dim=(-2, -1))
-        inputs["covariance"] = torch.where(inputs["input"][..., None, None], inputs["covariance"],
-                                           torch.eye(5, dtype=track_weight.dtype, device=track_weight.device))
-        inputs["perigee"] = torch.where(inputs["input"].unsqueeze(-1), inputs["perigee"],
-                                        inputs["perigee"].new_tensor([0.0, 0.0, 0.0, math.pi / 2, 1.0]))
-        track_weight = track_weight * inputs["input"]
-
+        tracks, inputs = self.tracks(class_probs, mask_probs, points, padding_mask, track_parameters, track_covariance)
+        bad = tracks["track_parameters"][..., 0].isnan()                 # tracks without a fit
         # the vertices kept: the first slots, in the order found (the PV: slot 0)
-        state, kept = self._find_primary(inputs, track_weight, (self.tracks_max_z_interval, self.tracks_max_significance))
-        step = torch.where(kept.any(dim=1), 0, -1)
-        for k, preselection in enumerate(self.fallback_preselection if self.pv_fallback and not self.hard_cuts else ()):
-            # events without a vertex (only those): searched again with a looser preselection
-            missing = (step < 0).nonzero().squeeze(1)
-            if not len(missing):
-                break
-            again, again_kept = self._find_primary({key: v[missing] for key, v in inputs.items()}, track_weight[missing],
-                                                   preselection)
-            use = again_kept.any(dim=1)
-            found = (missing[use],)
-            state = {key: value.index_put(found, again[key][use]) for key, value in state.items()}
-            kept = kept.index_put(found, again_kept[use])
-            step = step.index_put(found, step.new_tensor(k + 1))
+        state, kept, step = self.primary(inputs)
         valid = step >= 0
         pv_state = {k: v[:, :1] for k, v in state.items()}
         pv = pv_state["position"][:, 0].masked_fill(~valid.unsqueeze(-1), torch.nan)
@@ -167,22 +153,22 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
         result = {}
         if self.find_secondary:
             # the other primary vertices' tracks are theirs (weight x (1 - their fit weight))
-            others = (state["weight"] * (state["links"] > 0.5) * kept.unsqueeze(-1))[:, 1:].amax(dim=1)
-            result, sv_state, sv_ok = self._find_secondary(inputs, track_weight * (others < 0.5), pv, pv_state)
+            others = (state["weight"] * (state["links"] > 0.5) * (kept & (torch.arange(
+                kept.shape[1], device=kept.device) > 0)).unsqueeze(-1)).amax(dim=1)
+            result, sv_state, sv_ok = self.secondary({**inputs, "weight": inputs["weight"] * (others < 0.5)}, pv, pv_state)
             if self.refit_pv and sv_ok.any():
                 # the PV and its SVs fitted together (tracks shared) where the event has an SV; the pileup list too
                 joint = {k: torch.cat([v, sv_state[k]], dim=1) for k, v in pv_state.items()}
-                self._fit(joint, torch.cat([(valid & sv_ok.any(dim=1)).unsqueeze(1), sv_ok], dim=1), track_weight, inputs)
+                self.vertex_fit.fit(joint, torch.cat([(valid & sv_ok.any(dim=1)).unsqueeze(1), sv_ok], dim=1), inputs)
                 pv_state, sv_state = {k: v[:, :1] for k, v in joint.items()}, {k: v[:, 1:] for k, v in joint.items()}
                 state = {k: torch.cat([pv_state[k], v[:, 1:]], dim=1) for k, v in state.items()}
                 pv = pv_state["position"][:, 0].masked_fill(~valid.unsqueeze(-1), torch.nan)
             # the SV outputs, measured from the (refitted) PV
-            result = {**self._sv_outputs(sv_state, sv_ok, pv, pv_state["covariance"][:, 0]), **result}
+            result = {**self.secondary.outputs(sv_state, sv_ok, pv, pv_state["covariance"][:, 0]), **result}
 
         # the PV's outputs; per-track ones NaN for tracks without a fit
         weight = (pv_state["weight"] * (pv_state["links"] > 0.5))[:, 0]
-        loc, axes = _impact_at_points(inputs["perigee"], inputs["bz"], inputs["perigee"].new_tensor(self.beam_position),
-                                      pv.nan_to_num().unsqueeze(1))
+        loc, axes = _impact_at_points(inputs["perigee"], inputs["bz"], inputs["beam"], pv.nan_to_num().unsqueeze(1))
         per_track = lambda v: v.masked_fill(_expand(bad | ~valid.unsqueeze(-1), v), torch.nan)  # noqa: E731
         result.update({
             "vertex_estimate": pv, "fit_is_valid": valid, "vertex_from_fallback": step > 0,
@@ -191,7 +177,7 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
             "chi_square": pv_state["chi2"][:, 0].masked_fill(~valid, torch.nan),
             "vertex_ndf": pv_state["ndf"][:, 0].masked_fill(~valid, torch.nan),
             "track_vertex_weight": weight.masked_fill(bad, 0.0), "vertex_n_tracks": (weight >= 0.5).sum(-1),
-            "track_chi2": per_track(self._compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)),
+            "track_chi2": per_track(self.vertex_fit.compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)),
             "track_dca": per_track(loc.norm(dim=-1)),
             "track_closest_approach_point": per_track(pv.nan_to_num().unsqueeze(1) + (loc.unsqueeze(-1) * axes).sum(-2)),
         })
@@ -202,7 +188,6 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
             "primary_vertices": state["position"].masked_fill(~kept.unsqueeze(-1), torch.nan),
             "primary_vertex_valid": kept,
             "primary_vertex_n_tracks": (fit_weight >= 0.5).sum(-1),
-            "pv_index": torch.zeros_like(step),
             "track_primary_vertex": torch.where(best >= 0.5, index, -1),
         })
-        return {**{k: v for k, v in tracks.items() if not k.startswith("_")}, **result}
+        return {**tracks, **result}

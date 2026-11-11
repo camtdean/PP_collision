@@ -5,13 +5,57 @@ selection (circle intersections of displaced tracks), each seed fitted with Vert
 import math
 
 import torch
+import torch.nn as nn
 
-from .helix_tools import _circle_point, _expand, _helix_radius, _perigee_at_points, _soft_above, _soft_below, _wrap
-from .vertexfit import VertexFit
+from .helix_tools import _expand, _helix_at, _helix_centre, _perigee_at_points, _soft_above, _soft_below
+from .vertexfit import _events
 
 
-class SecondaryVertices(VertexFit):
-    """VertexHead's secondary-vertex search and outputs (on VertexFit's settings and fit)."""
+class SecondaryVertices(nn.Module):
+    """
+    VertexHead's secondary-vertex search and outputs, on the vertex fit vertex_fit (VertexFit). Defaults: sPHENIX's
+    SecondaryVertexFinder; cm.
+
+    Args:
+        sv_min_track_hits: SV track candidates' TPC hits; displaced from the PV: tracks with silicon hits by
+            sPHENIX's impact cuts sv_min_track_dca_xy, sv_min_track_dca_z (cm), TPC-only tracks (their resolution
+            is too coarse for those) by compatibility with the PV above sv_min_track_pv_chi2; tracks of the other
+            primary vertices are not candidates.
+        sv_max_radius, sv_max_projected_dz, sv_max_pair_dca, sv_min_path (cm): pair seeds at circle intersections.
+        sv_max_track_chi2: further tracks attached to a seed; sv_max_chi2_per_dof; sv_merge_distance (cm): one SV per
+            group closer than this; max_sv_per_event.
+    """
+    def __init__(
+        self,
+        vertex_fit,
+        sv_min_track_dca_xy: float = 0.02,
+        sv_min_track_dca_z: float = 0.02,
+        sv_min_track_hits: int = 20,
+        sv_min_track_pv_chi2: float = 9.0,
+        sv_max_radius: float = 40.0,
+        sv_max_projected_dz: float = 1.0,
+        sv_max_pair_dca: float = 0.5,
+        sv_min_path: float = 0.2,
+        sv_max_track_chi2: float = 9.0,
+        sv_max_chi2_per_dof: float = 10.0,
+        sv_merge_distance: float = 0.1,
+        max_sv_per_event: int = 6,
+    ):
+        super().__init__()
+        self.vertex_fit = vertex_fit
+        self.sv_min_track_dca_xy = sv_min_track_dca_xy
+        self.sv_min_track_dca_z = sv_min_track_dca_z
+        self.sv_min_track_hits = sv_min_track_hits
+        self.sv_min_track_pv_chi2 = sv_min_track_pv_chi2
+        self.sv_max_radius = sv_max_radius
+        self.sv_max_projected_dz = sv_max_projected_dz
+        self.sv_max_pair_dca = sv_max_pair_dca
+        self.sv_min_path = sv_min_path
+        self.sv_max_track_chi2 = sv_max_track_chi2
+        self.sv_max_chi2_per_dof = sv_max_chi2_per_dof
+        self.sv_merge_distance = sv_merge_distance
+        self.max_sv_per_event = max_sv_per_event
+
     def _sv_seeds(self, tracks, candidate, pv):
         """
         Pair seeds (B, P, 3) and their pair DCA (B, P) of candidate tracks (B, T): the x-y intersections of their
@@ -19,12 +63,8 @@ class SecondaryVertices(VertexFit):
         than sv_max_pair_dca, the midpoint further than sv_min_path from the PV (soft; score (B, P)); and the pairs'
         tracks (B, P, 2).
         """
-        perigee, bz = tracks["perigee"], tracks["bz"]
-        beam = perigee.new_tensor(self.beam_position)
-        d0, phi = perigee[..., 0], perigee[..., 2]
-        rho = _helix_radius(perigee, bz)
-        centre = beam + d0.unsqueeze(-1) * torch.stack([-torch.sin(phi), torch.cos(phi)], -1) \
-            + rho.unsqueeze(-1) * torch.stack([torch.sin(phi), -torch.cos(phi)], -1)
+        perigee = tracks["perigee"]
+        centre, rho = _helix_centre(perigee, tracks["bz"], tracks["beam"])
         n_tracks = perigee.shape[1]
         i, j = torch.triu_indices(n_tracks, n_tracks, offset=1, device=perigee.device)
         c1, c2, r1, r2 = centre[:, i], centre[:, j], rho[:, i].abs(), rho[:, j].abs()
@@ -37,19 +77,9 @@ class SecondaryVertices(VertexFit):
         across = torch.stack([-along[..., 1], along[..., 0]], -1)
         base = c1 + a.unsqueeze(-1) * along
         points = torch.stack([base + h.unsqueeze(-1) * across, base - h.unsqueeze(-1) * across], 2)   # (B, pairs, 2, 2)
-
-        def at(track, xy):
-            """Each track's helix at the x-y point xy: position (z by arc length) and unit direction."""
-            q = perigee[:, track].unsqueeze(2).expand(-1, -1, 2, -1)
-            p_rho = rho[:, track].unsqueeze(2)
-            _, t = _circle_point(centre[:, track].unsqueeze(2), p_rho, xy)
-            phi_at = torch.atan2(t[..., 1], t[..., 0])
-            z = q[..., 1] - p_rho * _wrap(phi_at - q[..., 2]) / torch.tan(q[..., 3])
-            sin_t = torch.sin(q[..., 3]).unsqueeze(-1)
-            return (torch.cat([xy, z.unsqueeze(-1)], -1),
-                    torch.cat([sin_t * t, torch.cos(q[..., 3]).unsqueeze(-1)], -1))
-        x1, u1 = at(i, points)
-        x2, u2 = at(j, points)
+        # each pair's helices at its two intersections
+        x1, u1 = _helix_at(perigee[:, i].unsqueeze(2).expand(-1, -1, 2, -1), rho[:, i].unsqueeze(2), centre[:, i].unsqueeze(2), points)
+        x2, u2 = _helix_at(perigee[:, j].unsqueeze(2).expand(-1, -1, 2, -1), rho[:, j].unsqueeze(2), centre[:, j].unsqueeze(2), points)
         # the tangent lines' closest approach
         w0, b = x1 - x2, (u1 * u2).sum(-1)
         d1, d2 = (u1 * w0).sum(-1), (u2 * w0).sum(-1)
@@ -57,7 +87,7 @@ class SecondaryVertices(VertexFit):
         s1, s2 = (b * d2 - d1) / denominator, (d2 - b * d1) / denominator
         p1, p2 = x1 + s1.unsqueeze(-1) * u1, x2 + s2.unsqueeze(-1) * u2
         pair_dca, midpoint = (p1 - p2).norm(dim=-1), (p1 + p2) / 2
-        cm = self._width("cm")
+        cm = self.vertex_fit.width("cm")
         score = (meets.unsqueeze(-1).to(d.dtype)
                  * _soft_below(points.norm(dim=-1), self.sv_max_radius, cm)
                  * _soft_below((x1[..., 2] - x2[..., 2]).abs(), self.sv_max_projected_dz, cm)
@@ -68,18 +98,18 @@ class SecondaryVertices(VertexFit):
         return (midpoint.reshape(n_events, -1, 3), pair_dca.reshape(n_events, -1), score.reshape(n_events, -1),
                 pairs.unsqueeze(0).expand(n_events, -1, -1))
 
-    def _find_secondary(self, tracks, track_weight, pv, pv_state):
-        """SV finding after the PV (track_weight: without the other primary vertices' tracks): sv_pair_dca,
-        displaced_mask, displaced_weight; the SV states and which are valid."""
+    def forward(self, tracks, pv, pv_state):
+        """SV finding after the PV (tracks' weight: without the other primary vertices' tracks): sv_pair_dca,
+        displaced_mask, displaced_weight; the SV states (B, K = max_sv_per_event) and which are valid."""
+        vertex_fit, track_weight = self.vertex_fit, tracks["weight"]
         n_events, n_tracks = track_weight.shape
         dtype, device = track_weight.dtype, track_weight.device
         K = self.max_sv_per_event
         # candidates (soft): at least sv_min_track_hits TPC hits; displaced from the PV: with silicon hits by
         # sPHENIX's impact cuts (sv_min_track_dca_xy / _z), TPC-only by PV compatibility (sv_min_track_pv_chi2)
-        q, _ = _perigee_at_points(tracks["perigee"], tracks["bz"], tracks["perigee"].new_tensor(self.beam_position),
-                                  pv.nan_to_num().unsqueeze(1))
-        cm, sigma = self._width("cm"), self._width("sigma")
-        pv_chi2 = self._compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)
+        q, _ = _perigee_at_points(tracks["perigee"], tracks["bz"], tracks["beam"], pv.nan_to_num().unsqueeze(1))
+        cm, sigma = vertex_fit.width("cm"), vertex_fit.width("sigma")
+        pv_chi2 = vertex_fit.compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)
         displaced = torch.where(
             tracks["n_silicon_hits"] > 0,
             _soft_above(q[..., 0].abs(), self.sv_min_track_dca_xy, cm) * _soft_above(q[..., 1].abs(),
@@ -87,7 +117,7 @@ class SecondaryVertices(VertexFit):
             _soft_above(pv_chi2, self.sv_min_track_pv_chi2, sigma * 2 * math.sqrt(self.sv_min_track_pv_chi2)))
         candidate_weight = (displaced * (track_weight > 0) * tracks["input"].to(dtype)
                             * _soft_above(tracks["n_hits"] - tracks["n_silicon_hits"], self.sv_min_track_hits - 0.5,
-                                          self._width("hits"))
+                                          vertex_fit.width("hits"))
                             * torch.isfinite(pv).all(-1, keepdim=True))
         candidate = candidate_weight > 0.5
         if n_tracks >= 2:
@@ -107,17 +137,23 @@ class SecondaryVertices(VertexFit):
         seed = torch.where(seed_ok.unsqueeze(-1), seeds.gather(1, best.unsqueeze(-1).expand(-1, -1, 3)), torch.nan)
         seed_pair_dca = pair_dca.gather(1, best).masked_fill(~seed_ok, torch.nan)
         pair = pairs.gather(1, best.unsqueeze(-1).expand(-1, -1, 2))
+        # the seeds' states (the slots without a seed stay empty)
+        state = vertex_fit.empty_vertices(n_events, K, n_tracks, dtype, device)
+        at = seed_ok.nonzero(as_tuple=True)
+        if len(at[0]):
+            fresh = vertex_fit.new_vertices(seed[at].unsqueeze(1), torch.zeros(len(at[0]), 1, n_tracks, dtype=dtype,
+                                                                                device=device),
+                                            _events(tracks, at[0]), guarded=True)
+            state = {key: value.index_put(at, fresh[key][:, 0]) for key, value in state.items()}
         # each seed's tracks: its pair, and candidates compatible with the seed (chi2 <= sv_max_track_chi2, soft)
-        state = self._new_vertices(seed, torch.zeros(n_events, K, n_tracks, dtype=dtype, device=device), tracks,
-                                   guarded=True)
-        compatible = _soft_below(self._compatibility(state, seed), self.sv_max_track_chi2,
+        compatible = _soft_below(vertex_fit.compatibility(state, seed), self.sv_max_track_chi2,
                                  sigma * 2 * math.sqrt(self.sv_max_track_chi2))
         in_pair = torch.zeros_like(compatible, dtype=torch.bool).scatter_(2, pair, True)
         links = torch.where(in_pair, 1.0, compatible) * candidate_weight.unsqueeze(1) * seed_ok.unsqueeze(-1)
         state["links"] = links
-        self._fit(state, seed_ok, track_weight, tracks, shared=False)
+        vertex_fit.fit(state, seed_ok, tracks, shared=False)
         chi2_per_dof = state["chi2"] / state["ndf"].clamp(min=1e-12)
-        ok = (seed_ok & (((links > 0.5) & (state["compatibility"] < self.max_vertex_chi2)).sum(-1) >= 2)
+        ok = (seed_ok & (((links > 0.5) & (state["compatibility"] < vertex_fit.max_vertex_chi2)).sum(-1) >= 2)
               & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
               & ((state["position"] - pv.unsqueeze(1)).norm(dim=-1) > self.sv_min_path))
         # one SV per group within sv_merge_distance: the lowest chi2/ndf (ties: the lower slot)
@@ -129,7 +165,7 @@ class SecondaryVertices(VertexFit):
         return ({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
                  "displaced_weight": track_weight * candidate_weight}, state, ok)
 
-    def _sv_outputs(self, state, ok, pv, pv_covariance):
+    def outputs(self, state, ok, pv, pv_covariance):
         """The SV outputs of SV states (B, K) kept where ok, measured from the PV pv (B, 3) with covariance (B, 3, 3):
         the fit, the momentum at the SV (its tracks refitted to it) and the KFParticle-style topology (decay length
         significance with the two vertices' covariances added)."""
