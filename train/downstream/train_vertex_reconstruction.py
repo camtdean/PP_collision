@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-Vertex reconstruction training (ML phase), laid out like train_track_finding.py: VertexHead's learnable parts
-(learn_weights) with the backbone and track head frozen. The training loop is not written yet, so this script stops
-first; evaluate with eval_vertex_reconstruction.py. Artifacts: {config}_nerf_vertex_head_d{N}_{run}_seed{seed}.
+Vertex reconstruction training, laid out like train_track_finding.py: LearnedVertexHead (--vertex_method learned)
+on the frozen backbone's features. Evaluate with eval_vertex_reconstruction.py. Artifacts:
+{config}_nerf_vertex_{method}_d{N}_{run}_seed{seed}.
 """
 import os
 import sys
-
-# until the training loop exists: stop before the slow imports
-if __name__ == "__main__":
-    sys.exit("VertexHead training is not written yet (ML phase). To evaluate:\n\n"
-             "    scripts/run/vertexing.sh eval   (or python eval_vertex_reconstruction.py --run_config <file>)")
 
 import argparse
 import gc
@@ -66,6 +61,14 @@ def main():
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
     parser.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility")
+    parser.add_argument("--vertex_method", default="learned", choices=["learned"], help="the vertexing method trained")
+    parser.add_argument("--truth_radius", default=1.0, type=float,
+                        help="cm: hits whose particle starts within this of the beam line make the truth vertices")
+    parser.add_argument("--detector", default=None, type=str, help="detector file (its beam_position_cm)")
+    parser.add_argument("--checkpoint_dir", default=None, type=str,
+                        help="where the log and checkpoints go (default: checkpoint_dir from the config)")
+    parser.add_argument("--val_events", default=None, type=int, help="validation events per epoch (default: all)")
+    parser.add_argument("--max_epochs", default=None, type=int, help="epochs (default: max_epochs from the config)")
     args = parser.parse_args()
 
     # seed before anything touches an RNG
@@ -83,7 +86,7 @@ def main():
     params.limit_size = int(args.eventnumber)
     params.valid_batch_size = 1
     # the seed appears in artifact names so runs at different seeds don't overwrite each other
-    base_name = f"{args.config}_nerf_vertex_head_d{params.limit_size}_{args.run_num}_seed{args.seed}"
+    base_name = f"{args.config}_nerf_vertex_{args.vertex_method}_d{params.limit_size}_{args.run_num}_seed{args.seed}"
     if args.usepretrain:
         params.log_file_name = base_name + ".log"
     else:
@@ -91,6 +94,11 @@ def main():
     params.num_embedder_layers = 0
     params.return_reg_test = True        # loaders then yield reg (truth) as a 4th element
     params.return_dict = False
+    params.vertex_method, params.truth_radius = args.vertex_method, args.truth_radius
+    for key, value in (("vertex_detector", args.detector), ("learned_vertex_val_events", args.val_events),
+                       ("max_epochs", args.max_epochs), ("checkpoint_dir", args.checkpoint_dir)):
+        if value is not None:
+            params[key] = value
 
     # Launch and train
     trainer = DownstreamTrainer(params, args)

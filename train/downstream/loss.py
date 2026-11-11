@@ -864,4 +864,74 @@ def compute_vertex_metrics(pred, target, valid, tol_cm=(0.5, 1.0, 2.0)):
     return metrics
 
 
+class VertexHungarianMatcher(PointHungarianMatcher):
+    """
+    PointHungarianMatcher with a position cost, for vertex slots.
+
+    Args:
+        cost_class, cost_dice, cost_focal: as PointHungarianMatcher.
+        cost_position: weight of the L1 distance between the predicted and true positions, each coordinate in
+            units of position_scale.
+        position_scale: (x, y, z) cm.
+    """
+    def __init__(self, cost_class=1, cost_dice=1, cost_focal=20, cost_position=1, position_scale=(1.0, 1.0, 10.0)):
+        super().__init__(cost_class, cost_dice, cost_focal)
+        self.cost_position = cost_position
+        self.register_buffer("position_scale", torch.tensor(position_scale))
+
+    def forward(self, outputs, targets, mask):
+        """
+        Args:
+            outputs: Dict with "pred_probs" (B, N_pred, C), "pred_masks" (B, N_pred, N_points) and
+                "pred_positions" (B, N_pred, 3)
+            targets: List of Dict with "labels" (N_gt), "masks" (N_gt, N_points) and "positions" (N_gt, 3)
+            mask: (B, N_points) indicating valid points
+        """
+        indices = []
+        for b, target in enumerate(targets):
+            pred_masks, gt_masks, valid = outputs["pred_masks"][b:b + 1], target["masks"].unsqueeze(0), mask[b:b + 1]
+            row_ind, col_ind = linear_sum_assignment((
+                -self.cost_class * outputs["pred_probs"][b][:, target["labels"]]
+                + self.cost_dice * batch_dice_loss(pred_masks, gt_masks, valid).squeeze(0)
+                + self.cost_focal * batch_focal_loss(pred_masks, gt_masks, valid).squeeze(0)
+                + self.cost_position * torch.cdist(outputs["pred_positions"][b].float() / self.position_scale,
+                                                   target["positions"].float() / self.position_scale, p=1)
+            ).detach().cpu())
+            indices.append((torch.as_tensor(row_ind, dtype=torch.int64, device=mask.device),
+                            torch.as_tensor(col_ind, dtype=torch.int64, device=mask.device)))
+        return indices
+
+
+def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0):
+    """
+    compute_point_loss for vertex slots, with the position loss of the matched slots.
+
+    Args:
+        outputs: {
+            "pred_probs": (B, N_pred, 2),  # Class probabilities (empty, real)
+            "pred_masks": (B, N_pred, N_points)  # Mask probabilities
+            "pred_positions": (B, N_pred, 3)  # cm
+            "pred_log_variance": (B, N_pred, 3)  # log of the position variance, cm^2
+        }
+        targets: list of dicts, each with: {
+            "labels": (N_gt),  # Class labels for GT vertices
+            "masks": (N_gt, N_points)  # Binary GT masks
+            "positions": (N_gt, 3)  # cm
+        }
+        mask: (B, N_points)  # Valid points mask
+        matcher: VertexHungarianMatcher instance
+    Returns:
+        compute_point_loss's dict (matched once, by matcher) with "loss_position": the Gaussian negative
+        log-likelihood of the true positions, summed over the matched slots and coordinates, / B.
+    """
+    indices = matcher(outputs, targets, mask)
+    losses = compute_point_loss(outputs, targets, mask, lambda *_: indices, no_object_class)
+    log_variance = outputs["pred_log_variance"][_get_src_permutation_idx(indices)].float()
+    losses["loss_position"] = 0.5 * (log_variance + (
+        outputs["pred_positions"][_get_src_permutation_idx(indices)].float()
+        - torch.cat([t["positions"][J] for t, (_, J) in zip(targets, indices)]).float()) ** 2 / log_variance.exp()
+    ).sum() / len(targets)
+    return losses
+
+
 #test_point_loss()

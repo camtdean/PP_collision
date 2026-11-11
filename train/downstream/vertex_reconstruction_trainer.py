@@ -39,8 +39,9 @@ import csv
 
 import vertexing
 from vertexing import VertexHead
+from vertexing.learnedvertex import LearnedVertexHead, LearnedVertexing
 from downstream_util import get_vertex_label
-from loss import compute_vertex_metrics, assign_points_to_masks
+from loss import compute_vertex_metrics, assign_points_to_masks, VertexHungarianMatcher, compute_vertex_set_loss
 
 PAD_VALUE = -100
 
@@ -162,6 +163,8 @@ class DownstreamTrainer():
         
         self.params = params
         self.use_amp = bool(getattr(self.params, 'use_amp', True))
+        # how vertices are found: fit (VertexHead) or learned (LearnedVertexing)
+        self.vertex_method = getattr(self.params, "vertex_method", None) or "fit"
         print("running on rank {} with world size {}".format(self.world_rank, self.world_size))
 
 
@@ -365,7 +368,7 @@ class DownstreamTrainer():
 
     def cleanup(self):
         # 1) break references to big objects
-        for obj in ("model", "down_model", "vertex_head",
+        for obj in ("model", "down_model", "vertex_head", "learned_vertex",
                     "optimizer", "vertex_optimizer",
                     "scheduler", "vertex_scheduler",
                     "train_data_loader", "val_data_loader"):
@@ -385,22 +388,32 @@ class DownstreamTrainer():
     # VertexHead's optimizer and scheduler (made by training) and their keys in a checkpoint
     _TRAINING_STATE = (("optimizer_state_dict", "vertex_optimizer"), ("scheduler_state_dict", "vertex_scheduler"))
 
+    def _trained_head(self):
+        """The module a checkpoint holds: LearnedVertexHead with vertex_method learned, else VertexHead."""
+        head = self.learned_vertex.head if self.vertex_method == "learned" else self.vertex_head
+        return getattr(head, "module", head)          # DDP-wrapped or not
+
     def _save_checkpoint(self, filename, epoch, is_best, loss):
-        """VertexHead's weights (its learnable parts; the backbone and track head stay frozen) and, once training has
-        made them, its optimizer and scheduler, with the run's params, to params.checkpoint_dir/filename."""
-        head = getattr(self.vertex_head, "module", self.vertex_head)          # DDP-wrapped or not
-        checkpoint = {"epoch": epoch, "model_state_dict": head.state_dict(), "best_loss": getattr(self, "best_loss", None),
-                      "current_loss": loss, "is_best": is_best, "params": vars(self.params)}
+        """The trained head's weights (_trained_head; the backbone and track head stay frozen) and, once training has
+        made them, its optimizer and scheduler, with vertex_method and the run's params, to
+        params.checkpoint_dir/filename."""
+        checkpoint = {"epoch": epoch, "model_state_dict": self._trained_head().state_dict(),
+                      "best_loss": getattr(self, "best_loss", None), "current_loss": loss, "is_best": is_best,
+                      "vertex_method": self.vertex_method, "params": vars(self.params)}
         for key, name in self._TRAINING_STATE:
             if getattr(self, name, None) is not None:
                 checkpoint[key] = getattr(self, name).state_dict()
         torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, filename))
 
     def load_checkpoint(self, checkpoint_path, inference=False):
-        """VertexHead's weights from a _save_checkpoint file (strict: VertexHead's settings must match); without
-        inference also its optimizer and scheduler where training made them, the next epoch and the best loss."""
+        """The trained head's weights (_trained_head) from a _save_checkpoint file (strict: its settings and
+        vertex_method must match); without inference also its optimizer and scheduler where training made them, the
+        next epoch and the best loss."""
         checkpoint, state = self._load_checkpoint_state(checkpoint_path, "model_state_dict")
-        getattr(self.vertex_head, "module", self.vertex_head).load_state_dict(state)
+        if checkpoint.get("vertex_method", "fit") != self.vertex_method:
+            raise ValueError(f"{checkpoint_path} is a vertex_method {checkpoint.get('vertex_method', 'fit')!r} "
+                             f"checkpoint; this run's is {self.vertex_method!r}")
+        self._trained_head().load_state_dict(state)
         if not inference:
             for key, name in self._TRAINING_STATE:
                 if getattr(self, name, None) is not None and key in checkpoint:
@@ -428,18 +441,196 @@ class DownstreamTrainer():
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     # ------------------------------------------------------------------------------------------
-    # Training (ML phase, loss not written): VertexHead's learnable parts (learn_weights) with the backbone and track
-    # head frozen; same names and signatures as the other trainers.
+    # Training: LearnedVertexHead (vertex_method learned) with the backbone frozen; same names and signatures as the
+    # other trainers. VertexHead's learnable parts (vertex_method fit) are not trained yet.
     # ------------------------------------------------------------------------------------------
 
+    # the terms of the training loss and their weights (params: learned_vertex_<term>_weight)
+    LEARNED_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
+                            "loss_position": 1.0}
+
+    def setup_learned_vertexing(self):
+        """
+        Build LearnedVertexing (after launch()). From params: any LearnedVertexHead or LearnedVertexing argument as
+        learned_vertex_<argument> (e.g. learned_vertex_n_vertex_slots, learned_vertex_real_threshold), each only where
+        set; pe_method; the track slots: max_gt_classes.
+        """
+        settings = lambda cls: {name: getattr(self.params, "learned_vertex_" + name)  # noqa: E731
+                                for name in inspect.signature(cls.__init__).parameters
+                                if getattr(self.params, "learned_vertex_" + name, None) is not None}
+        head = LearnedVertexHead(**{
+            "input_dim": self.params.embed_dim, "pe_method": getattr(self.params, "pe_method", "nerf"),
+            "num_feature_layers": 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone,
+            **settings(LearnedVertexHead)})
+        self.learned_vertex = LearnedVertexing(
+            head, **{"n_track_slots": self.params.max_gt_classes, **settings(LearnedVertexing)}).to(self.device)
+
+    def _beam_position(self):
+        """The beam line (x, y) cm of the truth labels: VertexHead's when built, else params.vertex_beam_position,
+        the detector file's (vertex_detector) beam_position_cm, TrackBuilder's default."""
+        if hasattr(self, "vertex_head"):
+            return self.vertex_head.tracks.beam_position
+        beam = getattr(self.params, "vertex_beam_position", None)
+        if beam is None and getattr(self.params, "vertex_detector", None):
+            import yaml
+            with open(self.params.vertex_detector) as f:
+                beam = yaml.safe_load(f).get("beam_position_cm")
+        return tuple(beam or inspect.signature(vertexing.tracks.TrackBuilder.__init__).parameters["beam_position"].default)
+
+    def _truth_labels(self, reg, label, mask):
+        """get_vertex_label over the hits whose particle starts within params.truth_radius of the beam line (padded
+        rows excluded: their zeros would pass); the truth PV: the origin shared by the most particles."""
+        beam = self._beam_position()
+        return get_vertex_label(reg, particle_id=label, valid_tracks=(torch.hypot(
+            reg[..., 3] - beam[0], reg[..., 4] - beam[1]) < self.params.truth_radius) & mask)
+
+    def _learned_vertex_loss(self, batch, pretrain, aux=True):
+        """
+        One loader batch (grouped, label, knearest, reg) through the frozen backbone and LearnedVertexing.
+
+        Returns (loss, terms, residual): the loss (LEARNED_LOSS_WEIGHTS over compute_vertex_set_loss's terms; with
+        aux the same on each of the head's aux outputs added), its terms of the final output as floats, and the PV
+        residual (cm) of the events with a predicted and a truth PV.
+        """
+        if len(batch) != 4:
+            raise RuntimeError("loader must yield (grouped, label, knearest, reg): the test set with "
+                               "params.return_reg_test = True before launch(), a training set with its "
+                               "dataset's return_reg = True")
+        grouped, label, _, reg = (t.to(self.device) if torch.is_tensor(t) else t for t in batch)
+        grouped = grouped.reshape(grouped.size(0), -1, grouped.size(-1))
+        mask = grouped[..., 0] != PAD_VALUE
+        with torch.no_grad():
+            _, pre_embed, _ = self.model(grouped, return_z=True)
+            truth = self._truth_labels(reg, label, mask)
+        outputs, raw = self.learned_vertex(grouped, self._layer_features(pre_embed), mask)
+        targets = [{"labels": torch.ones(n, dtype=torch.long, device=self.device),
+                    "masks": (hit_vertex == torch.arange(n, device=self.device).unsqueeze(-1)).float(),
+                    "positions": vertices[:n].float()}
+                   for n, hit_vertex, vertices in zip(truth["n_primary_vertices"].tolist(), truth["hit_vertex"],
+                                                      truth["primary_vertices"])]
+        loss, terms = 0.0, None
+        for out in [raw] + (raw["aux_list"] if aux else []):
+            losses = compute_vertex_set_loss(
+                {"pred_probs": out["vertex_class_probs"], "pred_masks": out["vertex_mask_probs"].permute(0, 2, 1),
+                 "pred_positions": out["vertex_position"], "pred_log_variance": out["vertex_log_variance"]},
+                targets, mask, self.matcher)
+            loss = loss + sum(weight * losses[term] for term, weight in self.loss_weights.items())
+            terms = terms or {term: losses[term].item() for term in self.loss_weights}
+        ok = outputs["fit_is_valid"] & truth["vertex_valid"]
+        return loss, terms, (outputs["vertex_estimate"] - truth["vertex_target"])[ok].norm(dim=-1).detach().cpu()
+
     def train(self, pretrain=True, train_from_checkpoint=False, checkpoint_path=None):
-        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
+        """
+        Train LearnedVertexHead (vertex_method learned) on the frozen backbone's features, in fp32. AdamW (max_lr,
+        weight decay 1e-4), gradient norm clipped to 1, cosine schedule with warmup stepped per epoch
+        (first_cycle_steps, default max_epochs; min_lr; warmup_steps). Each epoch: the training set, then the
+        validation set (its first learned_vertex_val_events events, default all).
+
+        Writes to params.checkpoint_dir: the log (log_file_name: per epoch the losses, the PV residual medians, the
+        validation loss terms), <log name>_checkpoint.pth at the best validation loss and
+        <log name>_best_pv_checkpoint.pth at the best validation PV residual median. Stops after
+        learned_vertex_patience epochs (default 15) without a better validation loss (by learned_vertex_min_delta,
+        default 1e-4), once past learned_vertex_early_stop_warmup epochs (default 60).
+
+        Args:
+            pretrain: backbone features (must be True); train_from_checkpoint, checkpoint_path: resume.
+        """
+        if self.vertex_method != "learned":
+            raise NotImplementedError(f"training with vertex_method {self.vertex_method!r} is not written yet")
+        if self.world_size > 1:
+            raise RuntimeError("the vertex training runs in one process: run it with python, not torchrun")
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False     # full fp32
+        self.setup_learned_vertexing()
+        head = self.learned_vertex.head
+        print(f"Total parameters in LearnedVertexHead: {sum(p.numel() for p in head.parameters())}")
+        self.train_data_loader.dataset.return_reg = True        # the training set yields reg too
+        get = lambda name, default: (lambda v: default if v is None else v)(  # noqa: E731
+            getattr(self.params, "learned_vertex_" + name, None))
+        self.loss_weights = {term: get(term + "_weight", weight) for term, weight in self.LEARNED_LOSS_WEIGHTS.items()}
+        self.matcher = VertexHungarianMatcher(
+            cost_class=self.loss_weights["loss_matched_ce"], cost_dice=self.loss_weights["loss_dice"],
+            cost_focal=self.loss_weights["loss_focal"], cost_position=get("cost_position_weight", 1.0),
+            position_scale=head.position_scale.tolist()).to(self.device)
+        self.vertex_optimizer = torch.optim.AdamW([p for p in head.parameters() if p.requires_grad],
+                                                  lr=self.params.max_lr, weight_decay=0.0001)
+        self.vertex_scheduler = CosineAnnealingWarmupRestarts(
+            self.vertex_optimizer, max_lr=self.params.max_lr, min_lr=self.params.min_lr,
+            first_cycle_steps=int(getattr(self.params, "first_cycle_steps", None) or self.params.max_epochs),
+            warmup_steps=self.params.warmup_steps)
+        self.best_loss = self.best_pv = float("inf")
+        if train_from_checkpoint:
+            self.load_checkpoint(checkpoint_path, inference=False)
+
+        os.makedirs(self.params.checkpoint_dir, exist_ok=True)
+        log_file_path = os.path.join(self.params.checkpoint_dir, self.params.log_file_name)
+        stem = self.params.log_file_name.split('.')[0]
+        terms = list(self.loss_weights)
+        if not train_from_checkpoint:
+            with open(log_file_path, "w") as f:
+                f.write("\t".join(["Epoch", "Train_Loss", "Val_Loss", "Train_PV_median_cm", "Val_PV_median_cm",
+                                   "Val_PV_rate"] + terms + ["Time"]) + "\n")
+        stagnation = 0
+        for epoch in range(self.startEpoch, self.params.max_epochs):
+            self.epoch, start = epoch, time.time()
+            self.down_results = {"train": [], "train_residual": [], "val": [], "val_residual": [], "val_events": 0,
+                                 **{term: [] for term in terms}}
+            self.downstream_end_to_end_one_epoch(pretrain=pretrain)
+            val_loss = self.validate_end_to_end_one_epoch(pretrain=pretrain)
+            median = lambda key: (lambda r: r.median().item() if len(r) else float("nan"))(  # noqa: E731
+                torch.cat(self.down_results[key]))
+            row = [np.mean(self.down_results["train"]), val_loss, median("train_residual"), median("val_residual"),
+                   sum(map(len, self.down_results["val_residual"])) / max(self.down_results["val_events"], 1)
+                   ] + [np.mean(self.down_results[term]) for term in terms] + [time.time() - start]
+            with open(log_file_path, "a") as f:
+                f.write("\t".join([str(epoch)] + [f"{v:.8f}" for v in row]) + "\n")
+            if self.log_to_screen:
+                print(f"Epoch {epoch}/{self.params.max_epochs - 1} | Time: {row[-1]:.2f}s\n"
+                      f"  Train Loss: {row[0]:.6f} | Val Loss: {row[1]:.6f}\n"
+                      f"  PV residual median (cm): train {row[2]:.4f} | val {row[3]:.4f} (PV found: {row[4]:.3f})\n  "
+                      + " | ".join(f"{term}: {v:.6f}" for term, v in zip(terms, row[5:])) + "\n" + "-" * 80)
+            if row[3] < self.best_pv:
+                self.best_pv = row[3]
+                self._save_checkpoint(stem + "_best_pv_checkpoint.pth", epoch, True, val_loss)
+            if val_loss < self.best_loss - get("min_delta", 1e-4):
+                self.best_loss, stagnation = val_loss, 0
+                self._save_checkpoint(stem + "_checkpoint.pth", epoch, True, val_loss)
+            elif epoch >= get("early_stop_warmup", 60):
+                stagnation += 1
+                if stagnation >= get("patience", 15):
+                    print(f"Early stopping at epoch {epoch}: best validation loss {self.best_loss:.4f}")
+                    break
+            self.vertex_scheduler.step()
 
     def downstream_end_to_end_one_epoch(self, pretrain=False):
-        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
+        """One epoch over the training set: LearnedVertexHead optimised, the backbone frozen."""
+        self.model.eval()
+        self.learned_vertex.train()
+        for batch in tqdm(self.train_data_loader, disable=not self.log_to_screen):
+            loss, _, residual = self._learned_vertex_loss(batch, pretrain)
+            self.vertex_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.learned_vertex.head.parameters(), max_norm=1.0)
+            self.vertex_optimizer.step()
+            self.down_results["train"].append(loss.item())
+            self.down_results["train_residual"].append(residual)
 
+    @torch.no_grad()
     def validate_end_to_end_one_epoch(self, pretrain=False):
-        raise NotImplementedError("VertexHead training is not written yet (ML phase)")
+        """The validation set (its first learned_vertex_val_events events, default all); returns the mean loss (of
+        the final output: no aux terms)."""
+        self.model.eval()
+        self.learned_vertex.eval()
+        max_events = getattr(self.params, "learned_vertex_val_events", None)
+        for batch in tqdm(self.val_data_loader, disable=not self.log_to_screen):
+            loss, terms, residual = self._learned_vertex_loss(batch, pretrain, aux=False)
+            self.down_results["val"].append(loss.item())
+            self.down_results["val_residual"].append(residual)
+            self.down_results["val_events"] += batch[0].size(0)
+            for term, value in terms.items():
+                self.down_results[term].append(value)
+            if max_events and self.down_results["val_events"] >= max_events:
+                break
+        return float(np.mean(self.down_results["val"]))
 
     # ------------------------------------------------------------------------------------------
     # VertexHead evaluation
@@ -581,12 +772,8 @@ class DownstreamTrainer():
             """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
             thread)."""
             t0 = time.perf_counter()
-            beam = self.vertex_head.tracks.beam_position
             for r in records:
-                # hits whose particle starts within truth_radius of the beam line (padded rows excluded: their zeros
-                # would pass); the truth PV: the origin shared by the most particles
-                r["truth"] = get_vertex_label(r["reg"], particle_id=r["label"], valid_tracks=(torch.hypot(
-                    r["reg"][..., 3] - beam[0], r["reg"][..., 4] - beam[1]) < self.params.truth_radius) & r["mask"])
+                r["truth"] = self._truth_labels(r["reg"], r["label"], r["mask"])
             t1 = time.perf_counter()
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 fitted = self._vertex_head_chunk(records)
