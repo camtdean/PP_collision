@@ -128,7 +128,7 @@ class VertexFit(nn.Module):
                                             "hits": self.cut_softness_hits}[kind]
 
     # --------------------------------------------------------------------------------------------
-    # Vertex states: (B, K) vertices, their tracks (B, K, T); the tracks' perigee etc. in self._tracks
+    # Vertex states: (B, K) vertices, their tracks (B, K, T)
     # --------------------------------------------------------------------------------------------
 
     def _new_vertices(self, seeds, links, tracks, prior=None, guarded=False):
@@ -235,12 +235,10 @@ class VertexFit(nn.Module):
                                     -1e30)
             log_denominator = torch.logaddexp(torch.logsumexp(log_terms, dim=1, keepdim=True) if shared else log_terms,
                                               log_terms.new_tensor(-self.annealing_cut_off / t2))
-            weight = torch.exp(log_terms - log_denominator).nan_to_num(0.0)
-            weight = torch.where(active.unsqueeze(-1), weight, state["weight"])
-            state["weight"] = weight
-            fit_weight = weight * (weight > self.fit_min_weight) * track_weight.unsqueeze(1)
-            position, covariance, chi2, ndf = self._kalman(state, fit_weight)
-            for key, value in (("position", position), ("covariance", covariance), ("chi2", chi2), ("ndf", ndf)):
+            state["weight"] = torch.where(active.unsqueeze(-1), torch.exp(log_terms - log_denominator).nan_to_num(0.0),
+                                          state["weight"])
+            for key, value in zip(("position", "covariance", "chi2", "ndf"), self._kalman(state, state["weight"] * (
+                    state["weight"] > self.fit_min_weight) * track_weight.unsqueeze(1))):
                 state[key] = torch.where(_expand(active, value), value, state[key])
             d = (old - state["position"]).unsqueeze(-1)
             shift = (d.transpose(-1, -2) @ torch.linalg.solve(state["covariance"], d)).squeeze(-1).squeeze(-1)

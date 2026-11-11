@@ -135,6 +135,19 @@ def _with_jacobian(function):
     return run
 
 
+def _without_jacobian(function):
+    """function(p, bz, beam, point) -> (out, aux) batched over tracks."""
+    batched = vmap(function, in_dims=(0, 0, None, 0))
+
+    def run(p, bz, beam, point):
+        shape = p.shape[:-1]
+        out, aux = batched(p.reshape(-1, 5), bz.reshape(-1), beam, point.expand(*shape, 3).reshape(-1, 3))
+        return out.reshape(*shape, *out.shape[1:]), aux.reshape(*shape, *aux.shape[1:])
+    return run
+
+
+_perigee_at_points = _without_jacobian(_perigee_at)
+_impact_at_points = _without_jacobian(_impact_3d)
 _perigee_with_jacobian = _with_jacobian(_perigee_at)
 _impact_with_jacobian = _with_jacobian(_impact_3d)
 _guarded_impact_with_jacobian = _with_jacobian(functools.partial(_impact_3d, guarded=True))

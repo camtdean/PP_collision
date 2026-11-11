@@ -15,8 +15,8 @@ import os
 
 import torch
 
-from .helix_tools import _expand, _impact_with_jacobian
-from .primaryvertex import _NO_ORDER, PrimaryVertices
+from .helix_tools import _expand, _impact_at_points
+from .primaryvertex import PrimaryVertices
 from .secondaryvertex import SecondaryVertices
 from .tracks import TrackBuilder
 from .vertexfit import VertexFit
@@ -135,93 +135,74 @@ class VertexHead(PrimaryVertices, SecondaryVertices):
                 displaced_weight (B, T) the candidates.
         """
         tracks = self.tracks(class_probs, mask_probs, points, padding_mask, track_parameters, track_covariance)
-        dtype = torch.float64
-        bad = tracks["_bad"]
-        track_weight = tracks["track_weight"].to(dtype)
-        inputs = {"perigee": tracks["track_parameters"][..., :5].to(dtype).nan_to_num(),
-                  "covariance": tracks["_covariance"].to(dtype), "bz": tracks["_bz"].to(dtype),
-                  "n_hits": tracks["_n_hits"].to(dtype), "n_silicon_hits": tracks["_n_silicon_hits"].to(dtype)}
+        bad, track_weight = tracks["_bad"], tracks["track_weight"]
+        inputs = {"perigee": tracks["track_parameters"][..., :5], "covariance": tracks["_covariance"], "bz": tracks["_bz"],
+                  "n_hits": tracks["_n_hits"], "n_silicon_hits": tracks["_n_silicon_hits"]}
         inputs["input"] = (track_weight > 0) & ~bad & torch.isfinite(inputs["covariance"]).all(dim=(-2, -1))
-        eye = torch.eye(5, dtype=dtype, device=track_weight.device)
-        inputs["covariance"] = torch.where(inputs["input"][..., None, None], inputs["covariance"], eye)
+        inputs["covariance"] = torch.where(inputs["input"][..., None, None], inputs["covariance"],
+                                           torch.eye(5, dtype=track_weight.dtype, device=track_weight.device))
         inputs["perigee"] = torch.where(inputs["input"].unsqueeze(-1), inputs["perigee"],
                                         inputs["perigee"].new_tensor([0.0, 0.0, 0.0, math.pi / 2, 1.0]))
         track_weight = track_weight * inputs["input"]
-        n_events = track_weight.shape[0]
-        events = torch.arange(n_events, device=track_weight.device)
 
-        state, kept, order = self._find_primary(inputs, track_weight,
-                                                (self.tracks_max_z_interval, self.tracks_max_significance))
+        # the vertices kept: the first slots, in the order found (the PV: slot 0)
+        state, kept = self._find_primary(inputs, track_weight, (self.tracks_max_z_interval, self.tracks_max_significance))
         step = torch.where(kept.any(dim=1), 0, -1)
         for k, preselection in enumerate(self.fallback_preselection if self.pv_fallback and not self.hard_cuts else ()):
             # events without a vertex (only those): searched again with a looser preselection
             missing = (step < 0).nonzero().squeeze(1)
             if not len(missing):
                 break
-            again, again_kept, again_order = self._find_primary({key: v[missing] for key, v in inputs.items()},
-                                                                track_weight[missing], preselection)
+            again, again_kept = self._find_primary({key: v[missing] for key, v in inputs.items()}, track_weight[missing],
+                                                   preselection)
             use = again_kept.any(dim=1)
             found = (missing[use],)
             state = {key: value.index_put(found, again[key][use]) for key, value in state.items()}
-            kept, order = kept.index_put(found, again_kept[use]), order.index_put(found, again_order[use])
+            kept = kept.index_put(found, again_kept[use])
             step = step.index_put(found, step.new_tensor(k + 1))
-        pv_slot = order.argmin(dim=1)
-        slot_state = {k: v[events, pv_slot] for k, v in state.items()}
-        valid, from_fallback = step >= 0, step > 0
-        pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
+        valid = step >= 0
+        pv_state = {k: v[:, :1] for k, v in state.items()}
+        pv = pv_state["position"][:, 0].masked_fill(~valid.unsqueeze(-1), torch.nan)
 
         result = {}
         if self.find_secondary:
-            pv_state = {k: v.unsqueeze(1) for k, v in slot_state.items()}
             # the other primary vertices' tracks are theirs (weight x (1 - their fit weight))
-            others = (state["weight"] * (state["links"] > 0.5) * (kept & (order != order.gather(1, pv_slot[:, None]))
-                                                                 ).unsqueeze(-1)).amax(dim=1)
-            secondary, sv_state, sv_ok = self._find_secondary(inputs, track_weight * (others < 0.5), pv, pv_state)
-            result.update(secondary)
+            others = (state["weight"] * (state["links"] > 0.5) * kept.unsqueeze(-1))[:, 1:].amax(dim=1)
+            result, sv_state, sv_ok = self._find_secondary(inputs, track_weight * (others < 0.5), pv, pv_state)
             if self.refit_pv and sv_ok.any():
-                # the PV and its SVs fitted together (tracks shared); used where the event has an SV
+                # the PV and its SVs fitted together (tracks shared) where the event has an SV; the pileup list too
                 joint = {k: torch.cat([v, sv_state[k]], dim=1) for k, v in pv_state.items()}
-                which = torch.cat([(valid & sv_ok.any(dim=1)).unsqueeze(1), sv_ok], dim=1)
-                self._fit(joint, which, track_weight, inputs)
-                refit = which[:, 0]
-                slot_state = {k: torch.where(_expand(refit, v), joint[k][:, 0], v) for k, v in slot_state.items()}
-                state = {k: v.index_put((events, pv_slot), slot_state[k]) for k, v in state.items()}   # pileup list too
-                pv = slot_state["position"].masked_fill(~valid.unsqueeze(-1), torch.nan)
-                # the SV outputs from the same refit, measured from the refitted PV (the SV selection is unchanged)
-                joint_sv = self._sv_outputs({k: v[:, 1:] for k, v in joint.items()}, sv_ok, pv, slot_state["covariance"])
-                for key, value in joint_sv.items():
-                    result[key] = torch.where(_expand(refit, value), value, result[key])
+                self._fit(joint, torch.cat([(valid & sv_ok.any(dim=1)).unsqueeze(1), sv_ok], dim=1), track_weight, inputs)
+                pv_state, sv_state = {k: v[:, :1] for k, v in joint.items()}, {k: v[:, 1:] for k, v in joint.items()}
+                state = {k: torch.cat([pv_state[k], v[:, 1:]], dim=1) for k, v in state.items()}
+                pv = pv_state["position"][:, 0].masked_fill(~valid.unsqueeze(-1), torch.nan)
+            # the SV outputs, measured from the (refitted) PV
+            result = {**self._sv_outputs(sv_state, sv_ok, pv, pv_state["covariance"][:, 0]), **result}
 
         # the PV's outputs; per-track ones NaN for tracks without a fit
-        weight = slot_state["weight"] * (slot_state["links"] > 0.5)
-        track_chi2 = self._compatibility({k: v.unsqueeze(1) for k, v in slot_state.items()}, pv.nan_to_num().unsqueeze(1)
-                                         ).squeeze(1)
-        loc, axes, _ = _impact_with_jacobian(inputs["perigee"], inputs["bz"], inputs["perigee"].new_tensor(
-            self.beam_position), pv.nan_to_num().unsqueeze(1))
-        closest = pv.nan_to_num().unsqueeze(1) + (loc.unsqueeze(-1) * axes).sum(-2)
+        weight = (pv_state["weight"] * (pv_state["links"] > 0.5))[:, 0]
+        loc, axes = _impact_at_points(inputs["perigee"], inputs["bz"], inputs["perigee"].new_tensor(self.beam_position),
+                                      pv.nan_to_num().unsqueeze(1))
         per_track = lambda v: v.masked_fill(_expand(bad | ~valid.unsqueeze(-1), v), torch.nan)  # noqa: E731
         result.update({
-            "vertex_estimate": pv, "fit_is_valid": valid, "vertex_from_fallback": from_fallback,
+            "vertex_estimate": pv, "fit_is_valid": valid, "vertex_from_fallback": step > 0,
             "vertex_fallback_step": step,
-            "vertex_covariance": slot_state["covariance"].masked_fill(~valid.view(-1, 1, 1), torch.nan),
-            "chi_square": slot_state["chi2"].masked_fill(~valid, torch.nan),
-            "vertex_ndf": slot_state["ndf"].masked_fill(~valid, torch.nan),
+            "vertex_covariance": pv_state["covariance"][:, 0].masked_fill(~valid.view(-1, 1, 1), torch.nan),
+            "chi_square": pv_state["chi2"][:, 0].masked_fill(~valid, torch.nan),
+            "vertex_ndf": pv_state["ndf"][:, 0].masked_fill(~valid, torch.nan),
             "track_vertex_weight": weight.masked_fill(bad, 0.0), "vertex_n_tracks": (weight >= 0.5).sum(-1),
-            "track_chi2": per_track(track_chi2), "track_dca": per_track(loc.norm(dim=-1)),
-            "track_closest_approach_point": per_track(closest),
+            "track_chi2": per_track(self._compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)),
+            "track_dca": per_track(loc.norm(dim=-1)),
+            "track_closest_approach_point": per_track(pv.nan_to_num().unsqueeze(1) + (loc.unsqueeze(-1) * axes).sum(-2)),
         })
         # all primary vertices (pileup), in the order found; each track's (weight >= 0.5, else -1)
-        rank = torch.where(kept, order, order.new_tensor(_NO_ORDER)).argsort(dim=1)
-        vertices_kept = kept.gather(1, rank)
-        fit_weight = (state["weight"] * (state["links"] > 0.5)).gather(1, rank.unsqueeze(-1).expand_as(state["weight"]))
-        fit_weight = fit_weight * vertices_kept.unsqueeze(-1)
+        fit_weight = state["weight"] * (state["links"] > 0.5) * kept.unsqueeze(-1)
         best, index = fit_weight.max(dim=1)
         result.update({
-            "primary_vertices": state["position"].gather(1, rank.unsqueeze(-1).expand(-1, -1, 3)).masked_fill(
-                ~vertices_kept.unsqueeze(-1), torch.nan),
-            "primary_vertex_valid": vertices_kept,
+            "primary_vertices": state["position"].masked_fill(~kept.unsqueeze(-1), torch.nan),
+            "primary_vertex_valid": kept,
             "primary_vertex_n_tracks": (fit_weight >= 0.5).sum(-1),
-            "pv_index": torch.zeros_like(pv_slot),
+            "pv_index": torch.zeros_like(step),
             "track_primary_vertex": torch.where(best >= 0.5, index, -1),
         })
         return {**{k: v for k, v in tracks.items() if not k.startswith("_")}, **result}

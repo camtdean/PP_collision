@@ -276,20 +276,6 @@ def _perigee_from_circle(circle_centre, R_s, theta, z0, qop, beam_position):
     d0 = h * (R_s.abs() - norm)                                # the closest point: centre + |R_s| u, u towards the beam
     return torch.stack([d0, z0, phi, theta, qop, torch.zeros_like(d0)], dim=-1)
 
-def _circle_from_perigee(perigee, Bz, beam_position):
-    """
-    Inverse of _perigee_from_circle: circle_centre, R_s, zslope, z0, pT (GeV), beam_dca = |d0|. Bz: T, or (B, T)
-    each track's field at its perigee (a field map).
-    """
-    d0, z0, phi, theta, qop = perigee[..., :5].unbind(-1)
-    sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
-    pT = torch.sin(theta) / qop.abs()
-    Bz = torch.as_tensor(Bz, dtype=pT.dtype, device=pT.device)
-    R_s = torch.sign(qop) * torch.sign(Bz) * pT / (K_CM * Bz.abs())
-    pca_x, pca_y = beam_position[0] - d0 * sin_phi, beam_position[1] + d0 * cos_phi
-    circle_centre = torch.stack([pca_x + R_s * sin_phi, pca_y - R_s * cos_phi], dim=-1)
-    return circle_centre, R_s, torch.cos(theta) / torch.sin(theta), z0, pT, d0.abs()
-
 # ------------------------------------------------------------------------------------------------
 # Field map: the ACTS text map the detector file names (field.map), for TrackBuilder's own track maths
 # ------------------------------------------------------------------------------------------------
@@ -617,7 +603,7 @@ class TrackBuilder(nn.Module):
         dtype = torch.float64
         base_weight = base_weight.to(dtype)
         bad = ~torch.isfinite(perigee[..., :5]).all(dim=-1)          # tracks without a fit
-        *_, pT, beam_dca = _circle_from_perigee(perigee, perigee_bz, self.beam_position)
+        pT, beam_dca = torch.sin(perigee[..., 3]) / perigee[..., 4].abs(), perigee[..., 0].abs()
         # tracks without a usable covariance get no weight (and a finite stand-in error) and are not usable
         has_sigma = (torch.isfinite(track_sigma).all(dim=-1) & (track_sigma > 0).all(dim=-1)
                      & torch.isfinite(covariance_cm).all(dim=(-2, -1)))

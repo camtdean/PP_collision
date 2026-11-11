@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from .helix_tools import _circle_point, _expand, _helix_radius, _soft_above, _soft_below, _transport, _wrap
+from .helix_tools import _circle_point, _expand, _helix_radius, _perigee_at_points, _soft_above, _soft_below, _wrap
 from .vertexfit import VertexFit
 
 
@@ -69,16 +69,16 @@ class SecondaryVertices(VertexFit):
                 pairs.unsqueeze(0).expand(n_events, -1, -1))
 
     def _find_secondary(self, tracks, track_weight, pv, pv_state):
-        """SV finding after the PV (track_weight: without the other primary vertices' tracks): sv_* outputs,
+        """SV finding after the PV (track_weight: without the other primary vertices' tracks): sv_pair_dca,
         displaced_mask, displaced_weight; the SV states and which are valid."""
         n_events, n_tracks = track_weight.shape
         dtype, device = track_weight.dtype, track_weight.device
         K = self.max_sv_per_event
-        beam = tracks["perigee"].new_tensor(self.beam_position)
         # candidates (soft): at least sv_min_track_hits TPC hits; displaced from the PV: with silicon hits by
         # sPHENIX's impact cuts (sv_min_track_dca_xy / _z), TPC-only by PV compatibility (sv_min_track_pv_chi2)
-        q, _, _ = _transport(tracks["perigee"], tracks["covariance"], tracks["bz"], beam, pv.nan_to_num().unsqueeze(1))
-        cm, hits, sigma = self._width("cm"), self._width("hits"), self._width("sigma")
+        q, _ = _perigee_at_points(tracks["perigee"], tracks["bz"], tracks["perigee"].new_tensor(self.beam_position),
+                                  pv.nan_to_num().unsqueeze(1))
+        cm, sigma = self._width("cm"), self._width("sigma")
         pv_chi2 = self._compatibility(pv_state, pv.nan_to_num().unsqueeze(1)).squeeze(1)
         displaced = torch.where(
             tracks["n_silicon_hits"] > 0,
@@ -86,7 +86,8 @@ class SecondaryVertices(VertexFit):
                                                                                   self.sv_min_track_dca_z, cm),
             _soft_above(pv_chi2, self.sv_min_track_pv_chi2, sigma * 2 * math.sqrt(self.sv_min_track_pv_chi2)))
         candidate_weight = (displaced * (track_weight > 0) * tracks["input"].to(dtype)
-                            * _soft_above(tracks["n_hits"] - tracks["n_silicon_hits"], self.sv_min_track_hits - 0.5, hits)
+                            * _soft_above(tracks["n_hits"] - tracks["n_silicon_hits"], self.sv_min_track_hits - 0.5,
+                                          self._width("hits"))
                             * torch.isfinite(pv).all(-1, keepdim=True))
         candidate = candidate_weight > 0.5
         if n_tracks >= 2:
@@ -115,29 +116,25 @@ class SecondaryVertices(VertexFit):
         links = torch.where(in_pair, 1.0, compatible) * candidate_weight.unsqueeze(1) * seed_ok.unsqueeze(-1)
         state["links"] = links
         self._fit(state, seed_ok, track_weight, tracks, shared=False)
-        linked = links > 0.5
-        n_good = (linked & (state["compatibility"] < self.max_vertex_chi2)).sum(-1)
         chi2_per_dof = state["chi2"] / state["ndf"].clamp(min=1e-12)
-        length = (state["position"] - pv.unsqueeze(1)).norm(dim=-1)
-        ok = (seed_ok & (n_good >= 2) & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
-              & (length > self.sv_min_path))
+        ok = (seed_ok & (((links > 0.5) & (state["compatibility"] < self.max_vertex_chi2)).sum(-1) >= 2)
+              & (state["ndf"] > 0) & (chi2_per_dof <= self.sv_max_chi2_per_dof)
+              & ((state["position"] - pv.unsqueeze(1)).norm(dim=-1) > self.sv_min_path))
         # one SV per group within sv_merge_distance: the lowest chi2/ndf (ties: the lower slot)
         distance = (state["position"].unsqueeze(2) - state["position"].unsqueeze(1)).nan_to_num().norm(dim=-1)
         quality = chi2_per_dof.masked_fill(~ok, torch.inf)
         beats = (quality.unsqueeze(1) < quality.unsqueeze(2)) | ((quality.unsqueeze(1) == quality.unsqueeze(2))
                                                                   & torch.ones(K, K, dtype=torch.bool, device=device).tril(-1))
         ok = ok & ~(ok.unsqueeze(1) & (distance < self.sv_merge_distance) & beats).any(dim=2)
-        result = self._sv_outputs(state, ok, pv, pv_state["covariance"][:, 0])
-        result.update({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
-                       "displaced_weight": track_weight * candidate_weight})
-        return result, state, ok
+        return ({"sv_pair_dca": seed_pair_dca.masked_fill(~ok, torch.nan), "displaced_mask": candidate,
+                 "displaced_weight": track_weight * candidate_weight}, state, ok)
 
     def _sv_outputs(self, state, ok, pv, pv_covariance):
         """The SV outputs of SV states (B, K) kept where ok, measured from the PV pv (B, 3) with covariance (B, 3, 3):
         the fit, the momentum at the SV (its tracks refitted to it) and the KFParticle-style topology (decay length
         significance with the two vertices' covariances added)."""
-        linked = state["links"] > 0.5
-        momentum = self._vertex_momentum(state, ok)
+        tracks = (state["links"] > 0.5) & (state["weight"] >= 0.5) & ok.unsqueeze(-1)
+        momentum = self._vertex_momentum(state, tracks)
         path = state["position"] - pv.unsqueeze(1)
         length = path.norm(dim=-1)
         covariance = state["covariance"] + torch.nan_to_num(pv_covariance).unsqueeze(1)
@@ -150,13 +147,12 @@ class SecondaryVertices(VertexFit):
             "sv_displacement": nan(length), "sv_decay_length_significance": nan(length / sigma),
             "sv_momentum": nan(momentum),
             "sv_dira": nan((unit * momentum).sum(-1) / momentum.norm(dim=-1).clamp(min=1e-12)),
-            "sv_n_tracks": ((state["weight"] >= 0.5) & linked).sum(-1).masked_fill(~ok, 0),
-            "sv_track_mask": linked & (state["weight"] >= 0.5) & ok.unsqueeze(-1),
+            "sv_n_tracks": tracks.sum(-1), "sv_track_mask": tracks,
             "sv_track_weight": state["weight"] * ok.unsqueeze(-1),
         }
 
-    def _vertex_momentum(self, state, ok):
-        """Sum (B, K, 3) of the momenta (GeV) of each vertex's tracks (weight >= 0.5) refitted to it."""
+    def _vertex_momentum(self, state, tracks):
+        """Sum (B, K, 3) of the momenta (GeV) of each vertex's tracks (B, K, T) refitted to it."""
         A, B, G = state["A"], state["B"], state["G"]
         GB = G @ B
         r = state["q_minus_c"] - (A @ state["position"].nan_to_num().unsqueeze(2).unsqueeze(-1)).squeeze(-1)
@@ -164,5 +160,4 @@ class SecondaryVertices(VertexFit):
         phi, theta, qop = p.unbind(-1)
         vector = torch.stack([torch.cos(phi) * torch.sin(theta), torch.sin(phi) * torch.sin(theta), torch.cos(theta)],
                              -1) / qop.abs().unsqueeze(-1)
-        use = ((state["weight"] >= 0.5) & (state["links"] > 0.5) & ok.unsqueeze(-1)).unsqueeze(-1)
-        return torch.where(use, vector.nan_to_num(), 0.0).sum(2)
+        return torch.where(tracks.unsqueeze(-1), vector.nan_to_num(), 0.0).sum(2)

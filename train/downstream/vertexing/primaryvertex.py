@@ -10,8 +10,6 @@ import torch
 from .helix_tools import _soft_below, _transport
 from .vertexfit import VertexFit
 
-_NO_ORDER = 10 ** 9                # creation order of a vertex slot not kept
-
 
 def _density_seed(d0, z0, covariance, weight, d0_significance, z0_significance):
     """
@@ -73,18 +71,17 @@ class PrimaryVertices(VertexFit):
 
     def _find_primary(self, tracks, track_weight, preselection):
         """ACTS's AMVF over each event's input tracks (weight 0: not used) with the tracks' preselection (z interval
-        cm, significance): the vertex states (B, K) and kept (B, K) in creation order."""
+        cm, significance): the vertex states (B, K) and kept (B, K), the kept ones first, in creation order."""
         n_events, n_tracks = track_weight.shape
         dtype, device = track_weight.dtype, track_weight.device
         K = self.max_vertices + 1                                   # the kept ones and the one being tried
         perigee, cov = tracks["perigee"], tracks["covariance"]
         state = self._empty_vertices(n_events, K, n_tracks, dtype, device)
         kept = torch.zeros(n_events, K, dtype=torch.bool, device=device)
-        order = torch.full((n_events, K), _NO_ORDER, dtype=torch.long, device=device)
         pool = tracks["input"].clone()
         alive = pool.sum(-1) >= 2
         events = torch.arange(n_events, device=device)
-        for iteration in range(n_tracks):           # each pass takes >= 1 track from the pool of alive events
+        for _ in range(n_tracks):                   # each pass takes >= 1 track from the pool of alive events
             alive = alive & (kept.sum(dim=1) < self.max_vertices)
             if not alive.any():
                 break
@@ -113,7 +110,6 @@ class PrimaryVertices(VertexFit):
             fresh = self._new_vertices(seed.unsqueeze(1), links.unsqueeze(1), tracks, prior.unsqueeze(1))
             for key, value in fresh.items():
                 state[key] = state[key].index_put((events[alive], slot[alive]), value[alive, 0])
-            order = torch.where(new, iteration, order)
             # the vertices to fit: the new one and every kept vertex connected to it through shared tracks
             linked = state["links"] > 0.5
             fit = new.clone()
@@ -123,25 +119,23 @@ class PrimaryVertices(VertexFit):
             self._fit(state, fit, track_weight, tracks)
             # the new vertex: >= 2 of its tracks still unused and compatible; those leave the pool (if none, the
             # least compatible of its unused tracks, or the unused track nearest the fitted vertex in z)
-            new_links = (linked & new.unsqueeze(-1)).any(dim=1)
-            compatibility = torch.where(new.unsqueeze(-1), state["compatibility"], 0.0).sum(dim=1)
+            new_links, compatibility = linked[events, slot], state["compatibility"][events, slot]
             compatible = new_links & pool & (compatibility < self.max_vertex_chi2)
             good = alive & (compatible.sum(-1) >= 2)
             remove = compatible & alive.unsqueeze(-1)
             none = alive & ~compatible.any(dim=-1)
             unused = new_links & pool & (compatibility > 0)
-            z_new = (state["position"][..., 2] * new).sum(1, keepdim=True)
+            z_new = state["position"][events, slot, 2:]
             nearest = torch.where(pool, (perigee[..., 1] - z_new).abs(), torch.inf).argmin(dim=-1)
             drop = torch.where(unused.any(dim=-1), torch.where(unused, compatibility, -torch.inf).argmax(dim=-1), nearest)
             remove = remove | (torch.nn.functional.one_hot(drop, n_tracks).bool() & none.unsqueeze(-1))
             pool = pool & ~remove
             # kept: good, contamination <= maximum_vertex_contamination, not within max_merge_vertex_significance
             # sigma in z of another vertex
-            w = torch.where(new.unsqueeze(-1), state["weight"], 0.0).sum(dim=1) * new_links
+            w = state["weight"][events, slot] * new_links
             contamination = (w * (1 - w)).sum(-1) / (w * w).sum(-1).clamp(min=1e-300)
-            var_new = (state["covariance"][..., 2, 2] * new).sum(1, keepdim=True)
-            merged = (kept & ((state["position"][..., 2] - z_new).abs()
-                              < self.max_merge_vertex_significance * (state["covariance"][..., 2, 2] + var_new).sqrt())
+            merged = (kept & ((state["position"][..., 2] - z_new).abs() < self.max_merge_vertex_significance * (
+                state["covariance"][..., 2, 2] + state["covariance"][events, slot, 2, 2].unsqueeze(1)).sqrt())
                       ).any(dim=1)
             keep = good & (contamination <= self.maximum_vertex_contamination) & ~merged
             kept = kept | (new & keep.unsqueeze(-1))
@@ -152,7 +146,6 @@ class PrimaryVertices(VertexFit):
                 state["weight"] = state["weight"].masked_fill(rejected.unsqueeze(-1), 0.0)
                 state["compatibility"] = state["compatibility"].masked_fill(rejected.unsqueeze(-1), torch.inf)
                 state["seed"] = state["seed"].masked_fill(rejected.unsqueeze(-1), torch.nan)
-                order = order.masked_fill(rejected, _NO_ORDER)
                 self._fit(state, fit & ~rejected & rejected.any(dim=1, keepdim=True), track_weight, tracks)
             alive = alive & (pool.sum(-1) >= 2)
-        return state, kept, order
+        return state, kept
