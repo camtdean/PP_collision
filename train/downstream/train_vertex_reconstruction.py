@@ -77,11 +77,20 @@ def main():
                         help="cm: floor of the predicted x, y position uncertainty (default: none)")
     parser.add_argument("--min_sigma_z", default=None, type=float,
                         help="cm: floor of the predicted z position uncertainty (default: none)")
+    parser.add_argument("--resume", default=None, type=str,
+                        help="continue from this checkpoint (<name>_last_checkpoint.pth: written every epoch) with "
+                             "the same options; the log is appended to")
+    parser.add_argument("--feature_cache", default=None, type=str,
+                        help="the track finder's feature cache of the training events (scripts/cache_features.py, "
+                             "this backbone): features read instead of computed")
+    parser.add_argument("--feature_cache_val", default=None, type=str,
+                        help="the same for the validation (test) events")
     parser.add_argument("--run_config", default=None, type=str,
                         help="YAML file of options (the eval's, e.g. scripts/configs/vertex_m5_gpuserver0.yaml): its "
                              "keys this script has set the defaults (others ignored); command-line options "
                              "override it, relative paths are relative to the file")
-    path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint_dir", "root_dir", "detector"}
+    path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint_dir", "root_dir", "detector", "resume",
+                 "feature_cache", "feature_cache_val"}
     run_config = parser.parse_known_args()[0].run_config
     if run_config:
         import yaml
@@ -129,6 +138,7 @@ def main():
     params.vertex_method, params.truth_radius = args.vertex_method, args.truth_radius
     for key, value in (("vertex_detector", args.detector), ("learned_vertex_val_events", args.val_events),
                        ("max_epochs", args.max_epochs), ("max_lr", args.max_lr), ("min_lr", args.min_lr),
+                       ("feature_cache", args.feature_cache), ("feature_cache_val", args.feature_cache_val),
                        ("learned_vertex_min_sigma_xy", args.min_sigma_xy),
                        ("learned_vertex_min_sigma_z", args.min_sigma_z),
                        ("learned_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
@@ -138,8 +148,7 @@ def main():
     # Launch and train
     trainer = DownstreamTrainer(params, args)
     trainer.launch()
-    checkpoint_path = None
-    trainer.train(pretrain=args.usepretrain, train_from_checkpoint=False, checkpoint_path=checkpoint_path)
+    trainer.train(pretrain=args.usepretrain, train_from_checkpoint=bool(args.resume), checkpoint_path=args.resume)
 
     # Cleanup
     trainer.cleanup()
