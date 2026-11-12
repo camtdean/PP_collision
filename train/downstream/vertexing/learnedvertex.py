@@ -26,6 +26,8 @@ class LearnedVertexHead(nn.Module):
         num_refinement_layers: number of query refinement layers.
         position_scale_xy: cm, multiplies the raw x and y position outputs.
         position_scale_z: cm, multiplies the raw z position output.
+        min_sigma_xy: cm, floor of the predicted x and y position uncertainty, added in quadrature (0: none).
+        min_sigma_z: cm, the same for z.
         softmax_mask: hit-to-slot probabilities by softmax over slots instead of a per-slot sigmoid.
         do_masked_attn: bias each slot's cross-attention towards the hits of its current mask.
         attn_mask_eps: added to the mask probability before the log of the attention bias.
@@ -34,7 +36,7 @@ class LearnedVertexHead(nn.Module):
 
     def __init__(self, input_dim, num_feature_layers, pe_method="nerf", n_vertex_slots=10, embed_dim=256, num_heads=4,
                  ffn_dim=512, num_refinement_layers=2, position_scale_xy=1.0, position_scale_z=10.0,
-                 softmax_mask=False, do_masked_attn=True, attn_mask_eps=1e-6, dropout=0.0):
+                 min_sigma_xy=0.0, min_sigma_z=0.0, softmax_mask=False, do_masked_attn=True, attn_mask_eps=1e-6, dropout=0.0):
         super().__init__()
         self.n_vertex_slots, self.num_heads = n_vertex_slots, num_heads
         self.softmax_mask, self.do_masked_attn, self.attn_mask_eps = softmax_mask, do_masked_attn, attn_mask_eps
@@ -55,6 +57,9 @@ class LearnedVertexHead(nn.Module):
         self.class_mlp, self.mask_mlp = mlp(2), mlp(embed_dim)
         self.position_mlp, self.log_variance_mlp = mlp(3), mlp(3)
         self.register_buffer("position_scale", torch.tensor([position_scale_xy, position_scale_xy, position_scale_z]))
+        # a setting, not a weight: not in checkpoints
+        self.register_buffer("log_min_variance", 2 * torch.tensor([min_sigma_xy, min_sigma_xy, min_sigma_z]).log(),
+                             persistent=False)
 
     def predict(self, queries, hit_features):
         """
@@ -66,7 +71,8 @@ class LearnedVertexHead(nn.Module):
             "vertex_class_probs": torch.softmax(self.class_mlp(queries), dim=-1),
             "vertex_mask_probs": torch.softmax(similarity, dim=-1) if self.softmax_mask else torch.sigmoid(similarity),
             "vertex_position": self.position_mlp(queries) * self.position_scale,
-            "vertex_log_variance": self.log_variance_mlp(queries) + 2 * torch.log(self.position_scale),
+            "vertex_log_variance": torch.logaddexp(
+                self.log_variance_mlp(queries) + 2 * torch.log(self.position_scale), self.log_min_variance),
         }
 
     def forward(self, x, feature, padding_mask, pretrain=True):
@@ -81,7 +87,7 @@ class LearnedVertexHead(nn.Module):
             vertex_class_probs: (B, V, 2) probabilities (empty, real).
             vertex_mask_probs: (B, N, V) probability that the hit belongs to the slot.
             vertex_position: (B, V, 3) cm.
-            vertex_log_variance: (B, V, 3) log of the position variance, cm^2.
+            vertex_log_variance: (B, V, 3) log of the position variance (with the floor), cm^2.
             aux_list: the same four keys before each refinement layer.
         """
         if not pretrain:

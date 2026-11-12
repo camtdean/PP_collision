@@ -72,6 +72,20 @@ def write_metrics_log(metrics, logfile):
         f.write("\t".join(str(v) for v in metrics.values()) + "\n")
 
 
+def residual_table(results):
+    """
+    Display only (params.residual_table): per vertex_method the 3D PV residual (cm) median, 68% and 90% over its
+    events with a reconstructed and a truth PV. results: run_vertexing's dict. Returns the lines.
+    """
+    lines = [f"{'PV residual (cm)':18s}{'events':>8s}{'median':>10s}{'68%':>10s}{'90%':>10s}"]
+    for method, r in results.items():
+        residual = (r["vertex_estimate"] - r["vertex_target"])[r["fit_is_valid"]].double().norm(dim=-1)
+        lines.append(f"{method:18s}{len(residual):8d}" + "".join(
+            f"{v:10.4f}" for v in (torch.quantile(residual, residual.new_tensor([0.5, 0.68, 0.9])).tolist()
+                                   if len(residual) else [float("nan")] * 3)))
+    return lines
+
+
 def write_per_point_csv(columns, path):
     """
     Write {column: 1-D array} as pandas' to_csv(index=False) would (round-trip floats, NaN as
@@ -163,8 +177,11 @@ class DownstreamTrainer():
         
         self.params = params
         self.use_amp = bool(getattr(self.params, 'use_amp', True))
-        # how vertices are found: fit (VertexHead) or learned (LearnedVertexing)
-        self.vertex_method = getattr(self.params, "vertex_method", None) or "fit"
+        # how vertices are found: fit (VertexHead), learned (LearnedVertexing); the eval runs each of
+        # vertex_methods, training the first
+        methods = getattr(self.params, "vertex_method", None) or "fit"
+        self.vertex_methods = [methods] if isinstance(methods, str) else list(methods)
+        self.vertex_method = self.vertex_methods[0]
         print("running on rank {} with world size {}".format(self.world_rank, self.world_size))
 
 
@@ -388,9 +405,10 @@ class DownstreamTrainer():
     # VertexHead's optimizer and scheduler (made by training) and their keys in a checkpoint
     _TRAINING_STATE = (("optimizer_state_dict", "vertex_optimizer"), ("scheduler_state_dict", "vertex_scheduler"))
 
-    def _trained_head(self):
-        """The module a checkpoint holds: LearnedVertexHead with vertex_method learned, else VertexHead."""
-        head = self.learned_vertex.head if self.vertex_method == "learned" else self.vertex_head
+    def _trained_head(self, method=None):
+        """The module a method's (default vertex_method) checkpoint holds: LearnedVertexHead for learned, else
+        VertexHead."""
+        head = self.learned_vertex.head if (method or self.vertex_method) == "learned" else self.vertex_head
         return getattr(head, "module", head)          # DDP-wrapped or not
 
     def _save_checkpoint(self, filename, epoch, is_best, loss):
@@ -405,15 +423,16 @@ class DownstreamTrainer():
                 checkpoint[key] = getattr(self, name).state_dict()
         torch.save(checkpoint, os.path.join(self.params.checkpoint_dir, filename))
 
-    def load_checkpoint(self, checkpoint_path, inference=False):
-        """The trained head's weights (_trained_head) from a _save_checkpoint file (strict: its settings and
-        vertex_method must match); without inference also its optimizer and scheduler where training made them, the
-        next epoch and the best loss."""
+    def load_checkpoint(self, checkpoint_path, inference=False, method=None):
+        """The trained head's weights (_trained_head(method)) from a _save_checkpoint file (strict: its settings and
+        vertex_method must match method, default this run's); without inference also its optimizer and scheduler
+        where training made them, the next epoch and the best loss."""
+        method = method or self.vertex_method
         checkpoint, state = self._load_checkpoint_state(checkpoint_path, "model_state_dict")
-        if checkpoint.get("vertex_method", "fit") != self.vertex_method:
+        if checkpoint.get("vertex_method", "fit") != method:
             raise ValueError(f"{checkpoint_path} is a vertex_method {checkpoint.get('vertex_method', 'fit')!r} "
-                             f"checkpoint; this run's is {self.vertex_method!r}")
-        self._trained_head().load_state_dict(state)
+                             f"checkpoint; wanted {method!r}")
+        self._trained_head(method).load_state_dict(state)
         if not inference:
             for key, name in self._TRAINING_STATE:
                 if getattr(self, name, None) is not None and key in checkpoint:
@@ -449,15 +468,19 @@ class DownstreamTrainer():
     LEARNED_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
                             "loss_position": 1.0}
 
-    def setup_learned_vertexing(self):
+    def setup_learned_vertexing(self, saved=None):
         """
         Build LearnedVertexing (after launch()). From params: any LearnedVertexHead or LearnedVertexing argument as
-        learned_vertex_<argument> (e.g. learned_vertex_n_vertex_slots, learned_vertex_real_threshold), each only where
+        learned_vertex_<argument> (e.g. learned_vertex_n_vertex_slots, learned_vertex_min_sigma_z), each only where
         set; pe_method; the track slots: max_gt_classes.
+
+        Args:
+            saved: a checkpoint's params (the eval): its learned_vertex_<argument> where this run sets none.
         """
-        settings = lambda cls: {name: getattr(self.params, "learned_vertex_" + name)  # noqa: E731
-                                for name in inspect.signature(cls.__init__).parameters
-                                if getattr(self.params, "learned_vertex_" + name, None) is not None}
+        value = lambda name: (lambda v: (saved or {}).get("learned_vertex_" + name) if v is None else v)(  # noqa: E731
+            getattr(self.params, "learned_vertex_" + name, None))
+        settings = lambda cls: {name: value(name) for name in inspect.signature(cls.__init__).parameters  # noqa: E731
+                                if value(name) is not None}
         head = LearnedVertexHead(**{
             "input_dim": self.params.embed_dim, "pe_method": getattr(self.params, "pe_method", "nerf"),
             "num_feature_layers": 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone,
@@ -703,35 +726,64 @@ class DownstreamTrainer():
         return list(zip(result["vertex_estimate"].cpu().split(sizes), result["fit_is_valid"].cpu().split(sizes),
                         counts.cpu().split(sizes)))
 
-    def inference(self, checkpoint_path, max_events=None, pretrain=True, save_csv=False, csv_output_path=None):
+    def inference(self, checkpoint_path, max_events=None, pretrain=True, save_csv=False, csv_output_path=None,
+                  learned_checkpoint_path=None):
         """
-        setup_vertexing, then run_vertexing over at most max_events (None: all); appends the metrics to the run log,
-        writes the per-point CSV with save_csv (csv_output_path, default the run folder's data/) and, unless
-        no_output, the metrics JSON (metrics/: inputs, the track settings (TrackBuilder.track_fit_config), metrics).
+        Sets up each of vertex_methods (fit: setup_vertexing; learned: LearnedVertexing with the checkpoint's
+        settings and weights), then run_vertexing over at most max_events (None: all). Per method: the metrics
+        appended to the run log (after a "vertex_method: <method>" line, except fit) and, with save_csv, the
+        per-point CSV (fit: csv_output_path, default the run folder's data/; others: that name + _<method>, with
+        the method's hit-to-vertex-slot assignment as pred_assignment and confidence). Unless no_output, the
+        metrics JSON (metrics/: inputs, the track settings (TrackBuilder.track_fit_config), metrics: fit's,
+        <method>_metrics: the others'). With params.residual_table (default on): residual_table printed and logged.
 
         Args:
-            checkpoint_path: track-head checkpoint; pretrain: backbone features (True) or raw points.
-            save_csv, csv_output_path: the per-point CSV.
+            checkpoint_path: track-head checkpoint (fit); learned_checkpoint_path: LearnedVertexHead checkpoint
+            (learned); pretrain: backbone features (True) or raw points; save_csv, csv_output_path: the CSVs.
+
+        Returns:
+            run_vertexing's dict.
         """
         if self.world_size > 1:
             raise RuntimeError("the vertex eval runs in one process (its metrics are not gathered across ranks): "
                                "run it with python, not torchrun")
-        self.setup_vertexing(checkpoint_path)
-        result = self.run_vertexing(pretrain=pretrain, max_events=max_events, save_csv=save_csv)
+        if "fit" in self.vertex_methods:
+            self.setup_vertexing(checkpoint_path)
+        if "learned" in self.vertex_methods:
+            self.setup_learned_vertexing(
+                torch.load(learned_checkpoint_path, map_location="cpu", weights_only=False).get("params"))
+            self.load_checkpoint(learned_checkpoint_path, inference=True, method="learned")
+            self.learned_vertex.eval()
+        results = self.run_vertexing(pretrain=pretrain, max_events=max_events, save_csv=save_csv)
         if self.world_rank == 0:
-            write_metrics_log(result["metrics"], self.logfile)
-            if save_csv:
-                result["csv_output_path"] = csv_output_path or self.csv_path
-                write_per_point_csv(result["per_point"], result["csv_output_path"])
-                print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
+            for method, result in results.items():
+                if method != "fit":
+                    self.log_infile(f"vertex_method: {method}")
+                write_metrics_log(result["metrics"], self.logfile)
+                if save_csv:
+                    result["csv_output_path"] = (lambda path: path if method == "fit" else f"_{method}".join(
+                        os.path.splitext(path)))(csv_output_path or self.csv_path)
+                    write_per_point_csv(result["per_point"], result["csv_output_path"])
+                    print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
+            if getattr(self.params, "residual_table", True):
+                table = residual_table(results)
+                print("\n".join("[vertex] " + line for line in table))
+                self.log_infile("\n".join(table))
             if not getattr(self.params, "no_output", False):
+                record = {"config": self.config, "yaml_config": os.path.abspath(self.params._yaml_filename),
+                          "pretrained_ckpt": self.params.pretrained_ckpt}
+                if "fit" in results:
+                    record.update(track_ckpt=os.path.abspath(checkpoint_path),
+                                  track_fit_config=self.vertex_head.tracks.track_fit_config())
+                if "learned" in results:
+                    record.update(learned_ckpt=os.path.abspath(learned_checkpoint_path))
+                record["max_eval_events"] = max_events
+                record.update({"metrics" if method == "fit" else f"{method}_metrics": result["metrics"]
+                               for method, result in results.items()})
                 with open(self.metrics_path, "w") as f:
-                    json.dump({"config": self.config, "yaml_config": os.path.abspath(self.params._yaml_filename),
-                               "pretrained_ckpt": self.params.pretrained_ckpt, "track_ckpt": os.path.abspath(checkpoint_path),
-                               "track_fit_config": self.vertex_head.tracks.track_fit_config(), "max_eval_events": max_events,
-                               "metrics": result["metrics"]}, f, indent=2)
+                    json.dump(record, f, indent=2)
                 print(f"[vertex] wrote {self.logfile}\n[vertex] wrote {self.metrics_path}")
-        return result
+        return results
 
     def _layer_features(self, pre_embed):
         """
@@ -747,54 +799,68 @@ class DownstreamTrainer():
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
-        Backbone and track head per loader batch; truth labels and VertexHead per vertex_chunk_events events (default
-        32), with the metrics inputs and CSV rows, in a background thread on CPU copies while the GPU runs the next
-        batches.
+        The backbone once per loader batch, then each of vertex_methods on it. fit: the track head per loader batch,
+        VertexHead per vertex_chunk_events events (default 32). learned: LearnedVertexing per loader batch. The truth
+        labels, VertexHead, the metrics inputs and the CSV rows run in a background thread on CPU copies while the
+        GPU runs the next batches.
 
         Args:
-            pretrain: backbone features (True) or raw points; max_events: limit (None: all); save_csv: build the CSV.
+            pretrain: backbone features (True) or raw points (fit only); max_events: limit (None: all); save_csv:
+            build the CSVs.
 
         Returns:
-            dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target (n, 3), fit_is_valid (n,)
-            (the fit is valid and the truth PV is defined),
-            timing (seconds busy per stage; truth, vertex_head and csv overlap the others), per_point (with
-            save_csv).
+            dict vertex_method -> dict: metrics (incl. time_<stage>_ms_per_event), vertex_estimate, vertex_target
+            (n, 3), fit_is_valid (n,) (the method's PV is valid and the truth PV is defined), timing (seconds busy
+            per stage, shared; truth, vertex_head and csv overlap the others), per_point (with save_csv).
         """
+        methods = self.vertex_methods
+        fit, learned = "fit" in methods, "learned" in methods
+        if learned and not pretrain:
+            raise ValueError("vertex_method learned needs the backbone features (pretrain=True)")
         self.model.eval()
         # full fp32: no TF32 in matrix multiplies or convolutions
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-        est, tgt, reco_valid, truth_valid, track_counts, per_point = [], [], [], [], [], []
+        est, reco_valid, per_point = ({m: [] for m in methods} for _ in range(3))
+        tgt, truth_valid, track_counts = [], [], []
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
-        pending = []        # loader batches waiting for VertexHead (CPU copies)
+        pending = []        # loader batches waiting for the background thread (CPU copies)
         job = [None]
         # VertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
-        stream = torch.cuda.Stream(self.vertex_device) if self.vertex_device.type == "cuda" else None
+        stream = torch.cuda.Stream(self.vertex_device) if fit and self.vertex_device.type == "cuda" else None
 
         @torch.no_grad()        # grad mode is per thread: this one runs in the pool
         def finish(records):
-            """Truth labels and VertexHead over these batches, then their metrics inputs and CSV rows (the background
-            thread)."""
+            """Truth labels and VertexHead over these batches, then each method's metrics inputs and CSV rows (the
+            background thread)."""
             t0 = time.perf_counter()
             for r in records:
                 r["truth"] = self._truth_labels(r["reg"], r["label"], r["mask"])
             t1 = time.perf_counter()
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                fitted = self._vertex_head_chunk(records)
+            if fit:
+                with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                    fitted = self._vertex_head_chunk(records)
             t2 = time.perf_counter()
-            for r, (vertex, valid, counts) in zip(records, fitted):
-                if save_csv:
-                    truth_vertex = r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
-                                                                           float("nan"))
-                    per_point.append(per_point_columns(r["first_event"], r["grouped"], r["label"], r["reg"], r["mask"],
-                                                       r["class_probs"], r["mask_probs"], vertex, truth_vertex,
-                                                       r["truth"]["hit_vertex"]))
-                est.append(vertex)
+            for i, r in enumerate(records):
+                # per method: the PV, its validity, the class and mask probabilities of the CSV's assignment
+                found = {}
+                if fit:
+                    found["fit"] = (*fitted[i][:2], r["class_probs"], r["mask_probs"])
+                    track_counts.append(fitted[i][2])
+                if learned:
+                    found["learned"] = r["learned"]
+                for m, (vertex, valid, class_probs, mask_probs) in found.items():
+                    if save_csv:
+                        per_point[m].append(per_point_columns(
+                            r["first_event"], r["grouped"], r["label"], r["reg"], r["mask"], class_probs, mask_probs,
+                            vertex, r["truth"]["vertex_target"].masked_fill(~r["truth"]["vertex_valid"][:, None],
+                                                                            float("nan")), r["truth"]["hit_vertex"]))
+                    est[m].append(vertex)
+                    reco_valid[m].append(valid)
                 tgt.append(r["truth"]["vertex_target"])
-                reco_valid.append(valid)
                 truth_valid.append(r["truth"]["vertex_valid"])
-                track_counts.append(counts)
             timing["truth"] += t1 - t0
-            timing["vertex_head"] += t2 - t1
+            if fit:
+                timing["vertex_head"] += t2 - t1
             timing["csv"] += time.perf_counter() - t2
 
         def flush():
@@ -807,7 +873,8 @@ class DownstreamTrainer():
                 job[0] = pool.submit(finish, list(pending))
                 pending.clear()
 
-        stages = ("data", "backbone", "track_head", "to_cpu", "waiting", "truth", "vertex_head", "csv")
+        stages = (("data", "backbone") + ("track_head",) * fit + ("learned_head",) * learned
+                  + ("to_cpu", "waiting", "truth") + ("vertex_head",) * fit + ("csv",))
         timing = dict.fromkeys(stages, 0.0)
         vertexing.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0, restarts=0)
         # the main loop's own stream only (VertexHead runs on another)
@@ -839,13 +906,23 @@ class DownstreamTrainer():
                 if pretrain:
                     _, pre_embed, _ = self.model(inputs, return_z=True)
                     lap("backbone")
-                    out = self.down_model(inputs, self._layer_features(pre_embed), pretrain=True, padding_mask=input_mask)
-                else:
-                    out = self.down_model(inputs, feature=None)
-                lap("track_head")
+                if fit:
+                    out = (self.down_model(inputs, self._layer_features(pre_embed), pretrain=True,
+                                           padding_mask=input_mask) if pretrain
+                           else self.down_model(inputs, feature=None))
+                    lap("track_head")
+                if learned:
+                    outputs, raw = self.learned_vertex(inputs, self._layer_features(pre_embed), input_mask)
+                    lap("learned_head")
 
-                pending.append({"first_event": n_seen, "grouped": grouped, "label": label, "reg": reg, "mask": mask,
-                                "class_probs": out["class_probs"].cpu(), "mask_probs": out["mask_probs"].cpu()})
+                record = {"first_event": n_seen, "grouped": grouped, "label": label, "reg": reg, "mask": mask}
+                if fit:
+                    record.update(class_probs=out["class_probs"].cpu(), mask_probs=out["mask_probs"].cpu())
+                if learned:
+                    record["learned"] = (outputs["vertex_estimate"].cpu(), outputs["fit_is_valid"].cpu(),
+                                         *(raw[k].cpu() if save_csv else None
+                                           for k in ("vertex_class_probs", "vertex_mask_probs")))
+                pending.append(record)
                 lap("to_cpu")
                 n_seen += b
                 last = bool(max_events) and n_seen >= max_events
@@ -857,40 +934,48 @@ class DownstreamTrainer():
             flush()              # and waits for it
         timing["wall"] = wall = time.perf_counter() - start
 
-        est, tgt, reco_valid, truth_valid = torch.cat(est), torch.cat(tgt), torch.cat(reco_valid), torch.cat(truth_valid)
-        ok = reco_valid & truth_valid
-        metrics = compute_vertex_metrics(est, tgt, ok)
-        # fit_valid_rate: valid fits among the events with a truth PV (the accuracies are over those fits)
-        metrics.update(n_events=len(ok), truth_valid_rate=truth_valid.float().mean().item(),
-                       fit_valid_rate=reco_valid[truth_valid].float().mean().item())
-        counts = torch.cat(track_counts).double()
-        usable, acts_failed, refit_failed, _ = counts.mean(dim=0).tolist()
-        metrics.update(usable_tracks_per_event=usable)
-        # the fallback PVs (found with a looser preselection): their share of the valid fits and both groups' rmse
-        fallback, error = counts[:, 3].bool(), (est - tgt).double().norm(dim=-1)
-        rmse = lambda sel: error[sel].pow(2).mean().sqrt().item() if sel.any() else float("nan")  # noqa: E731
-        metrics.update(pv_fallback_rate=fallback[ok].double().mean().item() if ok.any() else float("nan"),
-                       rmse_3d_finder=rmse(ok & ~fallback), rmse_3d_fallback=rmse(ok & fallback))
-        if self.vertex_head.tracks.use_acts:
-            metrics.update(acts_failed_per_event=acts_failed, acts_refit_failed_per_event=refit_failed,
-                           acts_worker_restarts=vertexing.ACTS_TIMING["restarts"])
-        timing["acts_start"] = vertexing.ACTS_TIMING["start_s"]
-        timing["acts_propagate"] = vertexing.ACTS_TIMING["propagate_s"]
-        n_events = max(len(ok), 1)
-        metrics.update({f"time_{k}_ms_per_event": v / n_events * 1e3 for k, v in timing.items()})
+        tgt, truth_valid = torch.cat(tgt), torch.cat(truth_valid)
+        n_events = max(len(truth_valid), 1)
+        if fit:
+            timing["acts_start"] = vertexing.ACTS_TIMING["start_s"]
+            timing["acts_propagate"] = vertexing.ACTS_TIMING["propagate_s"]
+        output = {}
+        for m in methods:
+            vertex, valid = torch.cat(est[m]), torch.cat(reco_valid[m])
+            ok = valid & truth_valid
+            metrics = compute_vertex_metrics(vertex, tgt, ok)
+            # fit_valid_rate: valid PVs among the events with a truth PV (the accuracies are over those)
+            metrics.update(n_events=len(ok), truth_valid_rate=truth_valid.float().mean().item(),
+                           fit_valid_rate=valid[truth_valid].float().mean().item())
+            if m == "fit":
+                counts = torch.cat(track_counts).double()
+                usable, acts_failed, refit_failed, _ = counts.mean(dim=0).tolist()
+                metrics.update(usable_tracks_per_event=usable)
+                # the fallback PVs (found with a looser preselection): their share of the valid fits and both
+                # groups' rmse
+                fallback, error = counts[:, 3].bool(), (vertex - tgt).double().norm(dim=-1)
+                rmse = lambda sel: error[sel].pow(2).mean().sqrt().item() if sel.any() else float("nan")  # noqa: E731
+                metrics.update(pv_fallback_rate=fallback[ok].double().mean().item() if ok.any() else float("nan"),
+                               rmse_3d_finder=rmse(ok & ~fallback), rmse_3d_fallback=rmse(ok & fallback))
+                if self.vertex_head.tracks.use_acts:
+                    metrics.update(acts_failed_per_event=acts_failed, acts_refit_failed_per_event=refit_failed,
+                                   acts_worker_restarts=vertexing.ACTS_TIMING["restarts"])
+            metrics.update({f"time_{k}_ms_per_event": v / n_events * 1e3 for k, v in timing.items()})
+            if self.log_to_screen:
+                print(("[vertex] " if m == "fit" else f"[vertex:{m}] ")
+                      + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                  for k, v in metrics.items() if not k.startswith("time_")))
+            output[m] = {"metrics": metrics, "vertex_estimate": vertex.cpu(), "vertex_target": tgt.cpu(),
+                         "fit_is_valid": ok.cpu(), "timing": timing}
+            if save_csv:
+                output[m]["per_point"] = {k: np.concatenate([p[k] for p in per_point[m]]) for k in CSV_COLUMNS}
         if self.log_to_screen:
-            print("[vertex] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                                          for k, v in metrics.items() if not k.startswith("time_")))
-            print(f"[vertex] time over {len(ok)} events: {wall:.1f} s ({wall / n_events * 1e3:.1f} ms/event); busy "
-                  f"time per stage (truth, vertex_head and csv run alongside the others; waiting: for them)")
+            print(f"[vertex] time over {len(truth_valid)} events: {wall:.1f} s ({wall / n_events * 1e3:.1f} ms/event); "
+                  f"busy time per stage (truth, vertex_head and csv run alongside the others; waiting: for them)")
             for k in stages:
                 print(f"[vertex]   {k:14s} {timing[k]:8.2f} s  {timing[k] / n_events * 1e3:8.2f} ms/event  "
                       f"{timing[k] / max(wall, 1e-12):6.1%}")
-            if timing["acts_start"] or timing["acts_propagate"]:
+            if fit and (timing["acts_start"] or timing["acts_propagate"]):
                 print(f"[vertex]     of which ACTS: worker start {timing['acts_start']:.2f} s, propagation "
                       f"{timing['acts_propagate']:.2f} s ({vertexing.ACTS_TIMING['states']} track states)")
-        output = {"metrics": metrics, "vertex_estimate": est.cpu(), "vertex_target": tgt.cpu(),
-                  "fit_is_valid": ok.cpu(), "timing": timing}
-        if save_csv:
-            output["per_point"] = {k: np.concatenate([p[k] for p in per_point]) for k in CSV_COLUMNS}
         return output

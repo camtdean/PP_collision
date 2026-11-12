@@ -73,6 +73,10 @@ def main():
     parser.add_argument("--max_lr", default=None, type=float, help="peak learning rate (default: the config's)")
     parser.add_argument("--min_lr", default=None, type=float, help="lowest learning rate (default: the config's)")
     parser.add_argument("--max_epochs", default=None, type=int, help="epochs (default: max_epochs from the config)")
+    parser.add_argument("--min_sigma_xy", default=None, type=float,
+                        help="cm: floor of the predicted x, y position uncertainty (default: none)")
+    parser.add_argument("--min_sigma_z", default=None, type=float,
+                        help="cm: floor of the predicted z position uncertainty (default: none)")
     parser.add_argument("--run_config", default=None, type=str,
                         help="YAML file of options (the eval's, e.g. scripts/configs/vertex_m5_gpuserver0.yaml): its "
                              "keys this script has set the defaults (others ignored); command-line options "
@@ -89,7 +93,7 @@ def main():
         parser.set_defaults(**{
             k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str)
             else types[k](v) if k in types and v is not None else v
-            for k, v in run.items() if k in types and k not in ("eventnumber", "run_num")})
+            for k, v in run.items() if k in types and k not in ("eventnumber", "run_num", "vertex_method")})
     args = parser.parse_args()
     # paths: ~ expanded, absolute (not relative to this folder once the working directory changes)
     for key in path_keys:
@@ -125,6 +129,8 @@ def main():
     params.vertex_method, params.truth_radius = args.vertex_method, args.truth_radius
     for key, value in (("vertex_detector", args.detector), ("learned_vertex_val_events", args.val_events),
                        ("max_epochs", args.max_epochs), ("max_lr", args.max_lr), ("min_lr", args.min_lr),
+                       ("learned_vertex_min_sigma_xy", args.min_sigma_xy),
+                       ("learned_vertex_min_sigma_z", args.min_sigma_z),
                        ("learned_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
         if value is not None:
             params[key] = value
