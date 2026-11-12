@@ -902,7 +902,7 @@ class VertexHungarianMatcher(PointHungarianMatcher):
         return indices
 
 
-def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0):
+def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0, position_beta=0.0):
     """
     compute_point_loss for vertex slots, with the position loss of the matched slots.
 
@@ -920,17 +920,23 @@ def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0):
         }
         mask: (B, N_points)  # Valid points mask
         matcher: VertexHungarianMatcher instance
+        position_beta: each coordinate's negative log-likelihood is multiplied by its predicted variance
+            (cm^2, no gradient) to this power (beta-NLL; 0: the plain likelihood, 1: the position gradient of a
+            squared error).
     Returns:
-        compute_point_loss's dict (matched once, by matcher) with "loss_position": the Gaussian negative
-        log-likelihood of the true positions, summed over the matched slots and coordinates, / B.
+        compute_point_loss's dict (matched once, by matcher) with, both summed over the matched slots and
+        coordinates, / B:
+            "loss_position": the Gaussian negative log-likelihood of the true positions (weighted by position_beta).
+            "loss_position_l1": the absolute position residual, cm.
     """
     indices = matcher(outputs, targets, mask)
     losses = compute_point_loss(outputs, targets, mask, lambda *_: indices, no_object_class)
     log_variance = outputs["pred_log_variance"][_get_src_permutation_idx(indices)].float()
-    losses["loss_position"] = 0.5 * (log_variance + (
-        outputs["pred_positions"][_get_src_permutation_idx(indices)].float()
-        - torch.cat([t["positions"][J] for t, (_, J) in zip(targets, indices)]).float()) ** 2 / log_variance.exp()
-    ).sum() / len(targets)
+    residual = (outputs["pred_positions"][_get_src_permutation_idx(indices)].float()
+                - torch.cat([t["positions"][J] for t, (_, J) in zip(targets, indices)]).float())
+    losses["loss_position"] = ((position_beta * log_variance).exp().detach() * 0.5
+                               * (log_variance + residual ** 2 / log_variance.exp())).sum() / len(targets)
+    losses["loss_position_l1"] = residual.abs().sum() / len(targets)
     return losses
 
 

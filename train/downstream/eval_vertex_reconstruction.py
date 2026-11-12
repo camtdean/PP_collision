@@ -218,6 +218,13 @@ def main():
         help="LearnedVertexHead checkpoint written by train_vertex_reconstruction.py (its head settings are used)",
     )
     parser.add_argument(
+        "--vertex_checkpoint",
+        type=str,
+        default=None,
+        help="Trained VertexHead checkpoint (train_vertex_reconstruction.py --vertex_method fit): its learned track "
+             "weights, gates and fallback scale (default: the untrained fit)",
+    )
+    parser.add_argument(
         "--no_residual_table",
         action="store_true",
         help="Do not print or log the per-method PV residual table (median, 68%%, 90%%)",
@@ -240,7 +247,7 @@ def main():
         if unknown:
             sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
         base = os.path.dirname(os.path.abspath(run_config))
-        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "learned_checkpoint",
+        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "learned_checkpoint", "vertex_checkpoint",
                      "csv_output_path", "data_root_test", "root_dir", "detector"}
         # each value converted as the command line would be (e.g. run_num: 2 -> "2"; a list: each entry)
         types = {a.dest: a.type for a in parser._actions if a.type is not None}
@@ -259,6 +266,8 @@ def main():
     fit, learned = "fit" in args.vertex_method, "learned" in args.vertex_method
     if learned and not (args.learned_checkpoint and os.path.isfile(args.learned_checkpoint)):
         parser.error(f"--vertex_method learned needs --learned_checkpoint (an existing file): {args.learned_checkpoint}")
+    if args.vertex_checkpoint and not (fit and os.path.isfile(args.vertex_checkpoint)):
+        parser.error(f"--vertex_checkpoint needs --vertex_method fit and an existing file: {args.vertex_checkpoint}")
     if learned and not args.usepretrain:
         parser.error("--vertex_method learned needs the backbone features (not --no-pretrain)")
 
@@ -328,6 +337,7 @@ def main():
         save_csv=args.save_csv,
         csv_output_path=args.csv_output_path,
         learned_checkpoint_path=args.learned_checkpoint,
+        vertex_checkpoint_path=args.vertex_checkpoint,
     )
     trainer.cleanup()
 
