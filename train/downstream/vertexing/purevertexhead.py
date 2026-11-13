@@ -41,19 +41,22 @@ class PureVertexHead(nn.Module):
             (z: x r_hit^2); a slot's position is the mean of the votes weighted by (mask probability + vote_eps) /
             variance, its variance 1 / the sum of those weights x a factor from its query.
         vote_eps: added to the mask probability in the vote weights.
+        vote_z_from_origin: the vote's slope is z_hit / r_hit (the line to z = 0) + the output instead of the
+            output, so z = -r_hit x the output.
         normalization: the dataset's hit normalization (None: TPC_NORMALIZATION), for the hits' r and z in cm.
     """
 
     def __init__(self, input_dim, num_feature_layers, pe_method="nerf", point_embed_scale=0.0, n_vertex_slots=10,
                  embed_dim=256, num_heads=4, ffn_dim=512, num_refinement_layers=2, position_scale_xy=1.0,
                  position_scale_z=10.0, min_sigma_xy=0.0, min_sigma_z=0.0, softmax_mask=False, do_masked_attn=True,
-                 attn_mask_eps=1e-6, dropout=0.0, position_mode="query", vote_eps=1e-6, normalization=None):
+                 attn_mask_eps=1e-6, dropout=0.0, position_mode="query", vote_eps=1e-6, vote_z_from_origin=False,
+                 normalization=None):
         super().__init__()
         if position_mode not in ("query", "vote"):
             raise ValueError(f"position_mode {position_mode!r}: 'query' or 'vote'")
         self.n_vertex_slots, self.num_heads, self.point_embed_scale = n_vertex_slots, num_heads, point_embed_scale
         self.softmax_mask, self.do_masked_attn, self.attn_mask_eps = softmax_mask, do_masked_attn, attn_mask_eps
-        self.position_mode, self.vote_eps = position_mode, vote_eps
+        self.position_mode, self.vote_eps, self.vote_z_from_origin = position_mode, vote_eps, vote_z_from_origin
         self.normalization = dict(TPC_NORMALIZATION if normalization is None else normalization)
 
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
@@ -89,7 +92,8 @@ class PureVertexHead(nn.Module):
         raw = self.vote_mlp(torch.cat([hit_features, x.to(hit_features.dtype)], dim=-1))
         return {
             "vote_position": torch.cat([raw[..., :2] * self.position_scale[:2],
-                                        (points[..., 3] - r * raw[..., 2]).unsqueeze(-1)], dim=-1),
+                                        ((0.0 if self.vote_z_from_origin else points[..., 3])
+                                         - r * raw[..., 2]).unsqueeze(-1)], dim=-1),
             "vote_log_variance": raw[..., 3:] + 2 * torch.stack(
                 [self.position_scale[0].log().expand_as(r), self.position_scale[1].log().expand_as(r), r.log()], dim=-1),
         }

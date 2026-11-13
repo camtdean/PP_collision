@@ -101,6 +101,8 @@ def main():
                         help="pure: the slot position from its query, or from the hits' votes (default query)")
     parser.add_argument("--vote_weight", default=None, type=float,
                         help="pure: weight of the per-hit vote loss (position_mode vote; default 1)")
+    parser.add_argument("--vote_z_from_origin", action="store_true",
+                        help="pure: the z vote's slope starts from the hit's line to z = 0 (position_mode vote)")
     parser.add_argument("--resume", default=None, nargs="?", const="", type=str,
                         help="continue with the same options, each method from its <name>_last_checkpoint.pth in "
                              "--checkpoint_dir (written every epoch), or from the checkpoint given (one method "
@@ -186,6 +188,7 @@ def main():
                        ("pure_vertex_loss_position_l1_weight", args.position_l1_weight),
                        ("pure_vertex_position_mode", args.position_mode),
                        ("pure_vertex_loss_vote_weight", args.vote_weight),
+                       ("pure_vertex_vote_z_from_origin", args.vote_z_from_origin or None),
                        ("pure_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
         if value is not None:
             params[key] = value
