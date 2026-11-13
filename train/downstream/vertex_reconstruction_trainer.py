@@ -471,6 +471,11 @@ class DownstreamTrainer():
     PURE_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
                             "loss_position": 1.0, "loss_position_l1": 1.0, "loss_vote": 1.0}
     PURE_POSITION_BETA = 0.5    # compute_vertex_set_loss's position_beta; setting pure_vertex_position_beta
+    # lowest validation PV rate at which an epoch can be the best-PV checkpoint; settings <prefix>min_pv_rate
+    MIN_PV_RATE = {"pure": 0.9, "hybrid": 0.85}
+    # cm: hybrid's validation loss of an event with a true PV and no fitted one (the per-coordinate L1 of a
+    # no-information guess); setting vertex_train_missed_pv_penalty_cm
+    HYBRID_MISSED_PV_PENALTY_CM = 1.8
 
     def setup_pure_vertexing(self, saved=None):
         """
@@ -542,8 +547,8 @@ class DownstreamTrainer():
         One loader batch (grouped, label, knearest, reg; with cached a _cached_loader batch: its features instead
         of the backbone's) through the frozen backbone, once, and each of methods' heads.
 
-        Returns {method: (loss, terms, residual)}: the loss, its terms as floats and the PV residual (cm) of the
-        events with a reconstructed and a truth PV.
+        Returns {method: (loss, terms, residual, n_true)}: the loss, its terms as floats, the PV residual (cm) of
+        the events with a reconstructed and a truth PV, and the number of events with a truth PV.
             pure: PURE_LOSS_WEIGHTS over compute_vertex_set_loss's terms (with aux the same on each of the
                 head's aux outputs added; terms: the final output's).
             hybrid: the frozen track head, then HybridVertexHead; vertex_reg_loss (L1, cm) of the PV over those events
@@ -560,7 +565,7 @@ class DownstreamTrainer():
         with torch.no_grad():
             pre_embed = None if cached else self.model(grouped, return_z=True)[1]
             truth = self._truth_labels(reg, label, mask)
-        results = {}
+        results, n_true = {}, int(truth["vertex_valid"].sum())
         if "pure" in methods:
             outputs, raw = self.pure_vertex(grouped, third.float() if cached else self._pure_features(pre_embed),
                                                mask)
@@ -582,7 +587,8 @@ class DownstreamTrainer():
                 terms = terms or {term: losses[term].item() for term in self.loss_weights}
             ok = outputs["fit_is_valid"] & truth["vertex_valid"]
             results["pure"] = (loss, terms,
-                                  (outputs["vertex_estimate"] - truth["vertex_target"])[ok].norm(dim=-1).detach().cpu())
+                                  (outputs["vertex_estimate"] - truth["vertex_target"])[ok].norm(dim=-1).detach().cpu(),
+                                  n_true)
         if "hybrid" in methods:
             with torch.no_grad():
                 out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
@@ -591,7 +597,7 @@ class DownstreamTrainer():
                                                          "mask_probs": out["mask_probs"]}])[0]
             ok, target = valid & truth["vertex_valid"].cpu(), truth["vertex_target"].cpu().to(vertex.dtype)
             loss = vertex_reg_loss(vertex, target, ok)["loss"]
-            results["hybrid"] = (loss, {"loss_l1": loss.item()}, (vertex - target)[ok].norm(dim=-1).detach())
+            results["hybrid"] = (loss, {"loss_l1": loss.item()}, (vertex - target)[ok].norm(dim=-1).detach(), n_true)
         return results
 
     def train(self, pretrain=True, train_from_checkpoint=False, checkpoint_path=None):
@@ -616,7 +622,8 @@ class DownstreamTrainer():
         Writes to params.checkpoint_dir, per method (<name>: log_file_name with {method} filled in, without its
         extension): the log (per epoch the losses, the PV residual medians, the validation loss terms),
         <name>_checkpoint.pth at the best validation loss, <name>_best_pv_checkpoint.pth at the best validation PV
-        residual median and <name>_last_checkpoint.pth after every epoch. A method stops after <prefix>patience
+        residual median among the epochs with a validation PV rate of at least <prefix>min_pv_rate (default
+        MIN_PV_RATE) and <name>_last_checkpoint.pth after every epoch. A method stops after <prefix>patience
         epochs (default 15) without a better validation loss (by <prefix>min_delta, default 1e-4), once past
         <prefix>early_stop_warmup epochs (default 60); the others go on.
 
@@ -710,7 +717,7 @@ class DownstreamTrainer():
                 break
             self.epoch, start = epoch, time.time()
             self.down_results = {m: {"train": [], "train_residual": [], "val": [], "val_residual": [], "val_events": 0,
-                                     "steps": 0, "skipped": 0, **{term: [] for term in terms[m]}}
+                                     "val_true": 0, "steps": 0, "skipped": 0, **{term: [] for term in terms[m]}}
                                  for m in self.active_methods}
             self.downstream_end_to_end_one_epoch(pretrain=pretrain)
             val_losses = self.validate_end_to_end_one_epoch(pretrain=pretrain)
@@ -731,8 +738,10 @@ class DownstreamTrainer():
                           f"  PV residual median (cm): train {row[2]:.4f} | val {row[3]:.4f} (PV found: {row[4]:.3f})\n  "
                           + " | ".join(f"{term}: {v:.6f}" for term, v in zip(terms[m], row[5:])) + "\n" + "-" * 80)
                 # bests, early-stopping count and schedule first: every checkpoint then holds the next epoch's state
-                new_pv, new_loss = row[3] < state["best_pv"], val_loss < state["best_loss"] - get(m, "min_delta", 1e-4)
-                state["best_pv"] = min(state["best_pv"], row[3])
+                new_pv = row[3] < state["best_pv"] and row[4] >= get(m, "min_pv_rate", self.MIN_PV_RATE[m])
+                new_loss = val_loss < state["best_loss"] - get(m, "min_delta", 1e-4)
+                if new_pv:
+                    state["best_pv"] = row[3]
                 if new_loss:
                     state["best_loss"], state["stagnation"] = val_loss, 0
                 elif epoch >= get(m, "early_stop_warmup", 60):
@@ -754,7 +763,7 @@ class DownstreamTrainer():
         if "pure" in self.active_methods:
             self.pure_vertex.train()
         for batch in tqdm(self.train_data_loader, disable=not self.log_to_screen):
-            for m, (loss, _, residual) in self._batch_losses(batch, self.active_methods,
+            for m, (loss, _, residual, _) in self._batch_losses(batch, self.active_methods,
                                                              cached=self.train_cached).items():
                 state, results = self.train_state[m], self.down_results[m]
                 if loss.requires_grad:
@@ -777,26 +786,33 @@ class DownstreamTrainer():
     @torch.no_grad()
     def validate_end_to_end_one_epoch(self, pretrain=False):
         """The validation set (its first pure_vertex_val_events events, default all); returns each of
-        active_methods' mean loss (of the final output: no aux terms; hybrid: over the batches with a fitted and a
-        true PV)."""
+        active_methods' mean loss (of the final output: no aux terms). hybrid: the mean over the events with a true
+        PV of the event's L1, vertex_train_missed_pv_penalty_cm (default HYBRID_MISSED_PV_PENALTY_CM) for an event
+        without a fitted PV; its loss_l1 term stays the mean over the batches with a fitted and a true PV."""
         self.model.eval()
         if "pure" in self.active_methods:
             self.pure_vertex.eval()
         max_events, n_events = getattr(self.params, "pure_vertex_val_events", None), 0
+        penalty = getattr(self.params, "vertex_train_missed_pv_penalty_cm", None)
+        penalty = self.HYBRID_MISSED_PV_PENALTY_CM if penalty is None else penalty
         for batch in tqdm(self.val_data_loader, disable=not self.log_to_screen):
-            for m, (loss, terms, residual) in self._batch_losses(batch, self.active_methods, aux=False,
-                                                                 cached=self.val_cached).items():
+            for m, (loss, terms, residual, n_true) in self._batch_losses(batch, self.active_methods, aux=False,
+                                                                         cached=self.val_cached).items():
                 results = self.down_results[m]
                 results["val_residual"].append(residual)
                 results["val_events"] += batch[0].size(0)
+                results["val_true"] += n_true
+                # hybrid: the batch's sum over its events with a true PV (the loss is the mean over the fitted ones)
+                results["val"].append(loss.item() * len(residual) + penalty * (n_true - len(residual))
+                                      if m == "hybrid" else loss.item())
                 if self._has_loss(m, residual):
-                    results["val"].append(loss.item())
                     for term, value in terms.items():
                         results[term].append(value)
             n_events += batch[0].size(0)
             if max_events and n_events >= max_events:
                 break
-        return {m: self._mean(self.down_results[m]["val"]) for m in self.active_methods}
+        return {m: (lambda r: (sum(r["val"]) / r["val_true"] if r["val_true"] else float("nan")) if m == "hybrid"
+                    else self._mean(r["val"]))(self.down_results[m]) for m in self.active_methods}
 
     @staticmethod
     def _has_loss(method, residual):

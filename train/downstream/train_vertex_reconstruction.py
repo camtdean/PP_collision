@@ -71,6 +71,12 @@ def main():
                              "the one its checkpoint_dir, track_config, eventnumber, run_num and seed name)")
     parser.add_argument("--hybrid_max_lr", default=None, type=float, help="hybrid's peak learning rate (default: --max_lr)")
     parser.add_argument("--hybrid_min_lr", default=None, type=float, help="hybrid's lowest learning rate (default: --min_lr)")
+    parser.add_argument("--min_pv_rate", default=None, type=float,
+                        help="pure: lowest validation PV rate of a best-PV checkpoint (default 0.9)")
+    parser.add_argument("--hybrid_min_pv_rate", default=None, type=float,
+                        help="hybrid: lowest validation PV rate of a best-PV checkpoint (default 0.85)")
+    parser.add_argument("--missed_pv_penalty_cm", default=None, type=float,
+                        help="hybrid: validation loss, cm, of an event with a true PV and no fitted one (default 1.8)")
     parser.add_argument("--vertex_device", default=None, type=str,
                         help="HybridVertexHead's device, e.g. cpu (default: the backbone's)")
     parser.add_argument("--bz", default=None, type=float,
@@ -179,6 +185,9 @@ def main():
                        ("track_checkpoint", args.track_checkpoint), ("vertex_device", args.vertex_device),
                        ("vertex_Bz", args.bz), ("vertex_train_max_lr", args.hybrid_max_lr),
                        ("vertex_train_min_lr", args.hybrid_min_lr),
+                       ("pure_vertex_min_pv_rate", args.min_pv_rate),
+                       ("vertex_train_min_pv_rate", args.hybrid_min_pv_rate),
+                       ("vertex_train_missed_pv_penalty_cm", args.missed_pv_penalty_cm),
                        ("max_epochs", args.max_epochs), ("max_lr", args.max_lr), ("min_lr", args.min_lr),
                        ("feature_cache", args.feature_cache), ("feature_cache_val", args.feature_cache_val),
                        ("pure_vertex_min_sigma_xy", args.min_sigma_xy),

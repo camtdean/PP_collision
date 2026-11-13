@@ -852,7 +852,9 @@ a PV (`fit_is_valid`) if its best slot is a vertex.
 $\mathbf{x}_0$ the truth PV of §15.1.1. `Train_PV_median_cm` / `Val_PV_median_cm` are the medians over the residuals of the
 epoch (training: from the training-mode forward pass; validation: of the validation events). `Val_PV_rate` is the number of
 validation residuals divided by the number of validation events (an event without a PV or without a valid truth is not
-in it). The best-PV checkpoint is chosen by `Val_PV_median_cm`.
+in it). The best-PV checkpoint is the epoch with the lowest `Val_PV_median_cm`
+among those with `Val_PV_rate` of at least `min_pv_rate` (`--min_pv_rate`, default 0.9; hybrid `--hybrid_min_pv_rate`,
+default 0.85).
 
 **Sources** — Code: [vertex_reconstruction_trainer.py:train](../train/downstream/vertex_reconstruction_trainer.py#L597),
 [vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L583).
@@ -888,8 +890,10 @@ is left out of the epoch means. Learning rates: `--hybrid_max_lr`, `--hybrid_min
 
 * **Training**: $L_\text{l1}$ of the batch (`loss.backward()` when it has a gradient); `Train_Loss` is the mean over the
   batches with at least one event in $\mathcal{E}$.
-* **Validation**: the same $L_\text{l1}$ per batch (1 event), averaged over the batches with an event in $\mathcal{E}$;
-  the one logged term column is `loss_l1`, the same value. The PV residual median / rate of §15.1.13 are computed the
+* **Validation**: `Val_Loss` is the mean over the validation events with a true PV of the event's $L_\text{l1}$, with
+  the penalty $c_\text{miss}$ = `vertex_train_missed_pv_penalty_cm` (`--missed_pv_penalty_cm`, default 1.8 cm) for an
+  event without a fitted PV. The logged term column `loss_l1` is the mean of $L_\text{l1}$ over the batches (1 event)
+  with an event in $\mathcal{E}$, without the penalty. The PV residual median / rate of §15.1.13 are computed the
   same way ($\lVert\hat{\mathbf{x}} - \mathbf{x}_0\rVert$ over $\mathcal{E}$).
 
 **Sources** — Code: [loss.py:vertex_reg_loss](../train/downstream/loss.py#L803),
