@@ -1,6 +1,6 @@
 """
 acts_worker.py: ACTS computing perigee parameters and covariances for track states, inside the ACTS image with
-the module from build_images.sh (perigee_propagator/build/install). VertexHead (TrackBuilder, use_acts) starts it once and
+the module from build_images.sh (perigee_propagator/build/install). HybridVertexHead (TrackBuilder, use_acts) starts it once and
 streams batches:
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
@@ -97,7 +97,7 @@ def serve(config):
     while True:
         header = read_exact(stdin, 16)
         if header is None:
-            # at the end (VertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
+            # at the end (HybridVertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
             print(f"ACTS worker: {propagated} of {attempted} states propagated" + ("; failures:" if errors else ""))
             for key, count in errors.most_common():
                 print(f"  {count:7d}  {key}")

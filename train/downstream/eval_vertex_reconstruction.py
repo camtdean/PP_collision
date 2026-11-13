@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Evaluate VertexHead after a trained track-finding head. Run from train/downstream:
+Evaluate HybridVertexHead after a trained track-finding head. Run from train/downstream:
 
     python eval_vertex_reconstruction.py --run_config ../../scripts/configs/vertex_<run>.yaml [options override the file]
     python eval_vertex_reconstruction.py --root_dir out/ --checkpoint <head.pth> [--no-csv]
 
 Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
---checkpoint_dir. VertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
+--checkpoint_dir. HybridVertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
 --eval_batch_size.
-Methods: --vertex_method fit learned runs both on the same events (learned: --learned_checkpoint; its CSV is
-<name>_per_point_data_learned.csv, its metrics follow fit's in the log and JSON); a PV residual table per method is
+Methods: --vertex_method hybrid pure runs both on the same events (pure: --pure_checkpoint; its CSV is
+<name>_per_point_data_pure.csv, its metrics follow hybrid's in the log and JSON); a PV residual table per method is
 printed and logged unless --no_residual_table.
 Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/ (name: vertex_eval_e<events>_<N>):
 data/<name>_per_point_data.csv, logs/<name>.log (parameters, metrics) and metrics/<name>.json (inputs, track
@@ -174,7 +174,7 @@ def main():
         "--detector",
         type=str,
         default=None,
-        help="Detector file for VertexHead.from_detector (scripts/acts/detectors/<name>/<name>.yaml): field, "
+        help="Detector file for HybridVertexHead.from_detector (scripts/acts/detectors/<name>/<name>.yaml): field, "
              "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
     )
     parser.add_argument(
@@ -193,36 +193,36 @@ def main():
         "--vertex_chunk_events",
         type=int,
         default=None,
-        help="Events per VertexHead call (default: YAML vertex_chunk_events, else 32; 1 = per loader batch); "
+        help="Events per HybridVertexHead call (default: YAML vertex_chunk_events, else 32; 1 = per loader batch); "
              "the backbone and track head still run per loader batch",
     )
     parser.add_argument(
         "--vertex_device",
         type=str,
         default=None,
-        help="Device for VertexHead, e.g. cpu (default: YAML vertex_device, else the backbone's device)",
+        help="Device for HybridVertexHead, e.g. cpu (default: YAML vertex_device, else the backbone's device)",
     )
     parser.add_argument(
         "--vertex_method",
         type=str,
         nargs="+",
-        default=["fit"],
-        choices=["fit", "learned"],
-        help="Vertexing methods, each run on the same events with the backbone run once: fit (track head + "
-             "VertexHead), learned (LearnedVertexHead, needs --learned_checkpoint)",
+        default=["hybrid"],
+        choices=["hybrid", "pure"],
+        help="Vertexing methods, each run on the same events with the backbone run once: hybrid (track head + "
+             "HybridVertexHead), pure (PureVertexHead, needs --pure_checkpoint)",
     )
     parser.add_argument(
-        "--learned_checkpoint",
+        "--pure_checkpoint",
         type=str,
         default=None,
-        help="LearnedVertexHead checkpoint written by train_vertex_reconstruction.py (its head settings are used)",
+        help="PureVertexHead checkpoint written by train_vertex_reconstruction.py (its head settings are used)",
     )
     parser.add_argument(
         "--vertex_checkpoint",
         type=str,
         default=None,
-        help="Trained VertexHead checkpoint (train_vertex_reconstruction.py --vertex_method fit): its learned track "
-             "weights, gates and fallback scale (default: the untrained fit)",
+        help="Trained HybridVertexHead checkpoint (train_vertex_reconstruction.py --vertex_method hybrid): its learned track "
+             "weights, gates and fallback scale (default: the untrained hybrid)",
     )
     parser.add_argument(
         "--no_residual_table",
@@ -247,7 +247,7 @@ def main():
         if unknown:
             sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
         base = os.path.dirname(os.path.abspath(run_config))
-        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "learned_checkpoint", "vertex_checkpoint",
+        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "pure_checkpoint", "vertex_checkpoint",
                      "csv_output_path", "data_root_test", "root_dir", "detector"}
         # each value converted as the command line would be (e.g. run_num: 2 -> "2"; a list: each entry)
         types = {a.dest: a.type for a in parser._actions if a.type is not None}
@@ -263,13 +263,13 @@ def main():
         args.root_dir = args.root_dir or "."
     if not args.root_dir:
         parser.error("--root_dir is required (on the command line or in --run_config), unless --no_output")
-    fit, learned = "fit" in args.vertex_method, "learned" in args.vertex_method
-    if learned and not (args.learned_checkpoint and os.path.isfile(args.learned_checkpoint)):
-        parser.error(f"--vertex_method learned needs --learned_checkpoint (an existing file): {args.learned_checkpoint}")
-    if args.vertex_checkpoint and not (fit and os.path.isfile(args.vertex_checkpoint)):
-        parser.error(f"--vertex_checkpoint needs --vertex_method fit and an existing file: {args.vertex_checkpoint}")
-    if learned and not args.usepretrain:
-        parser.error("--vertex_method learned needs the backbone features (not --no-pretrain)")
+    hybrid, pure = "hybrid" in args.vertex_method, "pure" in args.vertex_method
+    if pure and not (args.pure_checkpoint and os.path.isfile(args.pure_checkpoint)):
+        parser.error(f"--vertex_method pure needs --pure_checkpoint (an existing file): {args.pure_checkpoint}")
+    if args.vertex_checkpoint and not (hybrid and os.path.isfile(args.vertex_checkpoint)):
+        parser.error(f"--vertex_checkpoint needs --vertex_method hybrid and an existing file: {args.vertex_checkpoint}")
+    if pure and not args.usepretrain:
+        parser.error("--vertex_method pure needs the backbone features (not --no-pretrain)")
 
     # Prepare hyperparameters
     params = YParams(os.path.abspath(args.yaml_config), args.config)
@@ -286,14 +286,14 @@ def main():
         params["data_root_test"] = args.data_root_test
     checkpoint_path = (args.checkpoint if args.checkpoint
                        else os.path.join(args.checkpoint_dir or params.checkpoint_dir, checkpoint_name))
-    # the run folder: <backbone checkpoint>/<track-head checkpoint> (without fit: the learned head's checkpoint);
+    # the run folder: <backbone checkpoint>/<track-head checkpoint> (without hybrid: the pure head's checkpoint);
     # outputs vertex_eval_e<events>_<N>.*
     stem = lambda path: os.path.splitext(os.path.basename(path))[0]  # noqa: E731
-    head = stem(checkpoint_path if fit else args.learned_checkpoint).replace("_checkpoint", "").replace(
+    head = stem(checkpoint_path if hybrid else args.pure_checkpoint).replace("_checkpoint", "").replace(
         "_nerf_tracking_head", "")
     params.run_folder = os.path.join(stem(params.pretrained_ckpt), head)
     params.run_name = f"vertex_eval_{f'e{args.max_eval_events}' if args.max_eval_events else 'all'}"
-    if fit and not os.path.isfile(checkpoint_path):
+    if hybrid and not os.path.isfile(checkpoint_path):
         sys.exit(f"track-head checkpoint not found: {checkpoint_path}\n"
                  f"(pass --checkpoint, or check --track_config/--run_num/--seed/--eventnumber "
                  f"against the training run)")
@@ -311,10 +311,10 @@ def main():
         if value is not None:
             params[key] = value
     print(f"[vertex] backbone   : {params.pretrained_ckpt}")
-    if fit:
+    if hybrid:
         print(f"[vertex] track head : {checkpoint_path}")
-    if learned:
-        print(f"[vertex] learned head: {args.learned_checkpoint}")
+    if pure:
+        print(f"[vertex] pure head: {args.pure_checkpoint}")
 
     # Launch and run inference
     trainer = DownstreamTrainer(params, args)
@@ -336,7 +336,7 @@ def main():
         pretrain=args.usepretrain,
         save_csv=args.save_csv,
         csv_output_path=args.csv_output_path,
-        learned_checkpoint_path=args.learned_checkpoint,
+        pure_checkpoint_path=args.pure_checkpoint,
         vertex_checkpoint_path=args.vertex_checkpoint,
     )
     trainer.cleanup()

@@ -1,5 +1,5 @@
 """
-vertexhead.py: VertexHead, vertex reconstruction from track-finder output and the training interface: TrackBuilder
+hybridvertexhead.py: HybridVertexHead, vertex reconstruction from track-finder output and the training interface: TrackBuilder
 (tracks.py) then the primary and secondary vertices (primaryvertex.py's PrimaryVertices, secondaryvertex.py's
 SecondaryVertices, both on vertexfit.py's VertexFit, the shared fit). The PV is the first vertex the AMVF keeps,
 refitted with the SVs sharing its tracks. ACTS's hard cuts are soft (sigmoids of width cut_softness_*);
@@ -26,10 +26,10 @@ _PARTS = (TrackBuilder, VertexFit, PrimaryVertices, SecondaryVertices)
 
 @functools.cache
 def _setting_names(part):
-    """The keyword settings part.__init__ takes (each named: VertexHead routes settings by these names)."""
+    """The keyword settings part.__init__ takes (each named: HybridVertexHead routes settings by these names)."""
     parameters = inspect.signature(part.__init__).parameters
     if any(p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL) for p in parameters.values()):
-        raise TypeError(f"{part.__name__}.__init__ takes *args/**kwargs; VertexHead needs every setting named")
+        raise TypeError(f"{part.__name__}.__init__ takes *args/**kwargs; HybridVertexHead needs every setting named")
     return frozenset(parameters) - {"self", "vertex_fit"}
 
 
@@ -37,7 +37,7 @@ if sum(len(_setting_names(part)) for part in _PARTS) != len(frozenset().union(*m
     raise TypeError("TrackBuilder, VertexFit, PrimaryVertices and SecondaryVertices must not share a setting's name")
 
 
-class VertexHead(nn.Module):
+class HybridVertexHead(nn.Module):
     """
     TrackBuilder (self.tracks) then the primary and secondary vertices (self.primary, self.secondary, on the fit
     self.vertex_fit). Takes their settings as keywords.
@@ -49,7 +49,7 @@ class VertexHead(nn.Module):
         super().__init__()
         unknown = sorted(set(settings) - self.setting_names())
         if unknown:
-            raise TypeError(f"VertexHead has no settings {unknown}")
+            raise TypeError(f"HybridVertexHead has no settings {unknown}")
         part = lambda cls, *args: cls(*args, **{k: v for k, v in settings.items() if k in _setting_names(cls)})  # noqa: E731
         self.find_secondary, self.refit_pv = find_secondary, refit_pv
         self.tracks, self.vertex_fit = part(TrackBuilder), part(VertexFit)
@@ -57,13 +57,13 @@ class VertexHead(nn.Module):
 
     @staticmethod
     def setting_names():
-        """The settings VertexHead takes: its own and those of TrackBuilder, VertexFit and the two vertex searches."""
+        """The settings HybridVertexHead takes: its own and those of TrackBuilder, VertexFit and the two vertex searches."""
         return frozenset({"find_secondary", "refit_pv"}).union(*map(_setting_names, _PARTS))
 
     @classmethod
     def from_detector(cls, path, **overrides):
         """
-        A VertexHead from a detector file (scripts/acts/detectors/<name>/<name>.yaml): use_acts when acts.image or
+        A HybridVertexHead from a detector file (scripts/acts/detectors/<name>/<name>.yaml): use_acts when acts.image or
         acts.command is set, its vertex_head block as further settings; keyword arguments override it.
         """
         import yaml
@@ -104,7 +104,7 @@ class VertexHead(nn.Module):
         }
         unknown = sorted(set(d.get("vertex_head") or {}) - cls.setting_names())
         if unknown:
-            raise ValueError(f"{path}: vertex_head sets {unknown}, which VertexHead does not take")
+            raise ValueError(f"{path}: vertex_head sets {unknown}, which HybridVertexHead does not take")
         return cls(**{**{k: v for k, v in kwargs.items() if v is not None}, **overrides})
 
     def forward(self, class_probs=None, mask_probs=None, points=None, padding_mask=None, track_parameters=None,

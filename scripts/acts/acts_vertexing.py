@@ -1,6 +1,6 @@
 """
 acts_vertexing.py: ACTS's own vertex finding, as shipped (AdaptiveMultiVertexFinderAlgorithm, Gaussian track-density
-seeder), on per-event perigee tracks; a reference for VertexHead, run by compare_vertexing.py inside the ACTS image:
+seeder), on per-event perigee tracks; a reference for HybridVertexHead, run by compare_vertexing.py inside the ACTS image:
 
     singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_vertexing.py <dir> --beamspot <x y z mm> \
         (--bz_tesla 1.4 | --field_map <field.txt>)

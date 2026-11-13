@@ -1,5 +1,5 @@
 """
-primaryvertex.py: PrimaryVertices, VertexHead's primary vertices: ACTS's adaptive multi-vertex finder (AMVF) with
+primaryvertex.py: PrimaryVertices, HybridVertexHead's primary vertices: ACTS's adaptive multi-vertex finder (AMVF) with
 the settings of its shipped example (AdaptiveMultiVertexFinderAlgorithm, Gaussian track-density seeder): seed,
 preselect tracks, fit all connected vertices together, keep or delete the new vertex, repeat on the tracks left.
 """
@@ -59,7 +59,7 @@ def _density_seed(d0, z0, covariance, weight, d0_significance, z0_significance):
 
 class PrimaryVertices(nn.Module):
     """
-    VertexHead's primary-vertex search, on the vertex fit vertex_fit (VertexFit). Defaults: ACTS's
+    HybridVertexHead's primary-vertex search, on the vertex fit vertex_fit (VertexFit). Defaults: ACTS's
     AdaptiveMultiVertexFinderAlgorithm; cm.
 
     Args:

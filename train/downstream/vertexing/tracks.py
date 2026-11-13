@@ -511,7 +511,7 @@ class TrackBuilder(nn.Module):
         Returns:
             dict: track_parameters (B, T, 6) cm, track_position, track_direction (B, T, 3), track_weight,
             track_quality_mask, track_sigma (B, T, 2), track_input_mask; acts_failed, acts_refit_failed,
-            track_covariance as VertexHead.forward.
+            track_covariance as HybridVertexHead.forward.
             dict, the vertex fit's tracks (stand-ins where not input): perigee (B, T, 5) cm, covariance (B, T, 5, 5)
             x track_error_scale^2, bz (B, T) Bz at the perigee, n_hits (inf for given tracks), n_silicon_hits,
             input (track_input_mask), weight (B, T) (0 where not input), beam (2,) the beam line's (x, y).

@@ -11,7 +11,7 @@ from fm4npp.models.rmsnorm import RMSNorm
 from trackinghead import FFNBlock, RefinementLayer
 
 
-class LearnedVertexHead(nn.Module):
+class PureVertexHead(nn.Module):
     """
     Vertex queries refined against the per-hit backbone features; each slot predicts whether it is a
     vertex, which hits belong to it, and its position with an uncertainty.
@@ -95,7 +95,7 @@ class LearnedVertexHead(nn.Module):
             aux_list: the same four keys before each refinement layer.
         """
         if not pretrain:
-            raise NotImplementedError("LearnedVertexHead needs the backbone features (pretrain=True)")
+            raise NotImplementedError("PureVertexHead needs the backbone features (pretrain=True)")
         hit_features = self.input_proj(torch.einsum("lbnd,l->bnd", feature,
                                                     torch.softmax(self.weighted_avg_weights, dim=0).to(feature.dtype)))
         if self.embedder is not None:
@@ -120,7 +120,7 @@ class LearnedVertexHead(nn.Module):
 
 
 _F, _I, _B, _NAN = torch.float64, torch.int64, torch.bool, float("nan")
-# VertexHead.forward's keys: (shape after B, dtype, value when not filled); T track slots, V vertices, K SVs
+# HybridVertexHead.forward's keys: (shape after B, dtype, value when not filled); T track slots, V vertices, K SVs
 _EMPTY = {
     "track_parameters": (("T", 6), _F, _NAN), "track_position": (("T", 3), _F, _NAN),
     "track_direction": (("T", 3), _F, _NAN), "track_weight": (("T",), _F, 0.0),
@@ -142,9 +142,9 @@ _EMPTY = {
 }
 
 
-def learned_outputs(raw, padding_mask, max_vertices, n_track_slots, max_sv_per_event, real_threshold):
+def pure_outputs(raw, padding_mask, max_vertices, n_track_slots, max_sv_per_event, real_threshold):
     """
-    LearnedVertexHead's output as VertexHead.forward's dict (same keys, shapes and dtypes).
+    PureVertexHead's output as HybridVertexHead.forward's dict (same keys, shapes and dtypes).
 
     A slot is a vertex when P(real) >= real_threshold. The vertices are ordered by P(real) x the slot's hits (the
     sum of its mask probabilities over the real hits), highest first; the PV is the first. The first max_vertices
@@ -152,7 +152,7 @@ def learned_outputs(raw, padding_mask, max_vertices, n_track_slots, max_sv_per_e
     -1. The track, SV, chi-square and ndf keys are not filled (NaN, False, 0, track_primary_vertex -1).
 
     Args:
-        raw: LearnedVertexHead.forward's dict.
+        raw: PureVertexHead.forward's dict.
         padding_mask: (B, N) bool, True for real hits.
         max_vertices: V of primary_vertices.
         n_track_slots: T of the track keys.
@@ -177,12 +177,12 @@ def learned_outputs(raw, padding_mask, max_vertices, n_track_slots, max_sv_per_e
     return out
 
 
-class LearnedVertexing(nn.Module):
+class PureVertexing(nn.Module):
     """
-    The learned vertexing method: LearnedVertexHead, its output as VertexHead.forward's dict.
+    The pure vertexing method: PureVertexHead, its output as HybridVertexHead.forward's dict.
 
     Args:
-        head: the LearnedVertexHead.
+        head: the PureVertexHead.
         n_track_slots: T, the track finder's slots (the shape of the track keys).
         max_vertices: V, the most primary vertices returned.
         max_sv_per_event: K, the shape of the sv keys.
@@ -197,10 +197,10 @@ class LearnedVertexing(nn.Module):
 
     def forward(self, x, feature, padding_mask):
         """
-        x (B, N, 4), feature (L, B, N, D), padding_mask (B, N) as LearnedVertexHead.forward.
+        x (B, N, 4), feature (L, B, N, D), padding_mask (B, N) as PureVertexHead.forward.
 
-        Returns (outputs, raw): VertexHead.forward's dict (learned_outputs) and the head's own dict (for the loss).
+        Returns (outputs, raw): HybridVertexHead.forward's dict (pure_outputs) and the head's own dict (for the loss).
         """
         raw = self.head(x, feature, padding_mask)
-        return learned_outputs(raw, padding_mask, self.max_vertices, self.n_track_slots, self.max_sv_per_event,
+        return pure_outputs(raw, padding_mask, self.max_vertices, self.n_track_slots, self.max_sv_per_event,
                                self.real_threshold), raw

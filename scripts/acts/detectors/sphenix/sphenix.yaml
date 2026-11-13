@@ -1,5 +1,5 @@
-# sPHENIX TPC detector description for VertexHead.from_detector (train/downstream/vertexing/vertexhead.py) and its ACTS
-# worker. Relative paths are relative to this file; VertexHead binds the ACTS input directories into the
+# sPHENIX TPC detector description for HybridVertexHead.from_detector (train/downstream/vertexing/hybridvertexhead.py) and its ACTS
+# worker. Relative paths are relative to this file; HybridVertexHead binds the ACTS input directories into the
 # container. A site's copy (scripts/run/vertexing.sh setup writes one into scripts/configs/) holds its ACTS paths;
 # for another detector, copy this folder and fill in the same keys (README: Adding a detector).
 name: sphenix
@@ -49,5 +49,5 @@ acts:                          # use_acts is on when image (or command) is set
     z: 16.4
     density_g_cm3: 0.002115    #   at 20 C, 1 atm
 
-# any other VertexHead argument (VertexHead's defaults otherwise)
+# any other HybridVertexHead argument (HybridVertexHead's defaults otherwise)
 vertex_head: {}

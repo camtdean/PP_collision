@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VertexHead evaluation with ACTS, from setup to the comparison against truth. From anywhere:
+# HybridVertexHead evaluation with ACTS, from setup to the comparison against truth. From anywhere:
 #   scripts/run/vertexing.sh setup [options]      ACTS image (if missing) and module; writes or updates the site
 #                                                 detector file
 #   scripts/run/vertexing.sh eval [options]       eval_vertex_reconstruction.py with the run config
-#   scripts/run/vertexing.sh compare [options]    VertexHead and ACTS's vertex finder against truth on the newest
+#   scripts/run/vertexing.sh compare [options]    HybridVertexHead and ACTS's vertex finder against truth on the newest
 #                                                 CSV under root_dir (--csv <file> for another): per-event CSV and
 #                                                 residual plots in compare/ beside it
 # setup options: --geometry, --geometry_config, --material_map <file> (ACTS inputs, must exist);

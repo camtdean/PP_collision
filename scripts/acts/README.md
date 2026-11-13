@@ -1,4 +1,4 @@
-# ACTS for VertexHead
+# ACTS for HybridVertexHead
 
 [ACTS](https://github.com/acts-project/acts) v48.2 (MPL-2.0), unmodified, in a Singularity/apptainer image, so it
 never touches `fm4npp-env`; it runs as a separate program. The one ACTS-derived source here,
@@ -6,7 +6,7 @@ never touches `fm4npp-env`; it runs as a separate program. The one ACTS-derived 
 unaffected). ACTS's examples are not part of its public API (ACTS `docs/pages/versioning.md`), so the propagation
 path does not use them; only `acts_vertexing.py` (the comparison's reference vertex finder) still does.
 
-With `acts.image` set in the detector file, VertexHead's track builder (`TrackBuilder`, `use_acts`) hands each
+With `acts.image` set in the detector file, HybridVertexHead's track builder (`TrackBuilder`, `use_acts`) hands each
 fitted track to ACTS. ACTS's Kalman fitter refits its hits (`kalman_refit`), then ACTS propagates the track from the
 innermost hit back to the beam line, through the field or the detector's tracking geometry with its material, and
 returns perigee parameters with their covariance.
@@ -15,8 +15,8 @@ returns perigee parameters with their covariance.
 
 ```bash
 scripts/run/vertexing.sh setup      # image (once, an hour or more) + module (a minute); site detector file
-scripts/run/vertexing.sh eval       # backbone, track finder, VertexHead -> per-point CSV
-scripts/run/vertexing.sh compare    # VertexHead and ACTS's own vertex finder against truth on that CSV:
+scripts/run/vertexing.sh eval       # backbone, track finder, HybridVertexHead -> per-point CSV
+scripts/run/vertexing.sh compare    # HybridVertexHead and ACTS's own vertex finder against truth on that CSV:
                                     # compare/<name>_reco_vertices.csv, _residuals.png, _secondary.png
 ```
 
@@ -41,10 +41,10 @@ Options after `eval` or `compare` go to the Python script, e.g. `eval --max_eval
 |---|---|
 | `build_images.sh`, `acts-base.def` | the image (ROOT, HepMC3, ACTS) and the module compiled inside it into `perigee_propagator/build/install` |
 | `perigee_propagator/` | the C++ module: ACTS Kalman refit of the hits, then backward propagation to the perigee with covariance and material (not in ACTS's Python bindings); `tgeo_geometry.cpp` builds the TGeo tracking geometry (vendored from ACTS's TGeoDetector example, MPL-2.0, so only ACTS Core and its public Root and Json plugins are used) |
-| `acts_worker.py` | runs in the image; VertexHead starts it once and streams track states to it |
+| `acts_worker.py` | runs in the image; HybridVertexHead starts it once and streams track states to it |
 | `detectors/<name>/` | the detector file template `<name>.yaml` and the tools that make its inputs |
 | `check_geometry.py` | a detector's geometry and material map in ACTS |
-| `compare_vertexing.py` | the PV reconstructions (VertexHead, ACTS AMVF) against truth: per-event CSV, residual plots in x, y, z and 3D, error table; SVs per event and SV residuals (secondary PNG) |
+| `compare_vertexing.py` | the PV reconstructions (HybridVertexHead, ACTS AMVF) against truth: per-event CSV, residual plots in x, y, z and 3D, error table; SVs per event and SV residuals (secondary PNG) |
 | `acts_vertexing.py` | ACTS's vertex finder as shipped (AMVF, Gaussian seeder) on given tracks, for the comparison |
 
 Tracks ACTS fails to propagate are dropped; those the hit fit had kept are flagged in `acts_failed`. Where the
@@ -55,7 +55,7 @@ flagged in `acts_refit_failed`. The worker prints a failure summary when it exit
 
 1. **Detector file.** Copy `detectors/sphenix/` to `detectors/<name>/` and fill in `<name>.yaml`: field (uniform
    Bz or an ACTS text field map), beam position, the dataset's hit normalization, per-hit errors, ACTS inputs and
-   any VertexHead settings. Relative paths are relative to the file.
+   any HybridVertexHead settings. Relative paths are relative to the file.
 2. **Geometry (optional, for material).** A TGeo ROOT file and the experiment's ACTS TGeo JSON configuration and
    material map, as its own ACTS tracking uses them.
 3. **Field map (optional).** ACTS text format (mm, T; a regular grid from the beam line to the tracker).
@@ -67,7 +67,7 @@ flagged in `acts_refit_failed`. The worker prints a failure summary when it exit
    ```
 
    Every sensitive volume should have its module count and every material-map entry should land.
-5. **Compare** VertexHead with ACTS's own finder on real events; a PV chi2/ndf far from 1 means
+5. **Compare** HybridVertexHead with ACTS's own finder on real events; a PV chi2/ndf far from 1 means
    `track_error_scale` (the file's `vertex_head` block) needs adjusting.
 
 ## sPHENIX inputs

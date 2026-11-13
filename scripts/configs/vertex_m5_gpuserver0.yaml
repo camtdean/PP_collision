@@ -21,7 +21,7 @@ max_eval_events: 1000         # events evaluated and written to the per-point CS
 eval_batch_size: 8            # events per backbone call: same results as 1 (padding is ignored), slightly faster
 root_dir: ~/vertex_eval        # runs in <backbone>/<track head>/: data/ (CSV), logs/, metrics/ (JSON), files vertex_eval_e<events>_<N>
 
-# VertexHead: field, ACTS inputs and fit settings
+# HybridVertexHead: field, ACTS inputs and fit settings
 detector: sphenix_gpuserver0.yaml   # site detector file (scripts/run/vertexing.sh setup makes it)
-vertex_device: cuda           # VertexHead's device (it runs beside the backbone)
-vertex_chunk_events: 128      # events per VertexHead call
+vertex_device: cuda           # HybridVertexHead's device (it runs beside the backbone)
+vertex_chunk_events: 128      # events per HybridVertexHead call

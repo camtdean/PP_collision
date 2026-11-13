@@ -1,7 +1,7 @@
 """
-vertex_reconstruction_trainer.py: VertexHead after a trained track-finding head.
+vertex_reconstruction_trainer.py: HybridVertexHead after a trained track-finding head.
 
-    frozen backbone -> frozen track finder -> VertexHead (PV + SVs)
+    frozen backbone -> frozen track finder -> HybridVertexHead (PV + SVs)
 
 Entry point: inference() (eval_vertex_reconstruction.py); train() is a phase-2 hook. Truth is used only for
 scoring. Per-point CSV: track finding's columns (vtx_*: truth production vertex), reco_vtx_* (reconstructed PV)
@@ -38,8 +38,8 @@ from trackinghead import *
 import csv
 
 import vertexing
-from vertexing import VertexHead
-from vertexing.learnedvertex import LearnedVertexHead, LearnedVertexing
+from vertexing import HybridVertexHead
+from vertexing.purevertexhead import PureVertexHead, PureVertexing
 from downstream_util import get_vertex_label
 from loss import (compute_vertex_metrics, assign_points_to_masks, VertexHungarianMatcher,
                   compute_vertex_set_loss, vertex_reg_loss)
@@ -178,9 +178,9 @@ class DownstreamTrainer():
         
         self.params = params
         self.use_amp = bool(getattr(self.params, 'use_amp', True))
-        # how vertices are found: fit (VertexHead), learned (LearnedVertexing); the eval runs each of
+        # how vertices are found: hybrid (HybridVertexHead), pure (PureVertexing); the eval runs each of
         # vertex_methods, training the first
-        methods = getattr(self.params, "vertex_method", None) or "fit"
+        methods = getattr(self.params, "vertex_method", None) or "hybrid"
         self.vertex_methods = [methods] if isinstance(methods, str) else list(methods)
         self.vertex_method = self.vertex_methods[0]
         print("running on rank {} with world size {}".format(self.world_rank, self.world_size))
@@ -386,7 +386,7 @@ class DownstreamTrainer():
 
     def cleanup(self):
         # 1) break references to big objects
-        for obj in ("model", "down_model", "vertex_head", "learned_vertex",
+        for obj in ("model", "down_model", "vertex_head", "pure_vertex",
                     "optimizer", "scheduler", "train_state",
                     "train_data_loader", "val_data_loader"):
             if hasattr(self, obj):
@@ -403,9 +403,9 @@ class DownstreamTrainer():
         print("Cleanup complete. All resources released.")
 
     def _trained_head(self, method=None):
-        """The module a method's (default vertex_method) checkpoint holds: LearnedVertexHead for learned, else
-        VertexHead."""
-        head = self.learned_vertex.head if (method or self.vertex_method) == "learned" else self.vertex_head
+        """The module a method's (default vertex_method) checkpoint holds: PureVertexHead for pure, else
+        HybridVertexHead."""
+        head = self.pure_vertex.head if (method or self.vertex_method) == "pure" else self.vertex_head
         return getattr(head, "module", head)          # DDP-wrapped or not
 
     def _save_checkpoint(self, filename, epoch, is_best, loss, method=None):
@@ -430,8 +430,8 @@ class DownstreamTrainer():
         count."""
         method = method or self.vertex_method
         checkpoint, weights = self._load_checkpoint_state(checkpoint_path, "model_state_dict")
-        if checkpoint.get("vertex_method", "fit") != method:
-            raise ValueError(f"{checkpoint_path} is a vertex_method {checkpoint.get('vertex_method', 'fit')!r} "
+        if checkpoint.get("vertex_method", "hybrid") != method:
+            raise ValueError(f"{checkpoint_path} is a vertex_method {checkpoint.get('vertex_method', 'hybrid')!r} "
                              f"checkpoint; wanted {method!r}")
         self._trained_head(method).load_state_dict(weights)
         if not inference:
@@ -463,38 +463,38 @@ class DownstreamTrainer():
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     # ------------------------------------------------------------------------------------------
-    # Training: LearnedVertexHead (vertex_method learned) and VertexHead's learnable parts (fit), together or
+    # Training: PureVertexHead (vertex_method pure) and HybridVertexHead's learnable parts (hybrid), together or
     # alone, with the backbone and track head frozen; same names and signatures as the other trainers.
     # ------------------------------------------------------------------------------------------
 
-    # the terms of the training loss and their weights (params: learned_vertex_<term>_weight)
-    LEARNED_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
+    # the terms of the training loss and their weights (params: pure_vertex_<term>_weight)
+    PURE_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
                             "loss_position": 1.0, "loss_position_l1": 1.0}
-    LEARNED_POSITION_BETA = 0.5     # compute_vertex_set_loss's position_beta; setting learned_vertex_position_beta
+    PURE_POSITION_BETA = 0.5    # compute_vertex_set_loss's position_beta; setting pure_vertex_position_beta
 
-    def setup_learned_vertexing(self, saved=None):
+    def setup_pure_vertexing(self, saved=None):
         """
-        Build LearnedVertexing (after launch()). From params: any LearnedVertexHead or LearnedVertexing argument as
-        learned_vertex_<argument> (e.g. learned_vertex_n_vertex_slots, learned_vertex_min_sigma_z), each only where
+        Build PureVertexing (after launch()). From params: any PureVertexHead or PureVertexing argument as
+        pure_vertex_<argument> (e.g. pure_vertex_n_vertex_slots, pure_vertex_min_sigma_z), each only where
         set; pe_method; the track slots: max_gt_classes.
 
         Args:
-            saved: a checkpoint's params (the eval): its learned_vertex_<argument> where this run sets none.
+            saved: a checkpoint's params (the eval): its pure_vertex_<argument> where this run sets none.
         """
-        value = lambda name: (lambda v: (saved or {}).get("learned_vertex_" + name) if v is None else v)(  # noqa: E731
-            getattr(self.params, "learned_vertex_" + name, None))
+        value = lambda name: (lambda v: (saved or {}).get("pure_vertex_" + name) if v is None else v)(  # noqa: E731
+            getattr(self.params, "pure_vertex_" + name, None))
         settings = lambda cls: {name: value(name) for name in inspect.signature(cls.__init__).parameters  # noqa: E731
                                 if value(name) is not None}
-        head = LearnedVertexHead(**{
+        head = PureVertexHead(**{
             "input_dim": self.params.embed_dim, "pe_method": getattr(self.params, "pe_method", "nerf"),
-            "num_feature_layers": 1 if getattr(self, "learned_combine_weights", None) is not None
+            "num_feature_layers": 1 if getattr(self, "pure_combine_weights", None) is not None
             else self.params.num_layers_backbone,
-            **settings(LearnedVertexHead)})
-        self.learned_vertex = LearnedVertexing(
-            head, **{"n_track_slots": self.params.max_gt_classes, **settings(LearnedVertexing)}).to(self.device)
+            **settings(PureVertexHead)})
+        self.pure_vertex = PureVertexing(
+            head, **{"n_track_slots": self.params.max_gt_classes, **settings(PureVertexing)}).to(self.device)
 
     def _beam_position(self):
-        """The beam line (x, y) cm of the truth labels: VertexHead's when built, else params.vertex_beam_position,
+        """The beam line (x, y) cm of the truth labels: HybridVertexHead's when built, else params.vertex_beam_position,
         the detector file's (vertex_detector) beam_position_cm, TrackBuilder's default."""
         if hasattr(self, "vertex_head"):
             return self.vertex_head.tracks.beam_position
@@ -516,7 +516,7 @@ class DownstreamTrainer():
         """
         A loader of (points, label, features, reg) from a track-finding feature cache (scripts/cache_features.py)
         and the live dataset's reg (CachedVertexDataset). The cache must be this backbone's. A layer-combined cache
-        sets learned_combine_weights (params learned_vertex_combine_weights): the head then takes one feature
+        sets pure_combine_weights (params pure_vertex_combine_weights): the head then takes one feature
         layer and live features are combined the same way.
         """
         from vertex_cached_dataset import CachedVertexDataset, CachedVertexCollator
@@ -528,11 +528,11 @@ class DownstreamTrainer():
         weights = cache.layer_weights if cache.combine_layers else None
         if cache.combine_layers and weights is None:
             raise ValueError(f"{cache_dir} stores one layer without layer_weights: live features cannot match it")
-        if getattr(self, "learned_combine_weights", weights) != weights:
+        if getattr(self, "pure_combine_weights", weights) != weights:
             raise ValueError("the training and validation caches combine the layers differently")
-        self.learned_combine_weights = weights
+        self.pure_combine_weights = weights
         if weights is not None:
-            self.params["learned_vertex_combine_weights"] = weights
+            self.params["pure_vertex_combine_weights"] = weights
         return torch.utils.data.DataLoader(dataset, batch_size=int(batch_size), shuffle=shuffle,
                                            num_workers=self.params.num_data_workers,
                                            collate_fn=CachedVertexCollator())
@@ -544,9 +544,9 @@ class DownstreamTrainer():
 
         Returns {method: (loss, terms, residual)}: the loss, its terms as floats and the PV residual (cm) of the
         events with a reconstructed and a truth PV.
-            learned: LEARNED_LOSS_WEIGHTS over compute_vertex_set_loss's terms (with aux the same on each of the
+            pure: PURE_LOSS_WEIGHTS over compute_vertex_set_loss's terms (with aux the same on each of the
                 head's aux outputs added; terms: the final output's).
-            fit: the frozen track head, then VertexHead; vertex_reg_loss (L1, cm) of the PV over those events
+            hybrid: the frozen track head, then HybridVertexHead; vertex_reg_loss (L1, cm) of the PV over those events
                 (terms: loss_l1); without one the loss carries no gradient.
         """
         if len(batch) != 4:
@@ -561,8 +561,8 @@ class DownstreamTrainer():
             pre_embed = None if cached else self.model(grouped, return_z=True)[1]
             truth = self._truth_labels(reg, label, mask)
         results = {}
-        if "learned" in methods:
-            outputs, raw = self.learned_vertex(grouped, third.float() if cached else self._learned_features(pre_embed),
+        if "pure" in methods:
+            outputs, raw = self.pure_vertex(grouped, third.float() if cached else self._pure_features(pre_embed),
                                                mask)
             targets = [{"labels": torch.ones(n, dtype=torch.long, device=self.device),
                         "masks": (hit_vertex == torch.arange(n, device=self.device).unsqueeze(-1)).float(),
@@ -578,9 +578,9 @@ class DownstreamTrainer():
                 loss = loss + sum(weight * losses[term] for term, weight in self.loss_weights.items())
                 terms = terms or {term: losses[term].item() for term in self.loss_weights}
             ok = outputs["fit_is_valid"] & truth["vertex_valid"]
-            results["learned"] = (loss, terms,
+            results["pure"] = (loss, terms,
                                   (outputs["vertex_estimate"] - truth["vertex_target"])[ok].norm(dim=-1).detach().cpu())
-        if "fit" in methods:
+        if "hybrid" in methods:
             with torch.no_grad():
                 out = self.down_model(grouped, self._layer_features(pre_embed), pretrain=True, padding_mask=mask)
             vertex, valid, _ = self._vertex_head_chunk([{"mask": mask, "grouped": grouped,
@@ -588,26 +588,26 @@ class DownstreamTrainer():
                                                          "mask_probs": out["mask_probs"]}])[0]
             ok, target = valid & truth["vertex_valid"].cpu(), truth["vertex_target"].cpu().to(vertex.dtype)
             loss = vertex_reg_loss(vertex, target, ok)["loss"]
-            results["fit"] = (loss, {"loss_l1": loss.item()}, (vertex - target)[ok].norm(dim=-1).detach())
+            results["hybrid"] = (loss, {"loss_l1": loss.item()}, (vertex - target)[ok].norm(dim=-1).detach())
         return results
 
     def train(self, pretrain=True, train_from_checkpoint=False, checkpoint_path=None):
         """
         Train each of vertex_methods' heads in one run on the frozen backbone's features (computed once per batch),
         in fp32, each with its own optimizer, schedule, log and checkpoints.
-            learned: LearnedVertexHead; settings learned_vertex_<name> (the head's arguments, <term>_weight for
-                LEARNED_LOSS_WEIGHTS, position_beta, cost_position_weight).
-            fit: VertexHead's learnable parts (built with learn_weights: the track weight network, the soft pT and
+            pure: PureVertexHead; settings pure_vertex_<name> (the head's arguments, <term>_weight for
+                PURE_LOSS_WEIGHTS, position_beta, cost_position_weight).
+            hybrid: HybridVertexHead's learnable parts (built with learn_weights: the track weight network, the soft pT and
                 beam-line gates, the Kalman fallback's covariance scale) after the frozen track head
                 (params.track_checkpoint); settings vertex_train_<name>. Its other settings as in the eval
                 (setup_vertexing).
         Per method: AdamW (<prefix>max_lr, default max_lr; weight decay 1e-4), gradient norm clipped to 1 (a step
         with a non-finite gradient is skipped and counted), cosine schedule with warmup stepped per epoch
         (first_cycle_steps, default max_epochs; <prefix>min_lr, default min_lr; warmup_steps). Each epoch: the
-        training set, then the validation set (its first learned_vertex_val_events events, default all; the
-        training set with learned_vertex_val_on_train).
+        training set, then the validation set (its first pure_vertex_val_events events, default all; the
+        training set with pure_vertex_val_on_train).
 
-        With params.feature_cache / feature_cache_val (the track finder's caches, _cached_loader; learned only)
+        With params.feature_cache / feature_cache_val (the track finder's caches, _cached_loader; pure only)
         the training / validation features are read instead of computed.
 
         Writes to params.checkpoint_dir, per method (<name>: log_file_name with {method} filled in, without its
@@ -628,8 +628,8 @@ class DownstreamTrainer():
         if not pretrain:
             raise NotImplementedError("the vertex training needs the backbone features (pretrain=True)")
         cache, cache_val = (getattr(self.params, key, None) for key in ("feature_cache", "feature_cache_val"))
-        if "fit" in methods and (cache or cache_val):
-            raise ValueError("vertex_method fit trains on the live backbone (its track head takes the backbone's "
+        if "hybrid" in methods and (cache or cache_val):
+            raise ValueError("vertex_method hybrid trains on the live backbone (its track head takes the backbone's "
                              "features): no feature cache")
         names = {m: self.params.log_file_name.format(method=m) for m in methods}
         stems = {m: name.split('.')[0] for m, name in names.items()}
@@ -639,7 +639,7 @@ class DownstreamTrainer():
             raise ValueError("a resume checkpoint path is one method's: none resumes each from its last checkpoint")
         resume = {m: checkpoint_path or os.path.join(self.params.checkpoint_dir, stems[m] + "_last_checkpoint.pth")
                   for m in methods} if train_from_checkpoint else {}
-        prefix = {"learned": "learned_vertex_", "fit": "vertex_train_"}
+        prefix = {"pure": "pure_vertex_", "hybrid": "vertex_train_"}
         get = lambda m, name, default: (lambda v: default if v is None else v)(  # noqa: E731
             getattr(self.params, prefix[m] + name, None))
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False     # full fp32
@@ -655,27 +655,27 @@ class DownstreamTrainer():
         if cache_val:
             self.val_cached, self.val_data_loader = True, self._cached_loader(
                 cache_val, self.val_data_loader.dataset, self.params.local_valid_batch_size, shuffle=False)
-        if getattr(self.params, "learned_vertex_val_on_train", False):
+        if getattr(self.params, "pure_vertex_val_on_train", False):
             self.val_cached, self.val_data_loader = self.train_cached, self.train_data_loader
 
         heads, terms = {}, {}
-        if "learned" in methods:
+        if "pure" in methods:
             # resuming: the checkpoint's head settings where this run sets none
-            self.setup_learned_vertexing(torch.load(resume["learned"], map_location="cpu", weights_only=False).get(
+            self.setup_pure_vertexing(torch.load(resume["pure"], map_location="cpu", weights_only=False).get(
                 "params") if train_from_checkpoint else None)
-            heads["learned"] = self.learned_vertex.head
-            self.loss_weights = {term: get("learned", term + "_weight", weight)
-                                 for term, weight in self.LEARNED_LOSS_WEIGHTS.items()}
-            self.position_beta = get("learned", "position_beta", self.LEARNED_POSITION_BETA)
+            heads["pure"] = self.pure_vertex.head
+            self.loss_weights = {term: get("pure", term + "_weight", weight)
+                                 for term, weight in self.PURE_LOSS_WEIGHTS.items()}
+            self.position_beta = get("pure", "position_beta", self.PURE_POSITION_BETA)
             self.matcher = VertexHungarianMatcher(
                 cost_class=self.loss_weights["loss_matched_ce"], cost_dice=self.loss_weights["loss_dice"],
-                cost_focal=self.loss_weights["loss_focal"], cost_position=get("learned", "cost_position_weight", 1.0),
-                position_scale=heads["learned"].position_scale.tolist()).to(self.device)
-            terms["learned"] = list(self.loss_weights)
-        if "fit" in methods:
+                cost_focal=self.loss_weights["loss_focal"], cost_position=get("pure", "cost_position_weight", 1.0),
+                position_scale=heads["pure"].position_scale.tolist()).to(self.device)
+            terms["pure"] = list(self.loss_weights)
+        if "hybrid" in methods:
             self.params["vertex_learn_weights"] = True
             self.setup_vertexing(self.params.track_checkpoint)
-            heads["fit"], terms["fit"] = self.vertex_head, ["loss_l1"]
+            heads["hybrid"], terms["hybrid"] = self.vertex_head, ["loss_l1"]
         self.train_state = {}
         for m, head in heads.items():
             parameters = [p for p in head.parameters() if p.requires_grad]
@@ -748,8 +748,8 @@ class DownstreamTrainer():
         """One epoch over the training set: each of active_methods' heads optimised, the backbone (and track head)
         frozen. Raises if a head never got a gradient."""
         self.model.eval()
-        if "learned" in self.active_methods:
-            self.learned_vertex.train()
+        if "pure" in self.active_methods:
+            self.pure_vertex.train()
         for batch in tqdm(self.train_data_loader, disable=not self.log_to_screen):
             for m, (loss, _, residual) in self._batch_losses(batch, self.active_methods,
                                                              cached=self.train_cached).items():
@@ -768,18 +768,18 @@ class DownstreamTrainer():
                 results["train_residual"].append(residual)
         for m in self.active_methods:
             if not self.down_results[m]["steps"]:
-                raise RuntimeError(f"vertex_method {m}: no usable gradient reached its trainable parameters this epoch "
+                raise RuntimeError(f"{m} vertex head: no usable gradient reached its trainable parameters this epoch "
                                    f"({self.down_results[m]['skipped']} steps with a non-finite gradient)")
 
     @torch.no_grad()
     def validate_end_to_end_one_epoch(self, pretrain=False):
-        """The validation set (its first learned_vertex_val_events events, default all); returns each of
-        active_methods' mean loss (of the final output: no aux terms; fit: over the batches with a fitted and a
+        """The validation set (its first pure_vertex_val_events events, default all); returns each of
+        active_methods' mean loss (of the final output: no aux terms; hybrid: over the batches with a fitted and a
         true PV)."""
         self.model.eval()
-        if "learned" in self.active_methods:
-            self.learned_vertex.eval()
-        max_events, n_events = getattr(self.params, "learned_vertex_val_events", None), 0
+        if "pure" in self.active_methods:
+            self.pure_vertex.eval()
+        max_events, n_events = getattr(self.params, "pure_vertex_val_events", None), 0
         for batch in tqdm(self.val_data_loader, disable=not self.log_to_screen):
             for m, (loss, terms, residual) in self._batch_losses(batch, self.active_methods, aux=False,
                                                                  cached=self.val_cached).items():
@@ -797,9 +797,9 @@ class DownstreamTrainer():
 
     @staticmethod
     def _has_loss(method, residual):
-        """Whether a batch's loss counts in the epoch means: fit's is a constant 0 when no event of the batch has
+        """Whether a batch's loss counts in the epoch means: hybrid's is a constant 0 when no event of the batch has
         both a fitted and a true PV."""
-        return method != "fit" or len(residual) > 0
+        return method != "hybrid" or len(residual) > 0
 
     @staticmethod
     def _mean(values):
@@ -807,13 +807,13 @@ class DownstreamTrainer():
         return float(np.mean(values)) if len(values) else float("nan")
 
     # ------------------------------------------------------------------------------------------
-    # VertexHead evaluation
+    # HybridVertexHead evaluation
     # ------------------------------------------------------------------------------------------
 
     def setup_vertexing(self, track_ckpt):
         """
-        Load the track head and build VertexHead (after launch()). From params: vertex_detector (detector file),
-        vertex_device, and any VertexHead argument as vertex_<argument> (e.g. vertex_Bz, vertex_learn_weights), each
+        Load the track head and build HybridVertexHead (after launch()). From params: vertex_detector (detector file),
+        vertex_device, and any HybridVertexHead argument as vertex_<argument> (e.g. vertex_Bz, vertex_learn_weights), each
         only where set.
         """
         n_feat = 1 if getattr(self, "cache_combined", False) else self.params.num_layers_backbone
@@ -828,24 +828,24 @@ class DownstreamTrainer():
         self.down_model.load_state_dict(self._load_checkpoint_state(track_ckpt, "model_state_dict")[1])
         self.down_model.eval()
 
-        # VertexHead arguments set in params as vertex_<argument>
-        names = VertexHead.setting_names()
+        # HybridVertexHead arguments set in params as vertex_<argument>
+        names = HybridVertexHead.setting_names()
         settings = {name: getattr(self.params, "vertex_" + name) for name in names
                     if getattr(self.params, "vertex_" + name, None) is not None}
-        # VertexHead's device (vertex_device, e.g. cuda or cpu; default: the trainer's)
+        # HybridVertexHead's device (vertex_device, e.g. cuda or cpu; default: the trainer's)
         self.vertex_device = torch.device(getattr(self.params, "vertex_device", None) or self.device)
         detector = getattr(self.params, "vertex_detector", None)
-        head = VertexHead.from_detector(detector, **settings) if detector else VertexHead(**settings)
+        head = HybridVertexHead.from_detector(detector, **settings) if detector else HybridVertexHead(**settings)
         self.vertex_head = head.to(self.vertex_device).eval()
         self.vertex_head.tracks.start_acts()       # boots while the first batches run
 
     def _vertex_head_chunk(self, records):
         """
-        VertexHead once over several loader batches, padded to a common size; returns each batch's
+        HybridVertexHead once over several loader batches, padded to a common size; returns each batch's
         (vertex_estimate, fit_is_valid, per event: usable, acts_failed, acts_refit_failed (0 without) track counts and
-        vertex_from_fallback). Each event keeps only the track slots VertexHead can fit, those at least
+        vertex_from_fallback). Each event keeps only the track slots HybridVertexHead can fit, those at least
         min_hits real hits are assigned to (vertexing.assign_hits), and the hits of the others stay unassigned: the
-        same result, without the track head's mostly empty max_gt_classes slots. VertexHead runs on vertex_device;
+        same result, without the track head's mostly empty max_gt_classes slots. HybridVertexHead runs on vertex_device;
         the results come back to the CPU.
         """
         events = []
@@ -875,20 +875,20 @@ class DownstreamTrainer():
                         counts.cpu().split(sizes)))
 
     def inference(self, checkpoint_path, max_events=None, pretrain=True, save_csv=False, csv_output_path=None,
-                  learned_checkpoint_path=None, vertex_checkpoint_path=None):
+                  pure_checkpoint_path=None, vertex_checkpoint_path=None):
         """
-        Sets up each of vertex_methods (fit: setup_vertexing; learned: LearnedVertexing with the checkpoint's
+        Sets up each of vertex_methods (hybrid: setup_vertexing; pure: PureVertexing with the checkpoint's
         settings and weights), then run_vertexing over at most max_events (None: all). Per method: the metrics
-        appended to the run log (after a "vertex_method: <method>" line, except fit) and, with save_csv, the
-        per-point CSV (fit: csv_output_path, default the run folder's data/; others: that name + _<method>, with
+        appended to the run log (after a "vertex_method: <method>" line, except hybrid) and, with save_csv, the
+        per-point CSV (hybrid: csv_output_path, default the run folder's data/; others: that name + _<method>, with
         the method's hit-to-vertex-slot assignment as pred_assignment and confidence). Unless no_output, the
-        metrics JSON (metrics/: inputs, the track settings (TrackBuilder.track_fit_config), metrics: fit's,
+        metrics JSON (metrics/: inputs, the track settings (TrackBuilder.track_fit_config), metrics: hybrid's,
         <method>_metrics: the others'). With params.residual_table (default on): residual_table printed and logged.
 
         Args:
-            checkpoint_path: track-head checkpoint (fit); learned_checkpoint_path: LearnedVertexHead checkpoint
-            (learned); vertex_checkpoint_path: trained VertexHead checkpoint (fit, then built with learn_weights;
-            None: the untrained fit); pretrain: backbone features (True) or raw points; save_csv, csv_output_path: the CSVs.
+            checkpoint_path: track-head checkpoint (hybrid); pure_checkpoint_path: PureVertexHead checkpoint
+            (pure); vertex_checkpoint_path: trained HybridVertexHead checkpoint (hybrid, then built with learn_weights;
+            None: the untrained hybrid); pretrain: backbone features (True) or raw points; save_csv, csv_output_path: the CSVs.
 
         Returns:
             run_vertexing's dict.
@@ -896,27 +896,27 @@ class DownstreamTrainer():
         if self.world_size > 1:
             raise RuntimeError("the vertex eval runs in one process (its metrics are not gathered across ranks): "
                                "run it with python, not torchrun")
-        if "fit" in self.vertex_methods:
+        if "hybrid" in self.vertex_methods:
             if vertex_checkpoint_path:
                 self.params["vertex_learn_weights"] = True
             self.setup_vertexing(checkpoint_path)
             if vertex_checkpoint_path:
-                self.load_checkpoint(vertex_checkpoint_path, inference=True, method="fit")
-        if "learned" in self.vertex_methods:
-            saved = torch.load(learned_checkpoint_path, map_location="cpu", weights_only=False).get("params") or {}
+                self.load_checkpoint(vertex_checkpoint_path, inference=True, method="hybrid")
+        if "pure" in self.vertex_methods:
+            saved = torch.load(pure_checkpoint_path, map_location="cpu", weights_only=False).get("params") or {}
             # a head trained on a layer-combined cache: its layer weights
-            self.learned_combine_weights = saved.get("learned_vertex_combine_weights")
-            self.setup_learned_vertexing(saved)
-            self.load_checkpoint(learned_checkpoint_path, inference=True, method="learned")
-            self.learned_vertex.eval()
+            self.pure_combine_weights = saved.get("pure_vertex_combine_weights")
+            self.setup_pure_vertexing(saved)
+            self.load_checkpoint(pure_checkpoint_path, inference=True, method="pure")
+            self.pure_vertex.eval()
         results = self.run_vertexing(pretrain=pretrain, max_events=max_events, save_csv=save_csv)
         if self.world_rank == 0:
             for method, result in results.items():
-                if method != "fit":
+                if method != "hybrid":
                     self.log_infile(f"vertex_method: {method}")
                 write_metrics_log(result["metrics"], self.logfile)
                 if save_csv:
-                    result["csv_output_path"] = (lambda path: path if method == "fit" else f"_{method}".join(
+                    result["csv_output_path"] = (lambda path: path if method == "hybrid" else f"_{method}".join(
                         os.path.splitext(path)))(csv_output_path or self.csv_path)
                     write_per_point_csv(result["per_point"], result["csv_output_path"])
                     print(f"[vertex] wrote {result['csv_output_path']} ({len(result['per_point']['batch_idx'])} points)")
@@ -927,15 +927,15 @@ class DownstreamTrainer():
             if not getattr(self.params, "no_output", False):
                 record = {"config": self.config, "yaml_config": os.path.abspath(self.params._yaml_filename),
                           "pretrained_ckpt": self.params.pretrained_ckpt}
-                if "fit" in results:
+                if "hybrid" in results:
                     record.update(track_ckpt=os.path.abspath(checkpoint_path),
                                   track_fit_config=self.vertex_head.tracks.track_fit_config())
                     if vertex_checkpoint_path:
                         record.update(vertex_ckpt=os.path.abspath(vertex_checkpoint_path))
-                if "learned" in results:
-                    record.update(learned_ckpt=os.path.abspath(learned_checkpoint_path))
+                if "pure" in results:
+                    record.update(pure_ckpt=os.path.abspath(pure_checkpoint_path))
                 record["max_eval_events"] = max_events
-                record.update({"metrics" if method == "fit" else f"{method}_metrics": result["metrics"]
+                record.update({"metrics" if method == "hybrid" else f"{method}_metrics": result["metrics"]
                                for method, result in results.items()})
                 with open(self.metrics_path, "w") as f:
                     json.dump(record, f, indent=2)
@@ -953,22 +953,22 @@ class DownstreamTrainer():
             return feature
         return torch.einsum("lbnd,l->bnd", feature, feature.new_tensor(weights)).unsqueeze(0)
 
-    def _learned_features(self, pre_embed):
-        """The learned head's features: torch.stack(pre_embed), collapsed with learned_combine_weights when set
+    def _pure_features(self, pre_embed):
+        """The pure head's features: torch.stack(pre_embed), collapsed with pure_combine_weights when set
         (never the track head's eval_combine_weights)."""
-        weights = getattr(self, "learned_combine_weights", None)
+        weights = getattr(self, "pure_combine_weights", None)
         return torch.stack(pre_embed) if weights is None else self._layer_features(pre_embed, weights)
 
     @torch.no_grad()
     def run_vertexing(self, pretrain=True, max_events=None, save_csv=False):
         """
-        The backbone once per loader batch, then each of vertex_methods on it. fit: the track head per loader batch,
-        VertexHead per vertex_chunk_events events (default 32). learned: LearnedVertexing per loader batch. The truth
-        labels, VertexHead, the metrics inputs and the CSV rows run in a background thread on CPU copies while the
+        The backbone once per loader batch, then each of vertex_methods on it. hybrid: the track head per loader batch,
+        HybridVertexHead per vertex_chunk_events events (default 32). pure: PureVertexing per loader batch. The truth
+        labels, HybridVertexHead, the metrics inputs and the CSV rows run in a background thread on CPU copies while the
         GPU runs the next batches.
 
         Args:
-            pretrain: backbone features (True) or raw points (fit only); max_events: limit (None: all); save_csv:
+            pretrain: backbone features (True) or raw points (hybrid only); max_events: limit (None: all); save_csv:
             build the CSVs.
 
         Returns:
@@ -977,9 +977,9 @@ class DownstreamTrainer():
             per stage, shared; truth, vertex_head and csv overlap the others), per_point (with save_csv).
         """
         methods = self.vertex_methods
-        fit, learned = "fit" in methods, "learned" in methods
-        if learned and not pretrain:
-            raise ValueError("vertex_method learned needs the backbone features (pretrain=True)")
+        hybrid, pure = "hybrid" in methods, "pure" in methods
+        if pure and not pretrain:
+            raise ValueError("vertex_method pure needs the backbone features (pretrain=True)")
         self.model.eval()
         # full fp32: no TF32 in matrix multiplies or convolutions
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
@@ -988,29 +988,29 @@ class DownstreamTrainer():
         chunk_events = int(getattr(self.params, "vertex_chunk_events", None) or 32)
         pending = []        # loader batches waiting for the background thread (CPU copies)
         job = [None]
-        # VertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
-        stream = torch.cuda.Stream(self.vertex_device) if fit and self.vertex_device.type == "cuda" else None
+        # HybridVertexHead on the GPU queues on its own stream, so the main loop's syncs and copies do not wait for it
+        stream = torch.cuda.Stream(self.vertex_device) if hybrid and self.vertex_device.type == "cuda" else None
 
         @torch.no_grad()        # grad mode is per thread: this one runs in the pool
         def finish(records):
-            """Truth labels and VertexHead over these batches, then each method's metrics inputs and CSV rows (the
+            """Truth labels and HybridVertexHead over these batches, then each method's metrics inputs and CSV rows (the
             background thread)."""
             t0 = time.perf_counter()
             for r in records:
                 r["truth"] = self._truth_labels(r["reg"], r["label"], r["mask"])
             t1 = time.perf_counter()
-            if fit:
+            if hybrid:
                 with torch.cuda.stream(stream) if stream is not None else nullcontext():
                     fitted = self._vertex_head_chunk(records)
             t2 = time.perf_counter()
             for i, r in enumerate(records):
                 # per method: the PV, its validity, the class and mask probabilities of the CSV's assignment
                 found = {}
-                if fit:
-                    found["fit"] = (*fitted[i][:2], r["class_probs"], r["mask_probs"])
+                if hybrid:
+                    found["hybrid"] = (*fitted[i][:2], r["class_probs"], r["mask_probs"])
                     track_counts.append(fitted[i][2])
-                if learned:
-                    found["learned"] = r["learned"]
+                if pure:
+                    found["pure"] = r["pure"]
                 for m, (vertex, valid, class_probs, mask_probs) in found.items():
                     if save_csv:
                         per_point[m].append(per_point_columns(
@@ -1022,7 +1022,7 @@ class DownstreamTrainer():
                 tgt.append(r["truth"]["vertex_target"])
                 truth_valid.append(r["truth"]["vertex_valid"])
             timing["truth"] += t1 - t0
-            if fit:
+            if hybrid:
                 timing["vertex_head"] += t2 - t1
             timing["csv"] += time.perf_counter() - t2
 
@@ -1036,11 +1036,11 @@ class DownstreamTrainer():
                 job[0] = pool.submit(finish, list(pending))
                 pending.clear()
 
-        stages = (("data", "backbone") + ("track_head",) * fit + ("learned_head",) * learned
-                  + ("to_cpu", "waiting", "truth") + ("vertex_head",) * fit + ("csv",))
+        stages = (("data", "backbone") + ("track_head",) * hybrid + ("pure_head",) * pure
+                  + ("to_cpu", "waiting", "truth") + ("vertex_head",) * hybrid + ("csv",))
         timing = dict.fromkeys(stages, 0.0)
         vertexing.ACTS_TIMING.update(start_s=0.0, propagate_s=0.0, states=0, restarts=0)
-        # the main loop's own stream only (VertexHead runs on another)
+        # the main loop's own stream only (HybridVertexHead runs on another)
         sync = torch.cuda.current_stream().synchronize if torch.cuda.is_available() else (lambda: None)
         clock = [time.perf_counter()]
         start, n_seen = clock[0], 0
@@ -1069,20 +1069,20 @@ class DownstreamTrainer():
                 if pretrain:
                     _, pre_embed, _ = self.model(inputs, return_z=True)
                     lap("backbone")
-                if fit:
+                if hybrid:
                     out = (self.down_model(inputs, self._layer_features(pre_embed), pretrain=True,
                                            padding_mask=input_mask) if pretrain
                            else self.down_model(inputs, feature=None))
                     lap("track_head")
-                if learned:
-                    outputs, raw = self.learned_vertex(inputs, self._learned_features(pre_embed), input_mask)
-                    lap("learned_head")
+                if pure:
+                    outputs, raw = self.pure_vertex(inputs, self._pure_features(pre_embed), input_mask)
+                    lap("pure_head")
 
                 record = {"first_event": n_seen, "grouped": grouped, "label": label, "reg": reg, "mask": mask}
-                if fit:
+                if hybrid:
                     record.update(class_probs=out["class_probs"].cpu(), mask_probs=out["mask_probs"].cpu())
-                if learned:
-                    record["learned"] = (outputs["vertex_estimate"].cpu(), outputs["fit_is_valid"].cpu(),
+                if pure:
+                    record["pure"] = (outputs["vertex_estimate"].cpu(), outputs["fit_is_valid"].cpu(),
                                          *(raw[k].cpu() if save_csv else None
                                            for k in ("vertex_class_probs", "vertex_mask_probs")))
                 pending.append(record)
@@ -1099,7 +1099,7 @@ class DownstreamTrainer():
 
         tgt, truth_valid = torch.cat(tgt), torch.cat(truth_valid)
         n_events = max(len(truth_valid), 1)
-        if fit:
+        if hybrid:
             timing["acts_start"] = vertexing.ACTS_TIMING["start_s"]
             timing["acts_propagate"] = vertexing.ACTS_TIMING["propagate_s"]
         output = {}
@@ -1110,7 +1110,7 @@ class DownstreamTrainer():
             # fit_valid_rate: valid PVs among the events with a truth PV (the accuracies are over those)
             metrics.update(n_events=len(ok), truth_valid_rate=truth_valid.float().mean().item(),
                            fit_valid_rate=valid[truth_valid].float().mean().item())
-            if m == "fit":
+            if m == "hybrid":
                 counts = torch.cat(track_counts).double()
                 usable, acts_failed, refit_failed, _ = counts.mean(dim=0).tolist()
                 metrics.update(usable_tracks_per_event=usable)
@@ -1125,7 +1125,7 @@ class DownstreamTrainer():
                                    acts_worker_restarts=vertexing.ACTS_TIMING["restarts"])
             metrics.update({f"time_{k}_ms_per_event": v / n_events * 1e3 for k, v in timing.items()})
             if self.log_to_screen:
-                print(("[vertex] " if m == "fit" else f"[vertex:{m}] ")
+                print(("[vertex] " if m == "hybrid" else f"[vertex:{m}] ")
                       + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                                   for k, v in metrics.items() if not k.startswith("time_")))
             output[m] = {"metrics": metrics, "vertex_estimate": vertex.cpu(), "vertex_target": tgt.cpu(),
@@ -1138,7 +1138,7 @@ class DownstreamTrainer():
             for k in stages:
                 print(f"[vertex]   {k:14s} {timing[k]:8.2f} s  {timing[k] / n_events * 1e3:8.2f} ms/event  "
                       f"{timing[k] / max(wall, 1e-12):6.1%}")
-            if fit and (timing["acts_start"] or timing["acts_propagate"]):
+            if hybrid and (timing["acts_start"] or timing["acts_propagate"]):
                 print(f"[vertex]     of which ACTS: worker start {timing['acts_start']:.2f} s, propagation "
                       f"{timing['acts_propagate']:.2f} s ({vertexing.ACTS_TIMING['states']} track states)")
         return output

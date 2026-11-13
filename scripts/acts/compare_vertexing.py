@@ -6,26 +6,26 @@ side against the truth PV:
     python scripts/acts/compare_vertexing.py --csv <per-point csv> --detector <detector yaml> \
         [--tracks finder|truth|both] [--max_events 0] [--out <dir>] [--range 1.0] [--sv_range 2.0]
 
-- VertexHead: VertexHead with the detector file's settings on the track finder's tracks (pred_assignment) or truth
+- HybridVertexHead: HybridVertexHead with the detector file's settings on the track finder's tracks (pred_assignment) or truth
   tracks (seg_target), every track with class probability 1.
 - ACTS AMVF: ACTS's own vertex finder as shipped (acts_vertexing.py: AMVF, Gaussian seeder; its first vertex) on the
   same tracks with the same errors (x track_error_scale); needs the detector file's ACTS image.
-- VertexHead, AMVF events: VertexHead on the events where AMVF found a vertex.
+- HybridVertexHead, AMVF events: HybridVertexHead on the events where AMVF found a vertex.
 
 Writes to --out (default: compare/ beside the CSV's folder), named after the CSV (<name>_per_point_data.csv),
 <name>_reco_vertices.csv (one row per event and track set: the truth PV, the eval's own PV and each reconstruction's
 PV, cm), <name>_residuals.png (PV residual reco - true in x, y, z and 3D, one row per track set; values beyond --range
-go in the end bins) and <name>_secondary.png (SVs per event: the true ones, the findable true ones, VertexHead's and
-those of them matched to a true SV, the rest being fakes; the SV residual of all VertexHead's SVs and of the matched
+go in the end bins) and <name>_secondary.png (SVs per event: the true ones, the findable true ones, HybridVertexHead's and
+those of them matched to a true SV, the rest being fakes; the SV residual of all HybridVertexHead's SVs and of the matched
 ones, within --sv_range), and prints the PV error table and an SV summary.
 
 SV definitions (truth from the CSV; the same for both track sets):
 - a track's truth origin: the production vertex (vtx_x/y/z) of its majority truth particle (seg_target);
 - a true SV: a truth origin more than --origin_tolerance from the true PV shared by >= 2 tracks of the set (so it
   counts only tracks the set has: with finder tracks, reconstructed ones); its radius: from the beam line;
-- candidate track: VertexHead's displaced_mask (its SV candidate cuts);
-- findable: a true SV with >= 2 candidate tracks (the like-for-like truth for VertexHead's SVs);
-- found: a VertexHead SV whose tracks (weight >= 0.5) include >= 2 of the true SV's tracks; a VertexHead SV is
+- candidate track: HybridVertexHead's displaced_mask (its SV candidate cuts);
+- findable: a true SV with >= 2 candidate tracks (the like-for-like truth for HybridVertexHead's SVs);
+- found: a HybridVertexHead SV whose tracks (weight >= 0.5) include >= 2 of the true SV's tracks; a HybridVertexHead SV is
   matched when its tracks include >= 2 tracks of one true SV (the one with most of them);
 - SV residual: matched SVs against their true SV's position; all SVs against their tracks' median truth origin (for
   an unmatched SV that is mostly the PV, so its residual says little).
@@ -83,7 +83,7 @@ def read_columns(path, max_events):
 
 def load_events(col, tracks, origin_tolerance):
     """Per event with at least one track: its batch_idx, a function giving (class_probs, mask_probs, points,
-    padding_mask) as VertexHead takes them (built on demand), the true PV, the eval's PV (cm), per track slot its
+    padding_mask) as HybridVertexHead takes them (built on demand), the true PV, the eval's PV (cm), per track slot its
     truth origin (S, 3) cm and its true SV (S,) (index, -1: none)."""
     label = np.where(np.isnan(col[tracks]), -999999, col[tracks]).astype(np.int64)
     truth_id = np.where(np.isnan(col["seg_target"]), 0, col["seg_target"]).astype(np.int64)
@@ -128,7 +128,7 @@ def load_events(col, tracks, origin_tolerance):
 
 
 def run_chunk(head, inputs):
-    """VertexHead once over several events (padded to common hit and track counts, as the eval runs it), split
+    """HybridVertexHead once over several events (padded to common hit and track counts, as the eval runs it), split
     back into one output per event with its own track count."""
     pad = torch.nn.functional.pad
     n_hits, n_tracks = max(i[1].shape[1] for i in inputs), max(i[0].shape[1] for i in inputs)
@@ -141,7 +141,7 @@ def run_chunk(head, inputs):
 
 
 def secondary_vertices(outs, events):
-    """VertexHead's SVs against the true ones: per event the number found, true, findable (>= 2 candidate tracks) and
+    """HybridVertexHead's SVs against the true ones: per event the number found, true, findable (>= 2 candidate tracks) and
     matched (E,); the residuals (N, 3) cm of all SVs (against their tracks' median truth origin) and of the matched
     ones (against their true SV); the true SVs found and the findable ones found."""
     n_found, n_true, n_findable, n_matched, residual, matched_residual, found, found_findable = \
@@ -176,7 +176,7 @@ def secondary_vertices(outs, events):
 
 
 def acts_vertices(head, outs):
-    """ACTS's own vertex finder (acts_vertexing.py) on each event's VertexHead input tracks (track_input_mask), errors
+    """ACTS's own vertex finder (acts_vertexing.py) on each event's HybridVertexHead input tracks (track_input_mask), errors
     scaled by track_error_scale: the first vertex found per event (E, 3) cm (NaN without one) and the vertices per
     event."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -218,12 +218,12 @@ def table_row(label, residual):
 
 STYLE = {"ACTS AMVF": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
          "truth": dict(histtype="stepfilled", alpha=0.35, color="tab:gray"),
-         "VertexHead": dict(histtype="step", lw=1.6, color="tab:blue"),
-         "VertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange"),
-         "VertexHead, matched": dict(histtype="step", lw=1.6, color="tab:green")}
+         "HybridVertexHead": dict(histtype="step", lw=1.6, color="tab:blue"),
+         "HybridVertexHead, AMVF events": dict(histtype="step", lw=1.2, ls="--", color="tab:orange"),
+         "HybridVertexHead, matched": dict(histtype="step", lw=1.6, color="tab:green")}
 # the SV figure's legend labels (their styles)
-SV_ALL, SV_MATCHED = "VertexHead SVs, all (matched + fakes)", "VertexHead SVs, matched to a true SV"
-STYLE.update({SV_ALL: STYLE["VertexHead"], SV_MATCHED: STYLE["VertexHead, matched"]})
+SV_ALL, SV_MATCHED = "HybridVertexHead SVs, all (matched + fakes)", "HybridVertexHead SVs, matched to a true SV"
+STYLE.update({SV_ALL: STYLE["HybridVertexHead"], SV_MATCHED: STYLE["HybridVertexHead, matched"]})
 
 
 def residual_panels(row, tracks, runs, limit, what, unit):
@@ -246,7 +246,7 @@ def residual_panels(row, tracks, runs, limit, what, unit):
 
 
 def sv_counts(ax, tracks, n_found, n_true, n_findable, n_matched):
-    """Histogram of SVs per event: the true ones, the findable true ones (>= 2 candidate tracks), VertexHead's and
+    """Histogram of SVs per event: the true ones, the findable true ones (>= 2 candidate tracks), HybridVertexHead's and
     those matched to a true SV."""
     max_sv = 5
     edges = np.arange(-0.5, max_sv + 1.5, 1)
@@ -286,7 +286,7 @@ def main():
     parser.add_argument("--range", type=float, default=1.0, help="plotted PV residual range, cm (3D: 1.5x)")
     parser.add_argument("--sv_range", type=float, default=2.0, help="plotted SV residual range, cm (3D: 1.5x)")
     parser.add_argument("--origin_tolerance", type=float, default=0.1, help="cm: a displaced truth origin (true SV)")
-    parser.add_argument("--chunk_events", type=int, default=32, help="events per VertexHead call (as the eval)")
+    parser.add_argument("--chunk_events", type=int, default=32, help="events per HybridVertexHead call (as the eval)")
     args = parser.parse_args()
     out_dir = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.csv))), "compare")
     os.makedirs(out_dir, exist_ok=True)
@@ -294,9 +294,9 @@ def main():
     reco_path, plot_path, sv_path = (os.path.join(out_dir, f"{name}_{k}")
                                      for k in ("reco_vertices.csv", "residuals.png", "secondary.png"))
 
-    head = vh.VertexHead.from_detector(args.detector).eval()
+    head = vh.HybridVertexHead.from_detector(args.detector).eval()
     head.tracks.start_acts()       # boots while the CSV loads
-    timing = dict.fromkeys(("reading the CSV", "VertexHead", "ACTS AMVF"), 0.0)
+    timing = dict.fromkeys(("reading the CSV", "HybridVertexHead", "ACTS AMVF"), 0.0)
     t0 = time.perf_counter()
     col = read_columns(args.csv, args.max_events)
     timing["reading the CSV"] += time.perf_counter() - t0
@@ -313,15 +313,15 @@ def main():
         with torch.no_grad():
             for k in range(0, len(events), args.chunk_events):
                 outs += run_chunk(head, [e[1]() for e in events[k:k + args.chunk_events]])
-        timing["VertexHead"] += time.perf_counter() - t0
+        timing["HybridVertexHead"] += time.perf_counter() - t0
         ours = np.array([o["vertex_estimate"][0].double().numpy() for o in outs]).reshape(-1, 3)
-        runs = {"VertexHead": ours}
+        runs = {"HybridVertexHead": ours}
         acts, n_found = np.full_like(ours, np.nan), np.zeros(len(outs), dtype=int)
         if head.tracks.use_acts:
             t0 = time.perf_counter()
             acts, n_found = acts_vertices(head, outs)
             timing["ACTS AMVF"] += time.perf_counter() - t0
-            runs.update({"ACTS AMVF": acts, "VertexHead, AMVF events": np.where(np.isfinite(acts), ours, np.nan)})
+            runs.update({"ACTS AMVF": acts, "HybridVertexHead, AMVF events": np.where(np.isfinite(acts), ours, np.nan)})
         sv[tracks] = secondary_vertices(outs, events)
         panels[tracks] = {k: v - truth for k, v in runs.items()}
         table += [table_row(f"{tracks:7s} {name:24s}", residual) for name, residual in panels[tracks].items()]
@@ -351,7 +351,7 @@ def main():
     print()
     for tracks, (n, t, f, m, r, mr, found, found_findable) in sv.items():
         median = lambda v: np.median(np.linalg.norm(v, axis=1)) if len(v) else float("nan")  # noqa: E731
-        print(f"{tracks:7s} SVs: VertexHead {n.sum()}, {m.sum()} matched to a true SV; true {t.sum()}, with >= 2 "
+        print(f"{tracks:7s} SVs: HybridVertexHead {n.sum()}, {m.sum()} matched to a true SV; true {t.sum()}, with >= 2 "
               f"candidate tracks {f.sum()}; found {found} of all ({found / max(t.sum(), 1):.1%}), {found_findable} of "
               f"those with >= 2 candidate tracks ({found_findable / max(f.sum(), 1):.1%}); residual median: matched "
               f"SVs to their true SV {median(mr):.3f} cm, all SVs to their tracks' truth origin {median(r):.3f} cm")

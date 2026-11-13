@@ -1,5 +1,5 @@
 """
-secondaryvertex.py: SecondaryVertices, VertexHead's secondary vertices: sPHENIX's SecondaryVertexFinder pair
+secondaryvertex.py: SecondaryVertices, HybridVertexHead's secondary vertices: sPHENIX's SecondaryVertexFinder pair
 selection (circle intersections of displaced tracks), each seed fitted with VertexFit's vertex fit.
 """
 import math
@@ -13,7 +13,7 @@ from .vertexfit import _events
 
 class SecondaryVertices(nn.Module):
     """
-    VertexHead's secondary-vertex search and outputs, on the vertex fit vertex_fit (VertexFit). Defaults: sPHENIX's
+    HybridVertexHead's secondary-vertex search and outputs, on the vertex fit vertex_fit (VertexFit). Defaults: sPHENIX's
     SecondaryVertexFinder; cm.
 
     Args:

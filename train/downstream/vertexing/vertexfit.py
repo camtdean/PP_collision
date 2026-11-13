@@ -31,7 +31,7 @@ def _project(A, B, G):
 
 class VertexFit(nn.Module):
     """
-    The vertex fit VertexHead's primary and secondary searches share. Defaults: ACTS's
+    The vertex fit HybridVertexHead's primary and secondary searches share. Defaults: ACTS's
     AdaptiveMultiVertexFinderAlgorithm; cm.
 
     Args:

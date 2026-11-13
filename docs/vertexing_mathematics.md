@@ -1,4 +1,4 @@
-# VertexHead: the mathematics
+# HybridVertexHead: the mathematics
 
 How [`train/downstream/vertexing`](../train/downstream/vertexing) turns the track finder's output into primary and
 secondary vertices. Each section says what a step does, gives its equations, notes where it differs from ACTS, and
@@ -24,11 +24,11 @@ vertices (primaryvertex.py, secondaryvertex.py on vertexfit.py; helix geometry i
    │  §12    secondary vertices: sPHENIX-style pair seeds, same vertex fit
    │  §13    joint PV + SV refit
    ▼
-vertex outputs (vertexhead.py: VertexHead.forward)
+vertex outputs (hybridvertexhead.py: HybridVertexHead.forward)
 ```
 
-`VertexHead` ([vertexhead.py:VertexHead](../train/downstream/vertexing/vertexhead.py#L40)) is `TrackBuilder` followed by
-the vertex finding (`PrimaryVertices`, `SecondaryVertices` on `VertexFit`); [`from_detector`](../train/downstream/vertexing/vertexhead.py#L64) reads the settings from a detector file
+`HybridVertexHead` ([hybridvertexhead.py:HybridVertexHead](../train/downstream/vertexing/hybridvertexhead.py#L40)) is `TrackBuilder` followed by
+the vertex finding (`PrimaryVertices`, `SecondaryVertices` on `VertexFit`); [`from_detector`](../train/downstream/vertexing/hybridvertexhead.py#L64) reads the settings from a detector file
 (e.g. [`scripts/acts/detectors/sphenix/sphenix.yaml`](../scripts/acts/detectors/sphenix/sphenix.yaml)).
 
 ## 1. Conventions and units
@@ -488,7 +488,7 @@ beam-spot constraint, as in ACTS's shipped AMVF: the prior is the seed with 1 cm
 **Sources** — Code: [primaryvertex.py:_density_seed](../train/downstream/vertexing/primaryvertex.py#L15),
 [primaryvertex.py:PrimaryVertices._links](../train/downstream/vertexing/primaryvertex.py#L125),
 [primaryvertex.py:PrimaryVertices._amvf](../train/downstream/vertexing/primaryvertex.py#L137),
-[primaryvertex.py:PrimaryVertices.forward](../train/downstream/vertexing/primaryvertex.py#L103) (fallback), [vertexhead.py:VertexHead.forward](../train/downstream/vertexing/vertexhead.py#L110) (PV).
+[primaryvertex.py:PrimaryVertices.forward](../train/downstream/vertexing/primaryvertex.py#L103) (fallback), [hybridvertexhead.py:HybridVertexHead.forward](../train/downstream/vertexing/hybridvertexhead.py#L110) (PV).
 ACTS: [AdaptiveMultiVertexFinder.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/AdaptiveMultiVertexFinder.cpp)
 (`doSeeding`, `canRecoverFromNoCompatibleTracks`, `keepNewVertex`, `isMergedVertex`),
 [AdaptiveMultiVertexFinder.hpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/include/Acts/Vertexing/AdaptiveMultiVertexFinder.hpp),
@@ -590,14 +590,14 @@ selection is unchanged. Off with `refit_pv=False`.
 
 **Differs from ACTS / sPHENIX:** neither refits the PV with the SVs; this step is ours.
 
-**Sources** — Code: [vertexhead.py:VertexHead.forward](../train/downstream/vertexing/vertexhead.py#L176).
+**Sources** — Code: [hybridvertexhead.py:HybridVertexHead.forward](../train/downstream/vertexing/hybridvertexhead.py#L176).
 ACTS: [AdaptiveMultiVertexFitter.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Core/src/Vertexing/AdaptiveMultiVertexFitter.cpp)
 (the multi-vertex fit reused). Maths: [1].
 
 ## 14. ACTS reference run
 
 The check against ACTS runs ACTS's own `AdaptiveMultiVertexFinderAlgorithm` (Gaussian seeder, as shipped) on the same
-perigee tracks (mm) and compares its first vertex with VertexHead's PV; `hard_cuts=True` is the like-for-like setting.
+perigee tracks (mm) and compares its first vertex with HybridVertexHead's PV; `hard_cuts=True` is the like-for-like setting.
 
 **Sources** — Code: [acts_vertexing.py:main](../scripts/acts/acts_vertexing.py#L22),
 [compare_vertexing.py:main](../scripts/acts/compare_vertexing.py#L277).

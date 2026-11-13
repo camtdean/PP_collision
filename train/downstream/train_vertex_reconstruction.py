@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Vertex reconstruction training, laid out like train_track_finding.py, on the frozen backbone's features:
-LearnedVertexHead (--vertex_method learned) and VertexHead's learnable parts after the frozen track head (fit), one
-or both in a run (the backbone runs once). Evaluate with eval_vertex_reconstruction.py (--learned_checkpoint,
---vertex_checkpoint). Artifacts per method: {config}_nerf_vertex_{method}_d{N}_{run}_seed{seed}.
+PureVertexHead (--vertex_method pure) and HybridVertexHead's learnable parts after the frozen track head (hybrid), one
+or both in a run (the backbone runs once). Evaluate with eval_vertex_reconstruction.py (--pure_checkpoint,
+--vertex_checkpoint). Artifacts per method: {config}_nerf_vertex_{method}_d{N}_{run}_seed{seed}, method pure or hybrid.
 """
 import os
 import sys
@@ -62,17 +62,17 @@ def main():
     parser.set_defaults(usepretrain=True)
     parser.add_argument("--train_batch_size", default=32, type=int, help="train batch size")
     parser.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility")
-    parser.add_argument("--vertex_method", default=["learned"], nargs="+", choices=["fit", "learned"],
-                        help="the vertexing methods trained, each with its own log and checkpoints: learned "
-                             "(LearnedVertexHead), fit (VertexHead's track weights, gates and fallback scale; needs "
+    parser.add_argument("--vertex_method", default=["pure"], nargs="+", choices=["hybrid", "pure"],
+                        help="the vertexing methods trained, each with its own log and checkpoints: pure "
+                             "(PureVertexHead), hybrid (HybridVertexHead's track weights, gates and fallback scale; needs "
                              "the track head)")
     parser.add_argument("--track_checkpoint", default=None, type=str,
-                        help="the frozen track head's checkpoint, for fit (default: --run_config's checkpoint, else "
+                        help="the frozen track head's checkpoint, for hybrid (default: --run_config's checkpoint, else "
                              "the one its checkpoint_dir, track_config, eventnumber, run_num and seed name)")
-    parser.add_argument("--fit_max_lr", default=None, type=float, help="fit's peak learning rate (default: --max_lr)")
-    parser.add_argument("--fit_min_lr", default=None, type=float, help="fit's lowest learning rate (default: --min_lr)")
+    parser.add_argument("--hybrid_max_lr", default=None, type=float, help="hybrid's peak learning rate (default: --max_lr)")
+    parser.add_argument("--hybrid_min_lr", default=None, type=float, help="hybrid's lowest learning rate (default: --min_lr)")
     parser.add_argument("--vertex_device", default=None, type=str,
-                        help="VertexHead's device, e.g. cpu (default: the backbone's)")
+                        help="HybridVertexHead's device, e.g. cpu (default: the backbone's)")
     parser.add_argument("--bz", default=None, type=float,
                         help="solenoid field, Tesla (default: the model YAML's vertex_Bz, else the detector file's)")
     parser.add_argument("--truth_radius", default=1.0, type=float,
@@ -91,12 +91,12 @@ def main():
     parser.add_argument("--min_sigma_z", default=None, type=float,
                         help="cm: floor of the predicted z position uncertainty (default: none)")
     parser.add_argument("--point_embed_scale", default=None, type=float,
-                        help="learned: multiplies the coordinate embedding added to the hit features (default 0: not used)")
+                        help="pure: multiplies the coordinate embedding added to the hit features (default 0: not used)")
     parser.add_argument("--position_beta", default=None, type=float,
-                        help="learned: power of the predicted variance weighting the position likelihood "
+                        help="pure: power of the predicted variance weighting the position likelihood "
                              "(0: plain likelihood; default 0.5)")
     parser.add_argument("--position_l1_weight", default=None, type=float,
-                        help="learned: weight of the L1 position loss, cm (default 1)")
+                        help="pure: weight of the L1 position loss, cm (default 1)")
     parser.add_argument("--resume", default=None, nargs="?", const="", type=str,
                         help="continue with the same options, each method from its <name>_last_checkpoint.pth in "
                              "--checkpoint_dir (written every epoch), or from the checkpoint given (one method "
@@ -139,8 +139,8 @@ def main():
 
     if not args.root_dir:
         parser.error("--root_dir is required (on the command line or in --run_config)")
-    if "fit" in args.vertex_method and not (args.track_checkpoint and os.path.isfile(args.track_checkpoint)):
-        parser.error(f"--vertex_method fit needs the track head's checkpoint (--track_checkpoint): {args.track_checkpoint}")
+    if "hybrid" in args.vertex_method and not (args.track_checkpoint and os.path.isfile(args.track_checkpoint)):
+        parser.error(f"--vertex_method hybrid needs the track head's checkpoint (--track_checkpoint): {args.track_checkpoint}")
     if args.resume and len(args.vertex_method) > 1:
         parser.error("--resume <checkpoint> is one method's; with several methods give --resume alone")
 
@@ -169,18 +169,18 @@ def main():
     params.return_reg_test = True        # loaders then yield reg (truth) as a 4th element
     params.return_dict = False
     params.vertex_method, params.truth_radius = args.vertex_method, args.truth_radius
-    for key, value in (("vertex_detector", args.detector), ("learned_vertex_val_events", args.val_events),
+    for key, value in (("vertex_detector", args.detector), ("pure_vertex_val_events", args.val_events),
                        ("track_checkpoint", args.track_checkpoint), ("vertex_device", args.vertex_device),
-                       ("vertex_Bz", args.bz), ("vertex_train_max_lr", args.fit_max_lr),
-                       ("vertex_train_min_lr", args.fit_min_lr),
+                       ("vertex_Bz", args.bz), ("vertex_train_max_lr", args.hybrid_max_lr),
+                       ("vertex_train_min_lr", args.hybrid_min_lr),
                        ("max_epochs", args.max_epochs), ("max_lr", args.max_lr), ("min_lr", args.min_lr),
                        ("feature_cache", args.feature_cache), ("feature_cache_val", args.feature_cache_val),
-                       ("learned_vertex_min_sigma_xy", args.min_sigma_xy),
-                       ("learned_vertex_min_sigma_z", args.min_sigma_z),
-                       ("learned_vertex_point_embed_scale", args.point_embed_scale),
-                       ("learned_vertex_position_beta", args.position_beta),
-                       ("learned_vertex_loss_position_l1_weight", args.position_l1_weight),
-                       ("learned_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
+                       ("pure_vertex_min_sigma_xy", args.min_sigma_xy),
+                       ("pure_vertex_min_sigma_z", args.min_sigma_z),
+                       ("pure_vertex_point_embed_scale", args.point_embed_scale),
+                       ("pure_vertex_position_beta", args.position_beta),
+                       ("pure_vertex_loss_position_l1_weight", args.position_l1_weight),
+                       ("pure_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):
         if value is not None:
             params[key] = value
 

@@ -83,7 +83,7 @@ def get_weakdecaylabel(mid):
 
 def get_vertex_label(reg, valid_tracks, particle_id, tolerance_cm=1e-3, min_particles=2):
     """
-    Ground-truth vertices for VertexHead, per event: every primary vertex (an origin shared by >= min_particles
+    Ground-truth vertices for HybridVertexHead, per event: every primary vertex (an origin shared by >= min_particles
     primary particles, truth ID >= 0; pileup gives several), ranked by particle count; the PV is the first (without
     a primary vertex: the origin most particles share).
 
