@@ -604,6 +604,317 @@ perigee tracks (mm) and compares its first vertex with HybridVertexHead's PV; `h
 ACTS: [AdaptiveMultiVertexFinderAlgorithm.cpp](https://github.com/acts-project/acts/blob/v48.2.0/Examples/Algorithms/Vertexing/src/AdaptiveMultiVertexFinderAlgorithm.cpp).
 Maths: [12].
 
+## 15. Training losses
+
+The two heads that are trained ([vertex_reconstruction_trainer.py](../train/downstream/vertex_reconstruction_trainer.py),
+`train_vertex_reconstruction.py`), each on the frozen backbone, with its own optimiser (AdamW, weight decay $10^{-4}$,
+gradient norm clipped to 1) and log. Training and validation call the same function
+([vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L540)); what
+differs is stated per head. Lengths are in cm, $B$ is the number of events of the batch, a batch holds `--train_batch_size`
+(32) training events and 1 validation event (`valid_batch_size = 1`).
+
+### 15.1 Pure head (`PureVertexHead`)
+
+Per event: $N$ real hits, $V$ vertex slots (`n_vertex_slots`, 10). Slot $k$ outputs
+
+* $p_k$, $\bar p_k = 1 - p_k$: probability of real / empty (`vertex_class_probs`, softmax over 2 logits, index 1 = real),
+* $q_{ki} \in (0, 1)$: probability that hit $i$ belongs to slot $k$ (`vertex_mask_probs`, a sigmoid per slot and hit;
+  a softmax over slots with `softmax_mask`),
+* $\boldsymbol{\mu}_k \in \mathbb{R}^3$: position (`vertex_position`), cm,
+* $\boldsymbol{\ell}_k \in \mathbb{R}^3$: log of the position variance (`vertex_log_variance`), $\sigma_{k,c}^2 = e^{\ell_{k,c}}$, cm².
+
+With `position_mode='vote'` each hit $i$ also outputs a vote $\mathbf{v}_i$ (cm) and $\boldsymbol{\lambda}_i$ (log variance, cm²).
+
+**Sources** — Code: [purevertexhead.py:PureVertexHead](../train/downstream/vertexing/purevertexhead.py#L16),
+[loss.py:compute_vertex_set_loss](../train/downstream/loss.py#L905),
+[vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L540).
+
+#### 15.1.1 Truth targets
+
+Per event, from the per-hit truth ([downstream_util.py:get_vertex_label](../train/downstream/downstream_util.py#L84),
+called by [vertex_reconstruction_trainer.py:_truth_labels](../train/downstream/vertex_reconstruction_trainer.py#L508)):
+
+1. A hit counts if it is real and its particle's production vertex $(x, y)$ lies within `truth_radius` (CLI
+   `--truth_radius`, default 1.0 cm) of the beam line $\mathbf{b}$.
+2. Each particle (truth ID) has one origin: the production vertex of its first counted hit. Origins are rounded to a
+   grid of `tolerance_cm` = $10^{-3}$ cm (`torch.round(origin / tolerance)`); particles with the same rounded origin
+   form a cluster.
+3. A cluster is a primary vertex if it holds at least `min_particles` = 2 primary particles (truth ID $\ge 0$). The
+   primary vertices are ranked by their number of primary particles, most first (ties: the order of `torch.unique` over
+   the rounded origins).
+4. The truth set of an event is the $n_b$ primary vertices, each with
+   * label 1 (real), the only class (the empty class is 0),
+   * position $\mathbf{x}_g$: the mean of the origins of its primary particles (each particle once), cm,
+   * mask $t_{gi} = 1$ if counted hit $i$ belongs to a primary particle of vertex $g$, else 0. A hit that is not counted,
+     of a secondary particle (ID $< 0$) or of a particle in a cluster with fewer than 2 primary particles is in no mask.
+     The masks are disjoint.
+
+$n_b$ varies per event and can be 0 (every slot is then empty). The **truth PV** (`vertex_target`) is $\mathbf{x}_0$, the
+vertex with the most primary particles; with no primary vertex it is the mean origin of the cluster with the most
+particles (all IDs); with no counted hit the event has `vertex_valid = False` and its target is 0.
+
+#### 15.1.2 Matching
+
+Per event, a Hungarian assignment (`scipy.optimize.linear_sum_assignment`, minimum cost, no gradient) of the $V$ slots to
+the $n_b$ truth vertices; $\min(V, n_b)$ pairs are matched, the other truth vertices (if $n_b > V$) are unmatched and not
+in any loss. The cost of slot $k$ and truth vertex $g$:
+
+$$
+C_{kg} = -w_\text{cls}\,p_k
++ w_\text{dice}\,\Big(1 - \frac{2\sum_i q_{ki}t_{gi} + \varepsilon}{\sum_i q_{ki} + \sum_i t_{gi} + \varepsilon}\Big)
++ w_\text{foc}\,\frac{1}{N}\sum_i f(q_{ki}, t_{gi})
++ w_\text{pos}\sum_{c}\frac{\lvert\mu_{k,c} - x_{g,c}\rvert}{s_c},
+$$
+
+with $\varepsilon = 10^{-6}$, $f$ the focal term of §15.1.7, sums over the real hits, and
+
+| symbol | value | default | set by |
+|---|---|---|---|
+| $w_\text{cls}$ | weight of `loss_matched_ce` | 0.5 | `pure_vertex_loss_matched_ce_weight` |
+| $w_\text{dice}$ | weight of `loss_dice` | 1.0 | `pure_vertex_loss_dice_weight` |
+| $w_\text{foc}$ | weight of `loss_focal` | 30.0 | `pure_vertex_loss_focal_weight` |
+| $w_\text{pos}$ | `cost_position_weight` | 1.0 | `pure_vertex_cost_position_weight` |
+| $s_c$ | the head's `position_scale` (cm) | $(1, 1, 10)$ | `pure_vertex_position_scale_xy`, `pure_vertex_position_scale_z` |
+
+The class, dice and focal costs are thus the loss weights themselves (not independent settings). The class term uses
+only $p_k$ (the weight of the matched cross-entropy); the position cost uses the L1 distance with each coordinate in
+units of $s_c$ and is computed in float32. The cost is evaluated on the detached predictions.
+
+**Sources** — Code: [loss.py:VertexHungarianMatcher](../train/downstream/loss.py#L867),
+[loss.py:batch_dice_loss](../train/downstream/loss.py#L74), [loss.py:batch_focal_loss](../train/downstream/loss.py#L138),
+[vertex_reconstruction_trainer.py:train](../train/downstream/vertex_reconstruction_trainer.py#L673) (matcher built).
+
+#### 15.1.3 Terms with the matching
+
+Every term below uses the matched pairs $\mathcal{M}_b = \{(k, g)\}$ of event $b$ and the unmatched slots
+$\mathcal{U}_b$ of event $b$ ($V - \lvert\mathcal{M}_b\rvert$ slots); $M = \sum_b\lvert\mathcal{M}_b\rvert$. All sums are over
+the batch and divided by the number of events $B$ (not by $M$), except `loss_vote`.
+
+#### 15.1.4 `loss_matched_ce`
+
+$$
+L_\text{matched\,ce} = \frac1B\sum_b\sum_{(k, g)\in\mathcal{M}_b} -\ln(p_k + 10^{-6}).
+$$
+
+Weight 0.5 (`pure_vertex_loss_matched_ce_weight`). Summed over matched slots, no class weighting, no normalisation by the
+number of matched slots. Source: [loss.py:compute_point_loss](../train/downstream/loss.py#L452).
+
+#### 15.1.5 `loss_unmatched_ce`
+
+$$
+L_\text{unmatched\,ce} = \frac1B\sum_b\sum_{k\in\mathcal{U}_b} -\ln(\bar p_k + 10^{-6}).
+$$
+
+Weight 0.1 (`pure_vertex_loss_unmatched_ce_weight`). Over every unmatched slot of every event (events with $n_b = 0$:
+all $V$ slots). Source: [loss.py:compute_point_loss](../train/downstream/loss.py#L452).
+
+#### 15.1.6 `loss_dice`
+
+$$
+L_\text{dice} = \frac1B\sum_b\sum_{(k, g)\in\mathcal{M}_b}\Big(1 - \frac{2\sum_i q_{ki}t_{gi} + \varepsilon}{\sum_i q_{ki} + \sum_i t_{gi} + \varepsilon}\Big),
+$$
+
+$\varepsilon = 10^{-6}$, sums over the real hits (padding is zeroed in $q$ and $t$), $q$ the mask probabilities (soft Dice,
+no squares). Weight 1.0 (`pure_vertex_loss_dice_weight`). Summed over matched pairs. Source:
+[loss.py:matched_dice_loss](../train/downstream/loss.py#L104).
+
+#### 15.1.7 `loss_focal`
+
+$$
+f(q, t) = t\,\alpha(1 - q)^\gamma\big(-\ln q\big) + (1 - t)(1 - \alpha)\,q^\gamma\big(-\ln(1 - q)\big),\qquad
+L_\text{focal} = \frac1B\sum_b\sum_{(k, g)\in\mathcal{M}_b}\frac{1}{N_b}\sum_{i} f(q_{ki}, t_{gi}),
+$$
+
+$\alpha = 0.25$, $\gamma = 2$ (fixed in the code, not settings), $N_b$ the number of real hits of event $b$, the logarithms
+as `binary_cross_entropy` (clamped at $-100$), computed in float32. Weight 30.0 (`pure_vertex_loss_focal_weight`). Mean
+over hits, sum over matched pairs. Source: [loss.py:matched_focal_loss](../train/downstream/loss.py#L179).
+
+#### 15.1.8 `loss_position`
+
+Over the matched pairs, per coordinate $c$, with $r_{k,c} = \mu_{k,c} - x_{g,c}$ and $\beta$ = `position_beta`:
+
+$$
+L_\text{position} = \frac1B\sum_b\sum_{(k, g)\in\mathcal{M}_b}\sum_{c=1}^{3}
+\operatorname{sg}\!\big[(\sigma_{k,c}^2)^\beta\big]\cdot\frac12\Big(\ell_{k,c} + \frac{r_{k,c}^2}{\sigma_{k,c}^2}\Big),
+$$
+
+where $\operatorname{sg}$ is stop-gradient: the factor $(\sigma^2)^\beta = e^{\beta\ell}$ is detached. Gaussian negative
+log-likelihood without the $\tfrac12\ln2\pi$ constant ($\beta = 0$) and the $\beta$-NLL weighting otherwise. Summed over
+matched slots and the three coordinates, divided by $B$; units: the residual is in cm, so $\sigma^2$ in cm² and the term
+is dimensionless for $\beta = 0$. Weight 1.0 (`pure_vertex_loss_position_weight`). $\beta$ default 0.5 (CLI
+`--position_beta`, `pure_vertex_position_beta`). Gradients reach $\boldsymbol{\mu}$ and $\boldsymbol{\ell}$ (and through
+them the head). Source: [loss.py:compute_vertex_set_loss](../train/downstream/loss.py#L905).
+
+#### 15.1.9 `loss_position_l1`
+
+$$
+L_\text{position\,l1} = \frac1B\sum_b\sum_{(k, g)\in\mathcal{M}_b}\sum_{c=1}^{3}\lvert\mu_{k,c} - x_{g,c}\rvert .
+$$
+
+Units cm (no per-axis scaling). Weight 1.0 (CLI `--position_l1_weight`, `pure_vertex_loss_position_l1_weight`). Summed
+over matched slots and coordinates, divided by $B$. Source:
+[loss.py:compute_vertex_set_loss](../train/downstream/loss.py#L905).
+
+#### 15.1.10 `loss_vote`
+
+Only with `position_mode='vote'` (else 0). Over the set $\mathcal{V}$ of real hits that lie in a truth mask (of any truth
+vertex of their event, whether or not it is matched), with $\mathbf{x}(i)$ the position of the vertex that hit belongs to,
+$r_{i,c} = v_{i,c} - x_c(i)$ and $\lambda_{i,c}$ the hit's log variance:
+
+$$
+L_\text{vote} = \frac{1}{\max(\lvert\mathcal{V}\rvert, 1)}\sum_{i\in\mathcal{V}}\sum_{c=1}^{3}
+\operatorname{sg}\!\big[e^{\beta\lambda_{i,c}}\big]\cdot\frac12\Big(\lambda_{i,c} + \frac{r_{i,c}^2}{e^{\lambda_{i,c}}}\Big).
+$$
+
+The same likelihood as `loss_position` (same $\beta$, same detach), but for each hit's vote against its own true vertex,
+independent of the slot matching; summed over the three coordinates, averaged over the voting hits of the whole batch
+(not divided by $B$). Weight 1.0 (CLI `--vote_weight`, `pure_vertex_loss_vote_weight`). Source:
+[loss.py:compute_vertex_set_loss](../train/downstream/loss.py#L905).
+
+#### 15.1.11 Position and variance entering the loss
+
+Both modes use $\sigma_c^2 \leftarrow \sigma_c^2 + \sigma_{\min,c}^2$ at the end (`torch.logaddexp(log_variance,
+log_min_variance)`), with $\sigma_{\min} = $ `min_sigma_xy` (CLI `--min_sigma_xy`) for $x, y$ and `min_sigma_z` (CLI
+`--min_sigma_z`) for $z$; default 0 (no floor). With $\mathbf{s} = (s_{xy}, s_{xy}, s_z)$ = `position_scale` (default
+$(1, 1, 10)$ cm). The queries $\mathbf{u}_k$ are the refined slot embeddings.
+
+**`query`** (default): $\boldsymbol{\mu}_k = \mathrm{MLP}_\text{pos}(\mathbf{u}_k)\odot\mathbf{s}$ and
+$\ell_{k,c} = \mathrm{MLP}_\text{var}(\mathbf{u}_k)_c + 2\ln s_c$, i.e. $\sigma^2_{k,c} = e^{\mathrm{MLP}_c}s_c^2$.
+
+**`vote`**: each hit $i$ (cylindrical radius $r_i$ and $z_i$ in cm from the normalised input, padded hits as a hit at
+normalised 0) gives $(a_x, a_y, a_s, \lambda'_x, \lambda'_y, \lambda'_z) = \mathrm{MLP}_\text{vote}([\text{hit feature},
+\text{normalised hit}])$ and
+
+$$
+v_{i,x} = s_{xy}a_x,\quad v_{i,y} = s_{xy}a_y,\quad
+v_{i,z} = z_i - r_i a_s\ \ (\texttt{vote\_z\_from\_origin}\text{: } v_{i,z} = -r_i a_s),
+$$
+
+$$
+\lambda_{i,x} = \lambda'_x + 2\ln s_{xy},\quad \lambda_{i,y} = \lambda'_y + 2\ln s_{xy},\quad \lambda_{i,z} = \lambda'_z + 2\ln r_i .
+$$
+
+(`vote_z_from_origin` is CLI `--vote_z_from_origin`, default off.) Each slot's position is the weighted mean of the votes
+of the real hits, per coordinate, with $\varepsilon_v$ = `vote_eps` ($10^{-6}$):
+
+$$
+\omega_{kic} = \frac{q_{ki} + \varepsilon_v}{e^{\lambda_{i,c}}},\qquad
+\mu_{k,c} = \frac{\sum_i\omega_{kic}v_{i,c}}{\sum_i\omega_{kic}},\qquad
+\ell_{k,c} = \mathrm{MLP}_\text{var}(\mathbf{u}_k)_c - \ln\sum_i\omega_{kic},
+$$
+
+so $\sigma^2_{k,c} = e^{\mathrm{MLP}_c}/\sum_i\omega_{kic}$. No detach: the position loss reaches the votes, the mask
+probabilities and the slot's variance factor. The slot variance floor above applies to the slot, not to a hit's vote
+variance. The votes are computed once, from the hit features, and shared by the final and the auxiliary outputs.
+
+**Sources** — Code: [purevertexhead.py:PureVertexHead.votes](../train/downstream/vertexing/purevertexhead.py#L85),
+[purevertexhead.py:PureVertexHead.predict](../train/downstream/vertexing/purevertexhead.py#L101),
+[tracks.py:_unnormalize_hits](../train/downstream/vertexing/tracks.py#L139).
+
+#### 15.1.12 Total
+
+For one output (final or auxiliary), with $w_t$ the weights above (`PURE_LOSS_WEIGHTS`):
+
+$$
+L = 0.5\,L_\text{matched\,ce} + 0.1\,L_\text{unmatched\,ce} + 1\cdot L_\text{dice} + 30\,L_\text{focal}
++ 1\cdot L_\text{position} + 1\cdot L_\text{position\,l1} + 1\cdot L_\text{vote}.
+$$
+
+Each weight is `pure_vertex_<term>_weight`; only `loss_position_l1` and `loss_vote` have a CLI flag. Each output has its
+own matching.
+
+* **Training**: $L$ of the final output plus $L$ of each auxiliary output, all with the same weights. The auxiliary
+  outputs are the head's predictions before each refinement layer (`aux_list`, `num_refinement_layers` of them, 2 by
+  default, so 3 outputs in all). They carry no votes, so their `loss_vote` is 0 (their positions in `vote` mode still
+  come from the shared votes). The backpropagated loss is this sum, of one batch. The logged `Train_Loss` is the mean
+  of it over the batches of the epoch.
+* **Validation** (eval mode, no gradient): $L$ of the final output only, no auxiliary terms. The logged `Val_Loss` is
+  the mean over the validation events (batch size 1) of the epoch; it is the value used for the best checkpoint and
+  early stopping. The logged columns `loss_matched_ce` ... `loss_vote` are the validation means of the seven unweighted
+  terms of the final output. With `--val_on_train` the validation set is the training set (and its terms are then the
+  training set's).
+* The training log has no per-term columns.
+
+**Sources** — Code: [vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L540),
+[vertex_reconstruction_trainer.py:PURE_LOSS_WEIGHTS](../train/downstream/vertex_reconstruction_trainer.py#L471),
+[vertex_reconstruction_trainer.py:downstream_end_to_end_one_epoch](../train/downstream/vertex_reconstruction_trainer.py#L750),
+[vertex_reconstruction_trainer.py:validate_end_to_end_one_epoch](../train/downstream/vertex_reconstruction_trainer.py#L778).
+
+#### 15.1.13 Logged metrics that are not losses
+
+**Reported PV** ([purevertexhead.py:pure_outputs](../train/downstream/vertexing/purevertexhead.py#L190)): a slot is a
+vertex if $p_k \ge$ `real_threshold` (0.5, `pure_vertex_real_threshold`). The vertex slots are ordered by
+$p_k\sum_{i\,\in\,\text{real}}q_{ki}$, largest first; the first `max_vertices` (10) are kept and the first is the PV
+(`vertex_estimate`, position $\boldsymbol{\mu}_k$, covariance $\operatorname{diag}(e^{\boldsymbol{\ell}_k})$). The event has
+a PV (`fit_is_valid`) if its best slot is a vertex.
+
+**PV residual** per event with a PV and a valid truth: $\lVert\hat{\mathbf{x}}_\text{PV} - \mathbf{x}_0\rVert$ (3D, cm), with
+$\mathbf{x}_0$ the truth PV of §15.1.1. `Train_PV_median_cm` / `Val_PV_median_cm` are the medians over the residuals of the
+epoch (training: from the training-mode forward pass; validation: of the validation events). `Val_PV_rate` is the number of
+validation residuals divided by the number of validation events (an event without a PV or without a valid truth is not
+in it). The best-PV checkpoint is chosen by `Val_PV_median_cm`.
+
+**Sources** — Code: [vertex_reconstruction_trainer.py:train](../train/downstream/vertex_reconstruction_trainer.py#L597),
+[vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L583).
+
+### 15.2 Hybrid head (`HybridVertexHead`)
+
+**Trainable parameters.** With `learn_weights` (set by the trainer, `vertex_learn_weights = True`) the head's learnable
+parts are those of `TrackBuilder` ([tracks.py:TrackBuilder](../train/downstream/vertexing/tracks.py#L337)), the vertex
+fit itself has none:
+
+* `track_weight_network`: $6 \to 32 \to 1$ (`weight_hidden_dim`) MLP with GELU and a softplus output, inputs $(p_\text{empty},
+  p_\text{real}, q/(p_T + 1), \theta, \sin\phi, \cos\phi)$ of the track; its output multiplies the track weight; the last
+  layer starts at zero, with a bias such that the weight is 1,
+* `pt_threshold` (starts at `noise_pt_threshold`, 0.25 GeV) and `beam_radius` (starts at `valid_radius`, 1 cm): the
+  usability cuts, forward as hard cuts (straight-through: sigmoid gradients backward),
+* `log_gate_width_pt`, `log_gate_width_r` (start at $\ln0.05$ GeV, $\ln0.2$ cm): the widths of those sigmoids,
+* `log_kalman_fallback_scale`: the log of the covariance scale (starts at $\ln100$) of tracks the ACTS Kalman refit
+  failed on.
+
+The track head and the backbone are frozen and evaluated without gradient; the head runs in eval mode.
+
+**Loss.** On the head's PV (`vertex_estimate`, the first vertex the AMVF keeps, §10, refitted with the SVs, §13) against
+the truth PV $\mathbf{x}_0$ (§15.1.1). No matching. Events with a PV (`fit_is_valid`) and a valid truth (`vertex_valid`)
+contribute; $\mathcal{E}$ is their set in the batch:
+
+$$
+L_\text{l1} = \frac{1}{3\lvert\mathcal{E}\rvert}\sum_{b\in\mathcal{E}}\sum_{c=1}^{3}\lvert\hat{x}_{b,c} - x_{0,b,c}\rvert .
+$$
+
+Mean of the absolute residual over events and coordinates (`F.l1_loss`, mean), cm, no per-axis scaling; weight 1 (no
+setting); no auxiliary terms. With $\lvert\mathcal{E}\rvert = 0$ the loss is a constant 0 without gradient and the batch
+is left out of the epoch means. Learning rates: `--hybrid_max_lr`, `--hybrid_min_lr` (default: `--max_lr`, `--min_lr`).
+
+* **Training**: $L_\text{l1}$ of the batch (`loss.backward()` when it has a gradient); `Train_Loss` is the mean over the
+  batches with at least one event in $\mathcal{E}$.
+* **Validation**: the same $L_\text{l1}$ per batch (1 event), averaged over the batches with an event in $\mathcal{E}$;
+  the one logged term column is `loss_l1`, the same value. The PV residual median / rate of §15.1.13 are computed the
+  same way ($\lVert\hat{\mathbf{x}} - \mathbf{x}_0\rVert$ over $\mathcal{E}$).
+
+**Sources** — Code: [loss.py:vertex_reg_loss](../train/downstream/loss.py#L803),
+[vertex_reconstruction_trainer.py:_batch_losses](../train/downstream/vertex_reconstruction_trainer.py#L586),
+[tracks.py:TrackBuilder](../train/downstream/vertexing/tracks.py#L439),
+[hybridvertexhead.py:HybridVertexHead.forward](../train/downstream/vertexing/hybridvertexhead.py#L110).
+
+### 15.3 Comparison
+
+| | pure | hybrid |
+|---|---|---|
+| trained | all of `PureVertexHead` | track weight network, soft gates, Kalman fallback scale |
+| supervised output | slot set: class, hit masks, positions, variances (and votes) | the PV position |
+| matching | Hungarian per event (cost of §15.1.2), each output | none (PV vs truth PV) |
+| terms | 7: `loss_matched_ce`, `loss_unmatched_ce`, `loss_dice`, `loss_focal`, `loss_position`, `loss_position_l1`, `loss_vote` | 1: `loss_l1` |
+| weights | 0.5, 0.1, 1, 30, 1, 1, 1 | 1 |
+| units | mixed: nats, soft-Dice / focal (dimensionless), position terms in cm and cm² / dimensionless (NLL), L1 in cm | cm |
+| normalisation | sums over matched / unmatched slots divided by $B$; focal mean over hits; `loss_vote` mean over voting hits | mean over contributing events and 3 coordinates |
+| events that contribute | all (an event without truth vertex adds unmatched terms) | those with a PV and a valid truth |
+| auxiliary outputs | yes, in training (not `loss_vote`) | no |
+| `Train_Loss` | mean over batches of the sum over final + auxiliary outputs | mean over batches with a contributing event |
+| `Val_Loss` | mean over events of the final output's weighted sum | mean over batches with a contributing event of $L_\text{l1}$ |
+| logged terms | validation means, unweighted | `loss_l1` (validation) |
+| stochastic parts | none in the loss; stop-gradient on the $\beta$ weight | straight-through gates |
+
 ## References
 
 Licences: ACTS is MPL-2.0, KFParticle GPL-3.0, sPHENIX's coresoftware has no licence. This code is written from the
