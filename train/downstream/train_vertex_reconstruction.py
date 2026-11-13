@@ -90,6 +90,8 @@ def main():
                         help="cm: floor of the predicted x, y position uncertainty (default: none)")
     parser.add_argument("--min_sigma_z", default=None, type=float,
                         help="cm: floor of the predicted z position uncertainty (default: none)")
+    parser.add_argument("--point_embed_scale", default=None, type=float,
+                        help="learned: multiplies the coordinate embedding added to the hit features (default 0: not used)")
     parser.add_argument("--position_beta", default=None, type=float,
                         help="learned: power of the predicted variance weighting the position likelihood "
                              "(0: plain likelihood; default 0.5)")
@@ -175,6 +177,7 @@ def main():
                        ("feature_cache", args.feature_cache), ("feature_cache_val", args.feature_cache_val),
                        ("learned_vertex_min_sigma_xy", args.min_sigma_xy),
                        ("learned_vertex_min_sigma_z", args.min_sigma_z),
+                       ("learned_vertex_point_embed_scale", args.point_embed_scale),
                        ("learned_vertex_position_beta", args.position_beta),
                        ("learned_vertex_loss_position_l1_weight", args.position_l1_weight),
                        ("learned_vertex_val_on_train", args.val_on_train or None), ("checkpoint_dir", args.checkpoint_dir)):

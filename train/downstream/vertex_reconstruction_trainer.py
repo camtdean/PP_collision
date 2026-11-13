@@ -697,7 +697,7 @@ class DownstreamTrainer():
             for m in methods:
                 with open(log_paths[m], "w") as f:
                     f.write("\t".join(["Epoch", "Train_Loss", "Val_Loss", "Train_PV_median_cm", "Val_PV_median_cm",
-                                       "Val_PV_rate"] + terms[m] + ["Time"]) + "\n")
+                                       "Val_PV_rate"] + terms[m] + ["Skipped_steps", "Time"]) + "\n")
         running = [m for m in methods if not self.train_state[m]["stopped"]]
         for epoch in range(min((self.train_state[m]["epoch"] for m in running), default=0), self.params.max_epochs):
             # a method resumed from a later epoch waits for it; a stopped one is done
@@ -719,7 +719,8 @@ class DownstreamTrainer():
                        sum(map(len, results["val_residual"])) / max(results["val_events"], 1)
                        ] + [self._mean(results[term]) for term in terms[m]] + [time.time() - start]
                 with open(log_paths[m], "a") as f:
-                    f.write("\t".join([str(epoch)] + [f"{v:.8f}" for v in row]) + "\n")
+                    f.write("\t".join([str(epoch)] + [f"{v:.8f}" for v in row[:-1]]
+                                      + [str(results["skipped"]), f"{row[-1]:.8f}"]) + "\n")
                 if self.log_to_screen:
                     print(f"[{m}] Epoch {epoch}/{self.params.max_epochs - 1} | Time: {row[-1]:.2f}s"
                           + (f" | steps skipped (non-finite gradient): {results['skipped']}" if results["skipped"] else "")

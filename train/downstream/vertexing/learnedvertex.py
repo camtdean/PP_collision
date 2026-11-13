@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from fm4npp.models.embed import EmbedderAdd
+from fm4npp.models.rmsnorm import RMSNorm
 from trackinghead import FFNBlock, RefinementLayer
 
 
@@ -19,6 +20,7 @@ class LearnedVertexHead(nn.Module):
         input_dim: backbone feature width D.
         num_feature_layers: number of backbone feature layers L combined by learned weights.
         pe_method: coordinate embedding of the points ('none', 'ff', 'nerf', 'cpe').
+        point_embed_scale: multiplies the coordinate embedding added to the projected features (0: not used).
         n_vertex_slots: number of vertex queries V.
         embed_dim: working width of the head.
         num_heads: attention heads of the refinement layers.
@@ -34,16 +36,18 @@ class LearnedVertexHead(nn.Module):
         dropout: dropout of the attention and prediction layers.
     """
 
-    def __init__(self, input_dim, num_feature_layers, pe_method="nerf", n_vertex_slots=10, embed_dim=256, num_heads=4,
-                 ffn_dim=512, num_refinement_layers=2, position_scale_xy=1.0, position_scale_z=10.0,
-                 min_sigma_xy=0.0, min_sigma_z=0.0, softmax_mask=False, do_masked_attn=True, attn_mask_eps=1e-6, dropout=0.0):
+    def __init__(self, input_dim, num_feature_layers, pe_method="nerf", point_embed_scale=0.0, n_vertex_slots=10,
+                 embed_dim=256, num_heads=4, ffn_dim=512, num_refinement_layers=2, position_scale_xy=1.0,
+                 position_scale_z=10.0, min_sigma_xy=0.0, min_sigma_z=0.0, softmax_mask=False, do_masked_attn=True,
+                 attn_mask_eps=1e-6, dropout=0.0):
         super().__init__()
-        self.n_vertex_slots, self.num_heads = n_vertex_slots, num_heads
+        self.n_vertex_slots, self.num_heads, self.point_embed_scale = n_vertex_slots, num_heads, point_embed_scale
         self.softmax_mask, self.do_masked_attn, self.attn_mask_eps = softmax_mask, do_masked_attn, attn_mask_eps
 
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
         self.input_proj = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, embed_dim))
-        self.embedder = EmbedderAdd(pe_method=pe_method, embed_dim=embed_dim)
+        self.embedder = EmbedderAdd(pe_method=pe_method, embed_dim=embed_dim) if point_embed_scale else None
+        self.feature_norm = RMSNorm(embed_dim)
         self.output_layer = FFNBlock(embed_dim, ffn_dim)
 
         self.query_embed = nn.Embedding(n_vertex_slots, embed_dim)
@@ -92,10 +96,12 @@ class LearnedVertexHead(nn.Module):
         """
         if not pretrain:
             raise NotImplementedError("LearnedVertexHead needs the backbone features (pretrain=True)")
-        hit_features = self.output_layer(
-            self.input_proj(torch.einsum("lbnd,l->bnd", feature,
-                                         torch.softmax(self.weighted_avg_weights, dim=0).to(feature.dtype)))
-            + self.embedder(x.masked_fill(~padding_mask.unsqueeze(-1), 0.0))[0])
+        hit_features = self.input_proj(torch.einsum("lbnd,l->bnd", feature,
+                                                    torch.softmax(self.weighted_avg_weights, dim=0).to(feature.dtype)))
+        if self.embedder is not None:
+            hit_features = hit_features + self.point_embed_scale * self.embedder(
+                x.masked_fill(~padding_mask.unsqueeze(-1), 0.0))[0]
+        hit_features = self.output_layer(self.feature_norm(hit_features))
         context = hit_features.transpose(0, 1)
 
         slots = torch.arange(self.n_vertex_slots, device=x.device)
