@@ -81,50 +81,62 @@ def get_weakdecaylabel(mid):
         "weak_decay_class": weak_decay_class,  # B X N tensor with weak decay labels (1 for K0, 0 otherwise)
     }
 
-def get_vertex_label(reg, valid_tracks=None, valid_radius_cm=1.0, z_cut_cm=None):
+def get_vertex_label(reg, valid_tracks, particle_id, tolerance_cm=1e-3, min_particles=2):
     """
-    Ground-truth vertex position for VertexHead: mean (vtx_x, vtx_y, vtx_z)
-    over hits/tracks near the origin, aggregated per event.
+    Ground-truth vertices for HybridVertexHead, per event: every primary vertex (an origin shared by >= min_particles
+    primary particles, truth ID >= 0; pileup gives several), ranked by particle count; the PV is the first (without
+    a primary vertex: the origin most particles share).
 
     Args:
-        reg: (B, N, 8) - per-hit regression target tensor (same columns as get_trackinfo_noiselabel)
-        valid_tracks: (B, N) bool/int, optional - if None, recomputed exactly like
-            get_trackinfo_noiselabel: vtx_r = sqrt(vtx_x^2 + vtx_y^2) < valid_radius_cm
-            (NOTE: transverse-only cut, same as the original)
-        valid_radius_cm: transverse radius cut used when valid_tracks is None
-        z_cut_cm: optional float - if set, ALSO requires |vtx_z| < z_cut_cm
+        reg: (B, N, 8) per-hit truth (the particle's production vertex vtx_x, vtx_y, vtx_z in columns 3-5, cm).
+        valid_tracks: (B, N) bool, the hits that count (e.g. real hits of particles starting near the beam line).
+        particle_id: (B, N) each hit's truth particle (seg_target; < 0: Geant secondary).
+        tolerance_cm: origins closer than this are one vertex; min_particles: particles making a primary vertex.
 
     Returns:
-        vertex_target: (B, 3) - mean (vtx_x, vtx_y, vtx_z) over hits/tracks flagged valid
-            for that event; the regression target for VertexHead
-        vertex_valid: (B,) bool - whether the event had >=1 valid hit to average (events
-            with none should be excluded from the loss, not trained toward a meaningless
-            zero-vector target)
-        n_valid: (B,) long - how many hits contributed, for logging/debugging class imbalance
+        vertex_target (B, 3) the PV (0 without valid hits); vertex_valid (B,) the event has a valid hit;
+        primary_vertices (B, V, 3) (NaN padding), primary_vertex_particles (B, V), n_primary_vertices (B,);
+        hit_vertex (B, N) the rank of each hit's particle's primary vertex (-1: none).
     """
-    vtx_x = reg[..., 3]
-    vtx_y = reg[..., 4]
-    vtx_z = reg[..., 5]
+    device = reg.device
+    particle_id, valid_tracks = particle_id.to(device), valid_tracks.to(device)
+    vertex = reg.new_zeros(reg.shape[0], 3)
+    result = {"vertex_target": vertex, "vertex_valid": valid_tracks.bool().any(dim=-1)}
+    hit_vertex = torch.full(valid_tracks.shape, -1, dtype=torch.long, device=device)
+    found = []
+    for b in range(reg.shape[0]):
+        hits = valid_tracks[b].bool().nonzero(as_tuple=True)[0]
+        if not len(hits):
+            found.append((reg.new_zeros(0, 3), torch.zeros(0, dtype=torch.long, device=device)))
+            continue
+        # one origin per particle (its first valid hit); particles with the same origin form a vertex
+        ids, position = particle_id[b, hits], torch.arange(len(hits), device=device)
+        unique_ids, inverse = torch.unique(ids, return_inverse=True)
+        first = torch.full((len(unique_ids),), len(hits), device=device).scatter_reduce(0, inverse, position, "amin")
+        origins = reg[b, hits[first], 3:6]
+        _, cluster, size = torch.unique(torch.round(origins / tolerance_cm), dim=0, return_inverse=True,
+                                        return_counts=True)
+        # primary vertices: >= min_particles primary particles, most first (ties: the stored order)
+        primary = unique_ids >= 0
+        n_primary = torch.zeros_like(size).scatter_add(0, cluster, primary.long())
+        order = [c for c in n_primary.argsort(descending=True, stable=True).tolist() if n_primary[c] >= min_particles]
+        rank = torch.full_like(size, -1)
+        rank[order] = torch.arange(len(order), device=device)
+        hit_vertex[b, hits] = torch.where(primary, rank[cluster], -1)[inverse]
+        vertices = (torch.stack([origins[(cluster == c) & primary].mean(dim=0) for c in order]) if order
+                    else reg.new_zeros(0, 3))
+        # the PV: the first primary vertex; without one, the origin most particles share
+        vertex[b] = vertices[0] if order else origins[cluster == size.argmax()].mean(dim=0)
+        found.append((vertices, n_primary[order]))
 
-    if valid_tracks is None:
-        vtx_r = torch.sqrt(vtx_x ** 2 + vtx_y ** 2)
-        valid_tracks = vtx_r < valid_radius_cm  # (B, N)
-        if z_cut_cm is not None:
-            valid_tracks = valid_tracks & (vtx_z.abs() < z_cut_cm)
-
-    valid_f = valid_tracks.float()  # (B, N)
-    n_valid = valid_f.sum(dim=-1)  # (B,)
-    counts = n_valid.clamp(min=1)  # avoid div-by-zero; masked out via vertex_valid anyway
-
-    vx = (vtx_x * valid_f).sum(dim=-1) / counts
-    vy = (vtx_y * valid_f).sum(dim=-1) / counts
-    vz = (vtx_z * valid_f).sum(dim=-1) / counts
-
-    return {
-        "vertex_target": torch.stack([vx, vy, vz], dim=-1),  # (B, 3)
-        "vertex_valid": n_valid > 0,  # (B,)
-        "n_valid": n_valid.long(),  # (B,)
-    }
+    n_vertices = max([1] + [len(v) for v, _ in found])
+    primary_vertices = reg.new_full((reg.shape[0], n_vertices, 3), float("nan"))
+    primary_vertex_particles = torch.zeros(reg.shape[0], n_vertices, dtype=torch.long, device=device)
+    for b, (vertices, particles) in enumerate(found):
+        primary_vertices[b, :len(vertices)] = vertices
+        primary_vertex_particles[b, :len(vertices)] = particles
+    return {**result, "primary_vertices": primary_vertices, "primary_vertex_particles": primary_vertex_particles,
+            "n_primary_vertices": torch.tensor([len(v) for v, _ in found], device=device), "hit_vertex": hit_vertex}
     
 def get_silicon_tpc_match_mask(
     features,

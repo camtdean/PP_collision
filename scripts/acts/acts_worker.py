@@ -1,0 +1,124 @@
+"""
+acts_worker.py: ACTS computing perigee parameters and covariances for track states, inside the ACTS image with
+the module from build_images.sh (perigee_propagator/build/install). HybridVertexHead (TrackBuilder, use_acts) starts it once and
+streams batches:
+
+    singularity exec acts-base-48.2.0.sif acts-python scripts/acts/acts_worker.py '<json config>'
+
+Config (TrackBuilder.acts_worker_config, mm and T): reference, bz_tesla or field_map (+ field_map_kind),
+geometry + geometry_config (+ material_map, energy_loss), max_steps, threads (null: the CPUs this process may use),
+particle_pdg and particle_mass (GeV; null: ACTS's mass for the PDG id), kalman_refit, kalman_start_covariance_scale and
+kalman_material (the gas between the refit's hits: X0, L0 mm, A, Z, density g/cm^3; null: none).
+
+Protocol, after the line ACTS_WORKER_READY: n, m (uint64), then float64 position (n, 3), direction (n, 3), qop (n,),
+covariance (n, 6, 6), hit_track (m,) each hit's state index (sorted) and hits (m, 9) (position, the hit fit's
+direction there, the hit's r phi and z errors, 1 in the gas / 0 silicon): the Kalman refit's hits (m = 0 without kalman_refit). Reply: float64 params (n, 6), covariance
+(n, 6, 6), then ok (n,) and refitted (n,) uint8. States are propagated backward to the perigee. EOF ends it and prints a failure summary; everything else goes to stderr.
+"""
+import collections
+import json
+import os
+import struct
+import sys
+
+import numpy as np
+
+import acts
+
+
+def build_field(bz_tesla, field_map, field_map_kind):
+    """ACTS field: the text field map (mm, T; field_map_kind xyz or rz) if given, else uniform Bz (T)."""
+    u = acts.UnitConstants
+    if field_map:
+        return {"xyz": acts.MagneticFieldMapXyz, "rz": acts.MagneticFieldMapRz}[field_map_kind](
+            field_map, lengthUnit=u.mm, bFieldUnit=u.T)
+    return acts.ConstantBField(acts.Vector3(0.0, 0.0, float(bz_tesla) * u.T))
+
+
+def _perigee_module():
+    """The perigee module (perigee_propagator/build/install), its path added once."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perigee_propagator", "build", "install")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import acts_perigee_propagator
+    return acts_perigee_propagator
+
+
+def build_tracking_geometry(geometry, geometry_config, material_map=None, quiet=False):
+    """ACTS tracking geometry from TGeo (the perigee module's build_tgeo_geometry: TGeoDetector's layout with its JSON
+    configuration, ACTS Core and plugins only), with a JSON material map if given. quiet: ACTS logs fatal errors only
+    while building (README: sPHENIX inputs). Returns (owner, geometry): the owner holds the detector elements and must
+    be kept alive."""
+    owner = _perigee_module().build_tgeo_geometry(geometry, geometry_config, material_map or "", quiet)
+    return owner, owner.tracking_geometry()
+
+
+def build_propagator(config):
+    """(PerigeePropagator, objects to keep alive) from a config dict (see the module docstring)."""
+    acts_perigee_propagator = _perigee_module()
+    # ACTS reads a missing file as empty input ("parse error ... empty input"): name it instead
+    missing = [f"{k}={config[k]}" for k in ("field_map", "geometry", "geometry_config", "material_map")
+               if config[k] and not os.path.isfile(config[k])]
+    if missing:
+        raise FileNotFoundError(f"not visible inside the container: {', '.join(missing)} (a wrong path, or its "
+                                "directory not bound into the container)")
+    field = build_field(config["bz_tesla"], config["field_map"], config["field_map_kind"])
+    detector = geometry = None
+    if config["geometry"]:
+        detector, geometry = build_tracking_geometry(config["geometry"], config["geometry_config"],
+                                                     config["material_map"], quiet=True)
+    propagator = acts_perigee_propagator.PerigeePropagator(
+        field=field, reference=[float(v) for v in config["reference"]], geometry=geometry,
+        energy_loss=bool(config["energy_loss"]), max_steps=int(config["max_steps"] or 0),
+        threads=int(config["threads"] if config["threads"] is not None else len(os.sched_getaffinity(0))),
+        particle_pdg=int(config["particle_pdg"]), particle_mass=config["particle_mass"],
+        kalman_refit=bool(config["kalman_refit"]),
+        kalman_start_covariance_scale=float(config["kalman_start_covariance_scale"]),
+        kalman_material=None if config["kalman_material"] is None else [float(v) for v in config["kalman_material"]])
+    return propagator, (field, detector, geometry)
+
+
+def read_exact(stream, size):
+    """size bytes from a buffered stream (its read waits for them), None at the end of the input."""
+    data = stream.read(size)
+    return data if len(data) == size else None
+
+
+def serve(config):
+    # the protocol gets the real stdout; anything printed from here on (Python or ACTS's C++) goes to stderr
+    out = os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    propagator, _keep = build_propagator(config)
+    stdin = sys.stdin.buffer
+    out.write(b"ACTS_WORKER_READY\n")
+    out.flush()
+    errors, attempted, propagated = collections.Counter(), 0, 0
+    while True:
+        header = read_exact(stdin, 16)
+        if header is None:
+            # at the end (HybridVertexHead closes the worker at exit): why ACTS failed, for the dropped tracks
+            print(f"ACTS worker: {propagated} of {attempted} states propagated" + ("; failures:" if errors else ""))
+            for key, count in errors.most_common():
+                print(f"  {count:7d}  {key}")
+            sys.stdout.flush()
+            return 0
+        n, m = struct.unpack("<QQ", header)
+        body = read_exact(stdin, n * 8 * 43 + m * 8 * 10)
+        if body is None:
+            return 1
+        values = np.frombuffer(body, dtype="<f8")
+        position, direction = values[: 3 * n].reshape(n, 3), values[3 * n: 6 * n].reshape(n, 3)
+        qop, covariance = values[6 * n: 7 * n], values[7 * n: 43 * n].reshape(n, 6, 6)
+        hit_track, hits = values[43 * n: 43 * n + m], values[43 * n + m:].reshape(m, 9)
+        params, cov, ok, refitted, failures = propagator.propagate(position, direction, qop, covariance, hit_track, hits)
+        errors.update(failures)
+        attempted += int((np.isfinite(position).all(axis=1) & np.isfinite(direction).all(axis=1) & np.isfinite(qop)).sum())
+        propagated += int(ok.sum())
+        out.write(params.astype("<f8").tobytes() + cov.astype("<f8").tobytes() + ok.astype(np.uint8).tobytes()
+                  + refitted.astype(np.uint8).tobytes())
+        out.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(serve(json.loads(sys.argv[1])))

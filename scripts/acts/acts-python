@@ -1,0 +1,4 @@
+#!/bin/bash
+# python3 with the ACTS bindings importable (the build tree's setup script; bash: it supports bash and zsh only)
+source /opt/acts-build/python/setup.sh
+exec python3 "$@"

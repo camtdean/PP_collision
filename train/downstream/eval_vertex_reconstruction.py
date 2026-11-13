@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+Evaluate HybridVertexHead after a trained track-finding head. Run from train/downstream:
+
+    python eval_vertex_reconstruction.py --run_config ../../scripts/configs/vertex_<run>.yaml [options override the file]
+    python eval_vertex_reconstruction.py --root_dir out/ --checkpoint <head.pth> [--no-csv]
+
+Backbone: --pretrained_ckpt (else the config's). Track head: --checkpoint, else found by name in
+--checkpoint_dir. HybridVertexHead: --detector (detector file), --bz, --vertex_device, --vertex_chunk_events. Speed:
+--eval_batch_size.
+Methods: --vertex_method hybrid pure runs both on the same events (pure: --pure_checkpoint; its CSV is
+<name>_per_point_data_pure.csv, its metrics follow hybrid's in the log and JSON); a PV residual table per method is
+printed and logged unless --no_residual_table.
+Outputs in <root_dir>/<backbone checkpoint>/<track-head checkpoint>/ (name: vertex_eval_e<events>_<N>):
+data/<name>_per_point_data.csv, logs/<name>.log (parameters, metrics) and metrics/<name>.json (inputs, track
+settings, metrics).
+--no_output writes nothing.
+"""
+import os
+import sys
+import argparse
+
+
+# make sure the FM4NPP modules can be imported
+sys.path.append('../..')
+
+from fm4npp.utils import YParams
+from vertex_reconstruction_trainer import DownstreamTrainer
+
+DEFAULT_YAML = "../../scripts/configs/mamba_tracking.yaml"
+DEFAULT_CONFIG = "mamba_5m_downstream"
+DEFAULT_TRACK_CONFIG = "d9_m1_k30_p20"    # train_track_finding.py's name for the same backbone
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluation script for the vertex reconstruction downstream task"
+    )
+    parser.add_argument(
+        "--yaml_config",
+        type=str,
+        default=DEFAULT_YAML,
+        help=f"Path to the YAML config file (default: {DEFAULT_YAML})",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=DEFAULT_CONFIG,
+        help=f"Config name inside the YAML (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--track_config",
+        type=str,
+        default=DEFAULT_TRACK_CONFIG,
+        help="--config the track head was trained with; only names the derived checkpoint "
+             f"(default: {DEFAULT_TRACK_CONFIG})",
+    )
+    parser.add_argument(
+        "--pretrained_ckpt",
+        type=str,
+        default=None,
+        help="Frozen backbone checkpoint (default: pretrained_ckpt from the config)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="Track-head checkpoint (default: <track_config>_nerf_tracking_head_d<eventnumber>_<run_num>"
+             "[_seed<seed>][_nopretrain]_checkpoint.pth in --checkpoint_dir)",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Where track-head checkpoints live (default: checkpoint_dir from the config, "
+             "where train_track_finding.py writes them)",
+    )
+    parser.add_argument(
+        "--run_num",
+        type=str,
+        default="0",
+        help="The track head's run number: names its checkpoint",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used during track-head training (selects the checkpoint)",
+    )
+    parser.add_argument(
+        "--no_seed_in_ckpt",
+        action="store_true",
+        default=False,
+        help="Checkpoint name without the _seed<N> suffix",
+    )
+    parser.add_argument(
+        "--save_csv",
+        dest="save_csv",
+        action="store_true",
+        default=True,
+        help="Save the per-point CSV (default: enabled): vtx_x/y/z each hit's truth production vertex, reco_vtx_* "
+             "the reconstructed PV, test_* columns (truth PV, residual) for testing only",
+    )
+    parser.add_argument(
+        "--no-csv",
+        dest="save_csv",
+        action="store_false",
+        help="Disable per-point CSV output",
+    )
+    parser.add_argument(
+        "--csv_output_path",
+        type=str,
+        default=None,
+        help="Path for the per-point CSV (default: the run folder's data/)",
+    )
+    parser.add_argument(
+        "--data_root_test",
+        type=str,
+        default=None,
+        help="Evaluation data root (default: data_root_test from the config)",
+    )
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default=None,
+        help="Root directory to store evaluation outputs (required, here or in --run_config)",
+    )
+    parser.add_argument(
+        "--eventnumber",
+        type=int,
+        default=70000,
+        help="The track head's training size: names its checkpoint (--max_eval_events sets the events evaluated)",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for evaluation",
+    )
+    parser.add_argument(
+        "--usepretrain",
+        dest="usepretrain",
+        action="store_true",
+        help="enable using the pretrained model (default)",
+    )
+    parser.add_argument(
+        "--no-pretrain",
+        dest="usepretrain",
+        action="store_false",
+        help="disable pretrained model (track head trained with --no-pretrain)",
+    )
+    parser.set_defaults(usepretrain=True)
+    parser.add_argument(
+        "--max_eval_events",
+        type=int,
+        default=20000,
+        help="Evaluate at most this many events (0: all); also names the outputs vertex_eval_e<events>_<N>",
+    )
+    parser.add_argument(
+        "--combine_weights",
+        type=str,
+        default=None,
+        help="Comma-separated POST-softmax layer weights. Required for a track head that was "
+             "trained against a --combine_layers cache (built with num_feature_layers=1). Read "
+             "the vector from the cache's cache_meta.json.",
+    )
+    parser.add_argument(
+        "--bz",
+        type=float,
+        default=None,
+        help="Solenoid field, Tesla (default: YAML vertex_Bz, else the detector file's, else 1.4)",
+    )
+    parser.add_argument(
+        "--detector",
+        type=str,
+        default=None,
+        help="Detector file for HybridVertexHead.from_detector (scripts/acts/detectors/<name>/<name>.yaml): field, "
+             "ACTS inputs and fit settings (default: YAML vertex_detector, else the built-in sPHENIX defaults)",
+    )
+    parser.add_argument(
+        "--truth_radius",
+        type=float,
+        default=1.0,
+        help="cm: hits whose particle starts within this of the beam line make the truth vertex",
+    )
+    parser.add_argument(
+        "--no_output",
+        action="store_true",
+        help="Test run: write no files or run folder; the metrics and timing are only printed. "
+             "--root_dir is then not needed",
+    )
+    parser.add_argument(
+        "--vertex_chunk_events",
+        type=int,
+        default=None,
+        help="Events per HybridVertexHead call (default: YAML vertex_chunk_events, else 32; 1 = per loader batch); "
+             "the backbone and track head still run per loader batch",
+    )
+    parser.add_argument(
+        "--vertex_device",
+        type=str,
+        default=None,
+        help="Device for HybridVertexHead, e.g. cpu (default: YAML vertex_device, else the backbone's device)",
+    )
+    parser.add_argument(
+        "--vertex_method",
+        type=str,
+        nargs="+",
+        default=["hybrid"],
+        choices=["hybrid", "pure"],
+        help="Vertexing methods, each run on the same events with the backbone run once: hybrid (track head + "
+             "HybridVertexHead), pure (PureVertexHead, needs --pure_checkpoint)",
+    )
+    parser.add_argument(
+        "--pure_checkpoint",
+        type=str,
+        default=None,
+        help="PureVertexHead checkpoint written by train_vertex_reconstruction.py (its head settings are used)",
+    )
+    parser.add_argument(
+        "--vertex_checkpoint",
+        type=str,
+        default=None,
+        help="Trained HybridVertexHead checkpoint (train_vertex_reconstruction.py --vertex_method hybrid): its learned track "
+             "weights, gates and fallback scale (default: the untrained hybrid)",
+    )
+    parser.add_argument(
+        "--no_residual_table",
+        action="store_true",
+        help="Do not print or log the per-method PV residual table (median, 68%%, 90%%)",
+    )
+    parser.add_argument(
+        "--run_config",
+        type=str,
+        default=None,
+        help="YAML file of this script's options (keys = option names without --, e.g. scripts/configs/vertex_m5_gpuserver0.yaml); "
+             "command-line options override it, relative paths are relative to the file",
+    )
+    # a run file sets the defaults; anything given on the command line still wins
+    run_config = parser.parse_known_args()[0].run_config
+    if run_config:
+        import yaml
+        with open(run_config) as f:
+            run = yaml.safe_load(f) or {}
+        known = {a.dest for a in parser._actions}
+        unknown = sorted(set(run) - known)
+        if unknown:
+            sys.exit(f"{run_config}: unknown option(s) {unknown}; valid: {sorted(known - {'help', 'run_config'})}")
+        base = os.path.dirname(os.path.abspath(run_config))
+        path_keys = {"yaml_config", "pretrained_ckpt", "checkpoint", "checkpoint_dir", "pure_checkpoint", "vertex_checkpoint",
+                     "csv_output_path", "data_root_test", "root_dir", "detector"}
+        # each value converted as the command line would be (e.g. run_num: 2 -> "2"; a list: each entry)
+        types = {a.dest: a.type for a in parser._actions if a.type is not None}
+        run = {k: v if k not in types or v is None else [types[k](x) for x in v] if isinstance(v, list)
+               else types[k](v) for k, v in run.items()}
+        if isinstance(run.get("vertex_method"), str):
+            run["vertex_method"] = [run["vertex_method"]]
+        parser.set_defaults(**{k: os.path.join(base, os.path.expanduser(v)) if k in path_keys and isinstance(v, str) else v
+                               for k, v in run.items()})
+    args = parser.parse_args()
+    if args.no_output:
+        args.save_csv = False
+        args.root_dir = args.root_dir or "."
+    if not args.root_dir:
+        parser.error("--root_dir is required (on the command line or in --run_config), unless --no_output")
+    hybrid, pure = "hybrid" in args.vertex_method, "pure" in args.vertex_method
+    if pure and not (args.pure_checkpoint and os.path.isfile(args.pure_checkpoint)):
+        parser.error(f"--vertex_method pure needs --pure_checkpoint (an existing file): {args.pure_checkpoint}")
+    if args.vertex_checkpoint and not (hybrid and os.path.isfile(args.vertex_checkpoint)):
+        parser.error(f"--vertex_checkpoint needs --vertex_method hybrid and an existing file: {args.vertex_checkpoint}")
+    if pure and not args.usepretrain:
+        parser.error("--vertex_method pure needs the backbone features (not --no-pretrain)")
+
+    # Prepare hyperparameters
+    params = YParams(os.path.abspath(args.yaml_config), args.config)
+    if args.pretrained_ckpt:
+        params["pretrained_ckpt"] = args.pretrained_ckpt
+    elif not getattr(params, "pretrained_ckpt", None):
+        sys.exit(f"config {args.config!r} has no pretrained_ckpt; add one to the YAML or pass --pretrained_ckpt")
+    # the seed suffix train_track_finding.py adds
+    seed_suffix = "" if args.no_seed_in_ckpt else f"_seed{args.seed}"
+    pretrain_suffix = "" if args.usepretrain else "_nopretrain"
+    checkpoint_name = (f"{args.track_config}_nerf_tracking_head_d{args.eventnumber}_{args.run_num}"
+                       f"{seed_suffix}{pretrain_suffix}_checkpoint.pth")
+    if args.data_root_test:
+        params["data_root_test"] = args.data_root_test
+    checkpoint_path = (args.checkpoint if args.checkpoint
+                       else os.path.join(args.checkpoint_dir or params.checkpoint_dir, checkpoint_name))
+    # the run folder: <backbone checkpoint>/<track-head checkpoint> (without hybrid: the pure head's checkpoint);
+    # outputs vertex_eval_e<events>_<N>.*
+    stem = lambda path: os.path.splitext(os.path.basename(path))[0]  # noqa: E731
+    head = stem(checkpoint_path if hybrid else args.pure_checkpoint).replace("_checkpoint", "").replace(
+        "_nerf_tracking_head", "")
+    params.run_folder = os.path.join(stem(params.pretrained_ckpt), head)
+    params.run_name = f"vertex_eval_{f'e{args.max_eval_events}' if args.max_eval_events else 'all'}"
+    if hybrid and not os.path.isfile(checkpoint_path):
+        sys.exit(f"track-head checkpoint not found: {checkpoint_path}\n"
+                 f"(pass --checkpoint, or check --track_config/--run_num/--seed/--eventnumber "
+                 f"against the training run)")
+
+    params.num_embedder_layers = 0
+    params.return_reg_test = True        # val loader then yields reg as a 4th element
+    params.return_dict = False           # the trainer unpacks tuples, like track_finding_trainer
+    # the run's settings, through params[...] so the run log records them (None: the model YAML's or the default)
+    for key, value in (("batch_size", args.eval_batch_size), ("valid_batch_size", args.eval_batch_size),
+                       ("vertex_Bz", args.bz), ("vertex_chunk_events", args.vertex_chunk_events),
+                       ("vertex_device", args.vertex_device),
+                       ("vertex_detector", args.detector and os.path.abspath(args.detector)),
+                       ("truth_radius", args.truth_radius), ("no_output", args.no_output),
+                       ("vertex_method", args.vertex_method), ("residual_table", not args.no_residual_table)):
+        if value is not None:
+            params[key] = value
+    print(f"[vertex] backbone   : {params.pretrained_ckpt}")
+    if hybrid:
+        print(f"[vertex] track head : {checkpoint_path}")
+    if pure:
+        print(f"[vertex] pure head: {args.pure_checkpoint}")
+
+    # Launch and run inference
+    trainer = DownstreamTrainer(params, args)
+    if args.combine_weights:
+        w = [float(x) for x in args.combine_weights.split(',')]
+        if len(w) != int(params.num_layers_backbone):
+            raise ValueError(f'--combine_weights has {len(w)} entries, model has '
+                             f'{params.num_layers_backbone} layers')
+        if abs(sum(w) - 1.0) > 1e-3:
+            raise ValueError(f'--combine_weights sums to {sum(w):.6f}, expected 1.0 -- '
+                             'pass the POST-softmax vector from cache_meta.json')
+        trainer.cache_combined = True          # so the head is built with L=1
+        trainer.eval_combine_weights = w       # so the backbone stack is collapsed the same way
+        print(f'[eval] layer-combined head: {[round(x,4) for x in w]}')
+    trainer.launch(train=False)
+    trainer.inference(
+        checkpoint_path=checkpoint_path,
+        max_events=args.max_eval_events,
+        pretrain=args.usepretrain,
+        save_csv=args.save_csv,
+        csv_output_path=args.csv_output_path,
+        pure_checkpoint_path=args.pure_checkpoint,
+        vertex_checkpoint_path=args.vertex_checkpoint,
+    )
+    trainer.cleanup()
+
+
+if __name__ == "__main__":
+    main()
