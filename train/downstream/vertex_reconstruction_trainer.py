@@ -469,7 +469,7 @@ class DownstreamTrainer():
 
     # the terms of the training loss and their weights (params: pure_vertex_<term>_weight)
     PURE_LOSS_WEIGHTS = {"loss_matched_ce": 0.5, "loss_unmatched_ce": 0.1, "loss_dice": 1.0, "loss_focal": 30.0,
-                            "loss_position": 1.0, "loss_position_l1": 1.0}
+                            "loss_position": 1.0, "loss_position_l1": 1.0, "loss_vote": 1.0}
     PURE_POSITION_BETA = 0.5    # compute_vertex_set_loss's position_beta; setting pure_vertex_position_beta
 
     def setup_pure_vertexing(self, saved=None):
@@ -573,7 +573,10 @@ class DownstreamTrainer():
             for out in [raw] + (raw["aux_list"] if aux else []):
                 losses = compute_vertex_set_loss(
                     {"pred_probs": out["vertex_class_probs"], "pred_masks": out["vertex_mask_probs"].permute(0, 2, 1),
-                     "pred_positions": out["vertex_position"], "pred_log_variance": out["vertex_log_variance"]},
+                     "pred_positions": out["vertex_position"], "pred_log_variance": out["vertex_log_variance"],
+                     # the votes (position_mode 'vote'): in the final output only
+                     **({"vote_positions": out["vote_position"], "vote_log_variance": out["vote_log_variance"]}
+                        if "vote_position" in out else {})},
                     targets, mask, self.matcher, position_beta=self.position_beta)
                 loss = loss + sum(weight * losses[term] for term, weight in self.loss_weights.items())
                 terms = terms or {term: losses[term].item() for term in self.loss_weights}

@@ -912,6 +912,7 @@ def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0, 
             "pred_masks": (B, N_pred, N_points)  # Mask probabilities
             "pred_positions": (B, N_pred, 3)  # cm
             "pred_log_variance": (B, N_pred, 3)  # log of the position variance, cm^2
+            "vote_positions", "vote_log_variance": (B, N_points, 3)  # optional: each point's vote, cm, cm^2
         }
         targets: list of dicts, each with: {
             "labels": (N_gt),  # Class labels for GT vertices
@@ -928,6 +929,8 @@ def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0, 
         coordinates, / B:
             "loss_position": the Gaussian negative log-likelihood of the true positions (weighted by position_beta).
             "loss_position_l1": the absolute position residual, cm.
+        and "loss_vote": the same likelihood (position_beta) of each point's vote against its true vertex, summed
+            over the coordinates, averaged over the valid points with a true vertex (0 without votes).
     """
     indices = matcher(outputs, targets, mask)
     losses = compute_point_loss(outputs, targets, mask, lambda *_: indices, no_object_class)
@@ -937,6 +940,14 @@ def compute_vertex_set_loss(outputs, targets, mask, matcher, no_object_class=0, 
     losses["loss_position"] = ((position_beta * log_variance).exp().detach() * 0.5
                                * (log_variance + residual ** 2 / log_variance.exp())).sum() / len(targets)
     losses["loss_position_l1"] = residual.abs().sum() / len(targets)
+    losses["loss_vote"] = residual.new_zeros(())
+    if "vote_positions" in outputs:
+        voting = torch.stack([t["masks"].sum(dim=0) > 0 for t in targets]) & mask
+        log_variance = outputs["vote_log_variance"][voting].float()
+        residual = outputs["vote_positions"][voting].float() - torch.stack(
+            [t["masks"].T.float() @ t["positions"].float() for t in targets])[voting]
+        losses["loss_vote"] = ((position_beta * log_variance).exp().detach() * 0.5 * (
+            log_variance + residual ** 2 / log_variance.exp())).sum() / voting.sum().clamp_min(1)
     return losses
 
 

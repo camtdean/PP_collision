@@ -10,6 +10,8 @@ from fm4npp.models.embed import EmbedderAdd
 from fm4npp.models.rmsnorm import RMSNorm
 from trackinghead import FFNBlock, RefinementLayer
 
+from .tracks import TPC_NORMALIZATION, _unnormalize_hits
+
 
 class PureVertexHead(nn.Module):
     """
@@ -34,15 +36,25 @@ class PureVertexHead(nn.Module):
         do_masked_attn: bias each slot's cross-attention towards the hits of its current mask.
         attn_mask_eps: added to the mask probability before the log of the attention bias.
         dropout: dropout of the attention and prediction layers.
+        position_mode: 'query': each slot's position and variance from its query. 'vote': each hit votes for its
+            vertex (x, y directly, x position_scale_xy; z = z_hit - r_hit x a slope) with a variance per coordinate
+            (z: x r_hit^2); a slot's position is the mean of the votes weighted by (mask probability + vote_eps) /
+            variance, its variance 1 / the sum of those weights x a factor from its query.
+        vote_eps: added to the mask probability in the vote weights.
+        normalization: the dataset's hit normalization (None: TPC_NORMALIZATION), for the hits' r and z in cm.
     """
 
     def __init__(self, input_dim, num_feature_layers, pe_method="nerf", point_embed_scale=0.0, n_vertex_slots=10,
                  embed_dim=256, num_heads=4, ffn_dim=512, num_refinement_layers=2, position_scale_xy=1.0,
                  position_scale_z=10.0, min_sigma_xy=0.0, min_sigma_z=0.0, softmax_mask=False, do_masked_attn=True,
-                 attn_mask_eps=1e-6, dropout=0.0):
+                 attn_mask_eps=1e-6, dropout=0.0, position_mode="query", vote_eps=1e-6, normalization=None):
         super().__init__()
+        if position_mode not in ("query", "vote"):
+            raise ValueError(f"position_mode {position_mode!r}: 'query' or 'vote'")
         self.n_vertex_slots, self.num_heads, self.point_embed_scale = n_vertex_slots, num_heads, point_embed_scale
         self.softmax_mask, self.do_masked_attn, self.attn_mask_eps = softmax_mask, do_masked_attn, attn_mask_eps
+        self.position_mode, self.vote_eps = position_mode, vote_eps
+        self.normalization = dict(TPC_NORMALIZATION if normalization is None else normalization)
 
         self.weighted_avg_weights = nn.Parameter(torch.ones(num_feature_layers))
         self.input_proj = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, embed_dim))
@@ -55,34 +67,61 @@ class PureVertexHead(nn.Module):
         self.refinement_layers = nn.ModuleList(
             RefinementLayer(embed_dim, num_heads, ffn_dim, dropout=dropout) for _ in range(num_refinement_layers))
 
-        def mlp(n_out):
-            return nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, embed_dim), nn.GELU(),
+        def mlp(n_out, n_in=embed_dim):
+            return nn.Sequential(nn.LayerNorm(n_in), nn.Linear(n_in, embed_dim), nn.GELU(),
                                  nn.Dropout(dropout), nn.Linear(embed_dim, n_out))
         self.class_mlp, self.mask_mlp = mlp(2), mlp(embed_dim)
-        self.position_mlp, self.log_variance_mlp = mlp(3), mlp(3)
+        # vote: log_variance_mlp gives the log of the slot's variance factor; vote_mlp (x, y, slope, 3 log variances)
+        self.position_mlp, self.log_variance_mlp = mlp(3) if position_mode == "query" else None, mlp(3)
+        self.vote_mlp = mlp(6, embed_dim + 4) if position_mode == "vote" else None
         self.register_buffer("position_scale", torch.tensor([position_scale_xy, position_scale_xy, position_scale_z]))
         # a setting, not a weight: not in checkpoints
         self.register_buffer("log_min_variance", 2 * torch.tensor([min_sigma_xy, min_sigma_xy, min_sigma_z]).log(),
                              persistent=False)
 
-    def predict(self, queries, hit_features):
+    def votes(self, x, hit_features, padding_mask):
         """
-        queries (V, B, E), hit_features (B, N, E) -> the output dict of forward without aux_list.
+        Each hit's vote: vote_position (B, N, 3) cm and vote_log_variance (B, N, 3) cm^2 (padded hits: of a hit
+        at normalized 0).
+        """
+        x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
+        points, r = _unnormalize_hits(x, self.normalization)
+        raw = self.vote_mlp(torch.cat([hit_features, x.to(hit_features.dtype)], dim=-1))
+        return {
+            "vote_position": torch.cat([raw[..., :2] * self.position_scale[:2],
+                                        (points[..., 3] - r * raw[..., 2]).unsqueeze(-1)], dim=-1),
+            "vote_log_variance": raw[..., 3:] + 2 * torch.stack(
+                [self.position_scale[0].log().expand_as(r), self.position_scale[1].log().expand_as(r), r.log()], dim=-1),
+        }
+
+    def predict(self, queries, hit_features, votes=None, padding_mask=None):
+        """
+        queries (V, B, E), hit_features (B, N, E), with position_mode 'vote' votes (votes()) and padding_mask (B, N)
+        -> the output dict of forward without aux_list and the votes.
         """
         queries = queries.transpose(0, 1)
         similarity = torch.einsum("bne,bve->bnv", hit_features, self.mask_mlp(queries))
+        mask_probs = torch.softmax(similarity, dim=-1) if self.softmax_mask else torch.sigmoid(similarity)
+        if votes is None:
+            position = self.position_mlp(queries) * self.position_scale
+            log_variance = self.log_variance_mlp(queries) + 2 * torch.log(self.position_scale)
+        else:
+            # log weight of each hit's vote in each slot, per coordinate: (B, N, V, 3)
+            log_weight = (torch.log(mask_probs + self.vote_eps).unsqueeze(-1)
+                          - votes["vote_log_variance"].unsqueeze(2)).masked_fill(~padding_mask[:, :, None, None], -1e9)
+            position = (torch.softmax(log_weight, dim=1) * votes["vote_position"].unsqueeze(2)).sum(dim=1)
+            log_variance = self.log_variance_mlp(queries) - torch.logsumexp(log_weight, dim=1)
         return {
             "vertex_class_probs": torch.softmax(self.class_mlp(queries), dim=-1),
-            "vertex_mask_probs": torch.softmax(similarity, dim=-1) if self.softmax_mask else torch.sigmoid(similarity),
-            "vertex_position": self.position_mlp(queries) * self.position_scale,
-            "vertex_log_variance": torch.logaddexp(
-                self.log_variance_mlp(queries) + 2 * torch.log(self.position_scale), self.log_min_variance),
+            "vertex_mask_probs": mask_probs,
+            "vertex_position": position,
+            "vertex_log_variance": torch.logaddexp(log_variance, self.log_min_variance),
         }
 
     def forward(self, x, feature, padding_mask, pretrain=True):
         """
         Args:
-            x: (B, N, 4) normalized points (energy, x, y, z).
+            x: (B, N, 4) normalized points (energy, eta, phi, r).
             feature: (L, B, N, D) backbone layer features.
             padding_mask: (B, N) bool, True for real hits.
             pretrain: must be True; the head has no path without backbone features.
@@ -93,6 +132,7 @@ class PureVertexHead(nn.Module):
             vertex_position: (B, V, 3) cm.
             vertex_log_variance: (B, V, 3) log of the position variance (with the floor), cm^2.
             aux_list: the same four keys before each refinement layer.
+            vote_position, vote_log_variance: (B, N, 3) cm, cm^2, each hit's vote (position_mode 'vote' only).
         """
         if not pretrain:
             raise NotImplementedError("PureVertexHead needs the backbone features (pretrain=True)")
@@ -108,15 +148,16 @@ class PureVertexHead(nn.Module):
         queries = self.query_embed(slots).unsqueeze(1).expand(-1, x.size(0), -1)
         query_pos = self.query_pos_embed(slots).unsqueeze(1).expand(-1, x.size(0), -1)
 
-        out, aux_list = self.predict(queries, hit_features), []
+        votes = self.votes(x, hit_features, padding_mask) if self.position_mode == "vote" else None
+        out, aux_list = self.predict(queries, hit_features, votes, padding_mask), []
         for layer in self.refinement_layers:
             aux_list.append(out)
             queries = layer(queries, context, query_pos, padding_mask, attn_mask=(
                 torch.log(out["vertex_mask_probs"].transpose(1, 2) + self.attn_mask_eps)
                 .masked_fill(~padding_mask.unsqueeze(1), -1e9)
                 .repeat_interleave(self.num_heads, dim=0)) if self.do_masked_attn else None)
-            out = self.predict(queries, hit_features)
-        return {**out, "aux_list": aux_list}
+            out = self.predict(queries, hit_features, votes, padding_mask)
+        return {**out, "aux_list": aux_list, **(votes or {})}
 
 
 _F, _I, _B, _NAN = torch.float64, torch.int64, torch.bool, float("nan")
