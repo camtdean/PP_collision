@@ -3,6 +3,7 @@
 patch_macro.py: sPHENIX's standard detectors/sPHENIX/Fun4All_G4_sPHENIX.C (macros commit 661f781, as TPCpp-10M) to
 Fun4All_TPCpp.C: Pythia8 minimum-bias pp at 200 GeV with the Detroit tune and sPHENIX's pp beam parameters instead of
 the single-particle gun, with SpacepointDumper after the reconstruction (its output file: the macro's outputFile).
+The random seed is $TPCPP_SEED when set, else sPHENIX's default (/dev/urandom).
 
     python3 patch_macro.py <Fun4All_G4_sPHENIX.C> <Fun4All_TPCpp.C>
 
@@ -12,6 +13,9 @@ import sys
 
 EDITS = [
     ("int Fun4All_G4_sPHENIX(", "int Fun4All_TPCpp("),
+    ("recoConsts *rc = recoConsts::instance();",
+     "recoConsts *rc = recoConsts::instance();\n"
+     "  if (getenv(\"TPCPP_SEED\")) rc->set_IntFlag(\"RANDOMSEED\", std::stoi(getenv(\"TPCPP_SEED\")));"),
     ("Input::SIMPLE = true;", "Input::SIMPLE = false;"),
     ("// Input::PYTHIA8 = true;",
      "Input::PYTHIA8 = true;\n"

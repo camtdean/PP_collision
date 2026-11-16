@@ -172,11 +172,17 @@ int SpacepointDumper::process_event(PHCompositeNode *topNode)
 
   m_tree->Fill();
   ++m_event;
+  if (m_print_every > 0 && m_event % m_print_every == 0)
+  {
+    std::cout << Name() << ": " << m_event << " events, last with " << m_adc.size() << " TPC clusters, "
+              << m_reco_x.size() << " reconstructed vertices" << std::endl;
+  }
   return Fun4AllReturnCodes::EVENT_OK;
 }
 
 int SpacepointDumper::End(PHCompositeNode * /*topNode*/)
 {
+  m_eval.reset();
   if (m_file)
   {
     m_file->cd();

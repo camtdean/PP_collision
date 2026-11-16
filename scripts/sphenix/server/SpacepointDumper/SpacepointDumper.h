@@ -25,12 +25,15 @@ class SpacepointDumper : public SubsysReco
   int End(PHCompositeNode *topNode) override;
 
   void SetVertexMapName(const std::string &name) { m_vertex_map_name = name; }
+  // a progress line every n events (0: none)
+  void SetPrintEvery(int n) { m_print_every = n; }
 
  private:
   void clear();
 
   std::string m_output;
   std::string m_vertex_map_name = "SvtxVertexMap";
+  int m_print_every = 10;
   std::unique_ptr<SvtxEvalStack> m_eval;
   TFile *m_file = nullptr;
   TTree *m_tree = nullptr;

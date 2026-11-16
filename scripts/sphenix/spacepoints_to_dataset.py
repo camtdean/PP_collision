@@ -15,8 +15,8 @@ events with fewer than --min_event_points rejected):
 - pid_target_<split>    (n,)   int64    PDG code (downstream_util.get_pidlabel maps it to a class)
 - reg_target_<split>    (n, 8) float32  px, py, pz (GeV), vtx_x, vtx_y, vtx_z (production vertex, cm), q, e (GeV)
 - mid_target_<split>    (n,)   int64    parent track id (0: primary)
-- vertices_<split>.npz  per event: event, truth_pv (E, 3) cm, and sPHENIX's reconstructed vertices (reco_n, and
-  reco_x/y/z, reco_ntracks, reco_cov (V, 6: xx xy yy xz yz zz) flattened over events in event order)
+- vertices_<split>.npz  per event: file (index in --in), event (within the file), truth_pv (E, 3) cm, and sPHENIX's
+  reconstructed vertices (reco_n, and reco_x/y/z, reco_ntracks, reco_cov (V, 6: xx xy yy xz yz zz) flattened over events in event order)
 
 Needs uproot and mmap_ninja.
 """
@@ -31,13 +31,13 @@ EVENT = ("event", "truth_pv_x", "truth_pv_y", "truth_pv_z", "reco_x", "reco_y", 
 
 
 def events(paths):
-    """Each dumped event as a dict of numpy arrays (SpacepointDumper's tree 'spacepoints')."""
+    """(input file index, each dumped event as a dict of numpy arrays (SpacepointDumper's tree 'spacepoints'))."""
     import uproot
-    for path in paths:
+    for i, path in enumerate(paths):
         with uproot.open(path) as f:
             for chunk in f["spacepoints"].iterate(POINT + EVENT, library="np", step_size=1000):
                 for k in range(len(chunk["event"])):
-                    yield {name: np.asarray(chunk[name][k]) for name in POINT + EVENT}
+                    yield i, {name: np.asarray(chunk[name][k]) for name in POINT + EVENT}
 
 
 def select(ev, min_track_points, keep_unmatched):
@@ -63,15 +63,16 @@ def main():
     args = parser.parse_args()
     from mmap_ninja import RaggedMmap
 
-    kept, vertices = [], {k: [] for k in ("event", "truth_pv", "reco_n", "reco_x", "reco_y", "reco_z",
+    kept, vertices = [], {k: [] for k in ("file", "event", "truth_pv", "reco_n", "reco_x", "reco_y", "reco_z",
                                           "reco_ntracks", "reco_cov")}
     n_read = 0
-    for ev in events(args.inputs):
+    for i, ev in events(args.inputs):
         n_read += 1
         keep = select(ev, args.min_track_points, args.keep_unmatched)
         if keep.sum() < args.min_event_points:
             continue
         kept.append({k: ev[k][keep] for k in POINT})
+        vertices["file"].append(i)
         vertices["event"].append(int(ev["event"]))
         vertices["truth_pv"].append([float(ev[f"truth_pv_{a}"]) for a in "xyz"])
         vertices["reco_n"].append(len(ev["reco_x"]))
@@ -93,7 +94,7 @@ def main():
         RaggedMmap.from_generator(out_dir=out_dir, sample_generator=(fn(p) for p in kept), batch_size=args.batch_size,
                                   verbose=False)
     np.savez(os.path.join(args.out, f"vertices_{args.split}.npz"),
-             **{k: np.asarray(v, dtype=np.int64 if k in ("event", "reco_n", "reco_ntracks") else np.float64)
+             **{k: np.asarray(v, dtype=np.int64 if k in ("file", "event", "reco_n", "reco_ntracks") else np.float64)
                 for k, v in vertices.items()})
 
     sizes = np.array([len(p["adc"]) for p in kept])
