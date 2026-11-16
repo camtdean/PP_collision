@@ -16,7 +16,7 @@ set -euo pipefail
 
 if [[ ! -f $WORK/install/lib/libspacepointdumper.so ]]; then
     mkdir -p "$WORK/build"
-    (cd "$WORK/build" && "$HERE/SpacepointDumper/autogen.sh" --prefix="$WORK/install" && make -j4 install)
+    (cd "$WORK/build" && sh "$HERE/SpacepointDumper/autogen.sh" --prefix="$WORK/install" && make -j4 install)
 fi
 set +u
 source /opt/sphenix/core/bin/setup_local.sh "$WORK/install"
