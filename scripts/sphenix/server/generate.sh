@@ -36,7 +36,8 @@ set +u
 source "$ANA_SETUP/sphenix_setup.sh" -n ana.435
 set -u
 [[ $OFFLINE_MAIN == *ana.435* ]] || { echo "OFFLINE_MAIN=$OFFLINE_MAIN is not ana.435" >&2; exit 1; }
-stamp="$OFFLINE_MAIN $(cat "$HERE"/SpacepointDumper/* | md5sum | cut -d' ' -f1)"
+src=$HERE/SpacepointDumper   # autogen.sh also leaves generated files here: hash the sources only
+stamp="$OFFLINE_MAIN $(cat "$src"/*.cc "$src"/*.h "$src"/configure.ac "$src"/Makefile.am "$src"/autogen.sh | md5sum | cut -d' ' -f1)"
 if [[ $(cat "$WORK/install/built_with" 2>/dev/null) != "$stamp" ]]; then
     [[ $STEP != run ]] || { echo "SpacepointDumper in $WORK/install is missing or stale: run TPCPP_STEP=prepare first" >&2; exit 1; }
     rm -rf "$WORK/build" "$WORK/install"
